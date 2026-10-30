@@ -1,0 +1,165 @@
+from typing import List, Optional
+from pathlib import Path
+from pydantic import Field, AliasChoices
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class Settings(BaseSettings):
+    """Application configuration loaded from environment variables or .env file."""
+
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore"
+    )
+
+    # REDCap API settings
+    redcap_api_url: str = Field(
+        default="",
+        description="Full URL to the REDCap API endpoint (e.g., https://redcap.example.org/api/)"
+    )
+    redcap_api_token: str = Field(
+        default="",
+        description="API Token with Export Metadata (and optionally Import Records) privileges"
+    )
+
+    # Local AI Engine Selection: 'llama_cpp' (default) or 'ollama'
+    ai_backend: str = Field(
+        default="llama_cpp",
+        description="Backend IA locale da utilizzare ('llama_cpp' con RPC o 'ollama')"
+    )
+
+    # llama.cpp Server settings (Inferenza distribuita multi-GPU con protocollo RPC)
+    llama_cpp_base_url: str = Field(
+        default="http://localhost:8080",
+        description="URL del server master llama.cpp (es. http://localhost:8080)"
+    )
+    llama_cpp_api_mode: str = Field(
+        default="chat",
+        description="Modalità API llama.cpp: 'chat' (/v1/chat/completions) o 'completion' (/completion)"
+    )
+    llama_cpp_model: str = Field(
+        default="",
+        description="Nome opzionale del modello per l'header OpenAI di llama.cpp"
+    )
+    llama_cpp_temperature: float = Field(
+        default=0.0,
+        description="Temperatura di campionamento per llama.cpp (0.0 per estrazione deterministica)"
+    )
+    llama_cpp_timeout_seconds: int = Field(
+        default=180,
+        description="Timeout in secondi per llama.cpp (supporta modelli distribuiti su 2 schede RPC)"
+    )
+
+    # Local Ollama AI settings
+    ollama_base_url: str = Field(
+        default="http://localhost:11434",
+        description="Local Ollama instance URL"
+    )
+    ollama_model: str = Field(
+        default="llama3.2:3b",
+        description="Local model name running in Ollama (e.g. llama3.2:3b, qwen2.5:7b)"
+    )
+    ollama_temperature: float = Field(
+        default=0.0,
+        description="Sampling temperature (0.0 for deterministic factual extraction)"
+    )
+    ollama_timeout_seconds: int = Field(
+        default=120,
+        description="Timeout in seconds for Ollama LLM requests"
+    )
+
+    # Priamo .NET HIS Settings (Ospedale Valduce)
+    priamo_api_url: str = Field(
+        default="",
+        description="URL base per il portale/servizi Priamo (es. https://priamo-home.valduce.it:8062)"
+    )
+    priamo_username: str = Field(
+        default="",
+        description="Nome utente per autenticazione su Priamo .NET"
+    )
+    priamo_password: str = Field(
+        default="",
+        description="Password per autenticazione su Priamo .NET"
+    )
+    cloudflared_client_id: str = Field(
+        default="",
+        validation_alias=AliasChoices("cloudflared_client_id", "cf_client_id"),
+        description="Cloudflare Access Client ID (CF-Access-Client-Id)"
+    )
+    cloudflared_client_secret: str = Field(
+        default="",
+        validation_alias=AliasChoices("cloudflared_client_secret", "cf_client_secret"),
+        description="Cloudflare Access Client Secret (CF-Access-Client-Secret)"
+    )
+
+    # Generic .NET API Settings
+    dotnet_api_base_url: str = Field(
+        default="",
+        description="URL di base per API REST generica .NET dell'ospedale"
+    )
+    dotnet_api_key: str = Field(
+        default="",
+        description="Chiave API / Token Bearer per API generica .NET"
+    )
+
+    # Extraction settings
+    default_form_name: Optional[str] = Field(
+        default=None,
+        description="Optional REDCap form/instrument name to filter metadata fields"
+    )
+    webhook_callback_url: Optional[str] = Field(
+        default=None,
+        description="URL opzionale di un endpoint API esterno a cui inviare via POST i risultati dell'elaborazione"
+    )
+    allowed_webhook_hosts: Optional[List[str]] = Field(
+        default=None,
+        description="Whitelist opzionale di hostname autorizzati per le chiamate webhook (prevenzione SSRF)"
+    )
+    allow_local_webhooks: bool = Field(
+        default=False,
+        description="Consenti webhook verso localhost o IP privati (usare solo in ambiente di sviluppo locale)"
+    )
+
+    # Paths and Cohort Directories
+    pdf_input_dir: Path = Field(
+        default=Path("./data/input_pdf"),
+        description="Cartella predefinita con i referti PDF da elaborare"
+    )
+    output_dir: Path = Field(
+        default=Path("./data/output"),
+        description="Cartella predefinita per salvare i risultati strutturati JSON/CSV"
+    )
+    downloads_dir: Path = Field(
+        default=Path("./data/downloads"),
+        description="Cartella predefinita per salvare i PDF scaricati da Priamo/.NET"
+    )
+    state_dir: Path = Field(
+        default=Path("./data/state"),
+        description="Cartella per memorizzare lo stato e tracciare l'idempotenza delle elaborazioni"
+    )
+    redcap_cache_file: Path = Field(
+        default=Path("./data/redcap_metadata_live.json"),
+        description="Percorso della copia cache del Data Dictionary REDCap"
+    )
+    patients_excel_path: Optional[Path] = Field(
+        default=None,
+        description="Percorso al file Excel degli interventi (es. interventi.xls)"
+    )
+    priamo_files_dir: Optional[Path] = Field(
+        default=None,
+        description="Cartella locale contenente file o PDF esportati da PriamoScraper"
+    )
+
+    @property
+    def cf_client_id(self) -> str:
+        return self.cloudflared_client_id
+
+    @property
+    def cf_client_secret(self) -> str:
+        return self.cloudflared_client_secret
+
+
+def get_settings() -> Settings:
+    """Helper to instantiate settings."""
+    return Settings()

@@ -1,0 +1,178 @@
+[
+  {
+    "field_name": "record_id",
+    "form_name": "scheda_senologica",
+    "section_header": "Informazioni Generali",
+    "field_type": "text",
+    "field_label": "ID Paziente / Numero Cartella",
+    "select_choices_or_calculations": null,
+    "field_note": "Identificativo univoco",
+    "text_validation_type_or_show_slider_number": null,
+    "required_field": "y"
+  },
+  {
+    "field_name": "data_referto",
+    "form_name": "scheda_senologica",
+    "section_header": null,
+    "field_type": "text",
+    "field_label": "Data del referto o esame",
+    "select_choices_or_calculations": null,
+    "field_note": "Formato AAAA-MM-GG",
+    "text_validation_type_or_show_slider_number": "date_ymd",
+    "required_field": "y"
+  },
+  {
+    "field_name": "tipo_esame",
+    "form_name": "scheda_senologica",
+    "section_header": null,
+    "field_type": "dropdown",
+    "field_label": "Tipo di procedura o indagine",
+    "select_choices_or_calculations": "1, Mammografia | 2, Ecografia mammaria | 3, Risonanza Magnetica (RM) | 4, Biopsia / Istologico | 5, Visita clinica senologica",
+    "field_note": null,
+    "text_validation_type_or_show_slider_number": null,
+    "required_field": null
+  },
+  {
+    "field_name": "lateralita",
+    "form_name": "scheda_senologica",
+    "section_header": "Dati Clinico-Radiologici",
+    "field_type": "radio",
+    "field_label": "Lateralità della lesione",
+    "select_choices_or_calculations": "1, Destra | 2, Sinistra | 3, Bilaterale | 4, Non applicabile",
+    "field_note": null,
+    "text_validation_type_or_show_slider_number": null,
+    "required_field": null
+  },
+  {
+    "field_name": "quadrante",
+    "form_name": "scheda_senologica",
+    "section_header": null,
+    "field_type": "dropdown",
+    "field_label": "Sede o quadrante",
+    "select_choices_or_calculations": "1, QSE (Supero-Esterno) | 2, QSI (Supero-Interno) | 3, QIE (Infero-Esterno) | 4, QII (Infero-Interno) | 5, Retroareolare | 6, Diffuso / Non specificato",
+    "field_note": null,
+    "text_validation_type_or_show_slider_number": null,
+    "required_field": null
+  },
+  {
+    "field_name": "dimensione_lesione_mm",
+    "form_name": "scheda_senologica",
+    "section_header": null,
+    "field_type": "text",
+    "field_label": "Diametro massimo della lesione (mm)",
+    "select_choices_or_calculations": null,
+    "field_note": "Valore in millimetri",
+    "text_validation_type_or_show_slider_number": "number",
+    "required_field": null
+  },
+  {
+    "field_name": "classificazione_birads",
+    "form_name": "scheda_senologica",
+    "section_header": null,
+    "field_type": "radio",
+    "field_label": "Classificazione BI-RADS",
+    "select_choices_or_calculations": "1, BI-RADS 1 | 2, BI-RADS 2 | 3, BI-RADS 3 | 4, BI-RADS 4 | 5, BI-RADS 5 | 6, BI-RADS 6 | 0, BI-RADS 0",
+    "field_note": null,
+    "text_validation_type_or_show_slider_number": null,
+    "required_field": null
+  },
+  {
+    "field_name": "istotipo",
+    "form_name": "scheda_senologica",
+    "section_header": "Dati Anatomopatologici (se applicabile)",
+    "field_type": "dropdown",
+    "field_label": "Istotipo tumorale",
+    "select_choices_or_calculations": "1, Carcinoma duttale infiltrante (NST) | 2, Carcinoma lobulare infiltrante | 3, Carcinoma duttale in situ (DCIS) | 4, Lesione benigna (Fibroadenoma/Altro) | 5, Altro",
+    "field_note": null,
+    "text_validation_type_or_show_slider_number": null,
+    "required_field": null
+  },
+  {
+    "field_name": "grado_istologico",
+    "form_name": "scheda_senologica",
+    "section_header": null,
+    "field_type": "radio",
+    "field_label": "Grado istologico (G)",
+    "select_choices_or_calculations": "1, G1 (Ben differenziato) | 2, G2 (Moderatamente differenziato) | 3, G3 (Scarsamente differenziato)",
+    "field_note": "Score Nottingham",
+    "text_validation_type_or_show_slider_number": null,
+    "required_field": null
+  },
+  {
+    "field_name": "stato_er",
+    "form_name": "scheda_senologica",
+    "section_header": null,
+    "field_type": "text",
+    "field_label": "Recettori Estrogeni (ER) %",
+    "select_choices_or_calculations": null,
+    "field_note": "Percentuale di cellule positive (0-100%)",
+    "text_validation_type_or_show_slider_number": "integer",
+    "required_field": null
+  },
+  {
+    "field_name": "stato_pgr",
+    "form_name": "scheda_senologica",
+    "section_header": null,
+    "field_type": "text",
+    "field_label": "Recettori Progestinici (PgR) %",
+    "select_choices_or_calculations": null,
+    "field_note": "Percentuale di cellule positive (0-100%)",
+    "text_validation_type_or_show_slider_number": "integer",
+    "required_field": null
+  },
+  {
+    "field_name": "her2_status",
+    "form_name": "scheda_senologica",
+    "section_header": null,
+    "field_type": "radio",
+    "field_label": "Stato HER2",
+    "select_choices_or_calculations": "0, Negativo (Score 0-1+) | 1, Dubbio/Equivoco (Score 2+) | 2, Positivo (Score 3+ o FISH amplificato)",
+    "field_note": null,
+    "text_validation_type_or_show_slider_number": null,
+    "required_field": null
+  },
+  {
+    "field_name": "ki67",
+    "form_name": "scheda_senologica",
+    "section_header": null,
+    "field_type": "text",
+    "field_label": "Ki-67 (Indice di proliferazione %)",
+    "select_choices_or_calculations": null,
+    "field_note": "Valore percentuale",
+    "text_validation_type_or_show_slider_number": "integer",
+    "required_field": null
+  },
+  {
+    "field_name": "interessamento_linfonodale",
+    "form_name": "scheda_senologica",
+    "section_header": null,
+    "field_type": "yesno",
+    "field_label": "Coinvolgimento linfonodale sospetto o accertato",
+    "select_choices_or_calculations": null,
+    "field_note": null,
+    "text_validation_type_or_show_slider_number": null,
+    "required_field": null
+  },
+  {
+    "field_name": "sintomi_presentati",
+    "form_name": "scheda_senologica",
+    "section_header": "Quadro Clinico di Presentazione",
+    "field_type": "checkbox",
+    "field_label": "Sintomi o segni clinici rilevati",
+    "select_choices_or_calculations": "1, Nodulo palpabile | 2, Mastodinia/Dolore | 3, Secrezione ematica dal capezzolo | 4, Retrazione cutanea | 5, Asintomatica (Screening mammografico)",
+    "field_note": null,
+    "text_validation_type_or_show_slider_number": null,
+    "required_field": null
+  },
+  {
+    "field_name": "conclusioni_cliniche",
+    "form_name": "scheda_senologica",
+    "section_header": null,
+    "field_type": "notes",
+    "field_label": "Conclusioni diagnostiche e indicazioni terapeutiche",
+    "select_choices_or_calculations": null,
+    "field_note": "Sintesi conclusiva del medico refertante",
+    "text_validation_type_or_show_slider_number": null,
+    "required_field": null
+  }
+]
