@@ -144,22 +144,31 @@ class DotNetApiClient:
         return downloaded
 
     def _get_local_documents_mock(self, patient_id: str) -> List[Path]:
-        """Checks local directories (e.g. data/patient_repository or configured priamo_files_dir)."""
+        """Checks local directories for documents specifically belonging to patient_id."""
         search_dirs = [
             Path("data/patient_repository") / patient_id,
             self.settings.downloads_dir / patient_id,
-            Path("data/input_pdf"),
         ]
 
         if self.settings.priamo_files_dir:
             search_dirs.insert(0, Path(self.settings.priamo_files_dir) / patient_id)
-            search_dirs.insert(1, Path(self.settings.priamo_files_dir))
 
         for sdir in search_dirs:
-            if sdir and sdir.exists():
-                pdfs = list(sdir.glob("*.pdf")) + list(sdir.glob("*.PDF"))
+            if sdir and sdir.exists() and sdir.is_dir():
+                pdfs = sorted(list(sdir.glob("*.pdf")) + list(sdir.glob("*.PDF")))
                 if pdfs:
                     return pdfs
+
+        # Also check if files in data/input_pdf contain the patient_id in their filename
+        input_pdf_dir = Path("data/input_pdf")
+        if input_pdf_dir.exists():
+            matched = [
+                p for p in sorted(list(input_pdf_dir.glob("*.pdf")) + list(input_pdf_dir.glob("*.PDF")))
+                if patient_id.lower() in p.stem.lower()
+            ]
+            if matched:
+                return matched
+
         return []
 
     @staticmethod

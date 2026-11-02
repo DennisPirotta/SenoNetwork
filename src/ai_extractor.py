@@ -1,11 +1,11 @@
-from abc import ABC, abstractmethod
 import json
 import logging
 import re
 import time
+from abc import ABC, abstractmethod
 from typing import Any, Dict, List, Optional, Protocol, Tuple, Union, runtime_checkable
+
 import requests
-from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 
 from src.config import Settings
 from src.models import ExtractionResult, REDCapField

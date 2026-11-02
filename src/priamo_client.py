@@ -4,7 +4,11 @@ import re
 from datetime import date
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
-from bs4 import BeautifulSoup
+from urllib.parse import urlparse
+try:
+    from bs4 import BeautifulSoup
+except ImportError:
+    BeautifulSoup = None
 from pydantic import BaseModel, Field
 from requests import Response, Session
 from requests.adapters import HTTPAdapter
@@ -129,13 +133,21 @@ class PriamoClient:
 
         logger.info(f"Autenticazione in corso su Priamo .NET ({self.login_page_url})...")
         response = self._request("GET", self.login_page_url)
-        soup = BeautifulSoup(response.text, "html.parser")
-        token_input = soup.find("input", {"name": "__RequestVerificationToken"})
+        token = None
+        if BeautifulSoup:
+            soup = BeautifulSoup(response.text, "html.parser")
+            token_input = soup.find("input", {"name": "__RequestVerificationToken"})
+            if token_input:
+                token = str(token_input.get("value"))
+        if not token:
+            m = re.search(r'name=["\']__RequestVerificationToken["\'][^>]*value=["\']([^"\']+)["\']', response.text)
+            if not m:
+                m = re.search(r'value=["\']([^"\']+)["\'][^>]*name=["\']__RequestVerificationToken["\']', response.text)
+            if m:
+                token = m.group(1)
 
-        if not token_input:
+        if not token:
             raise ValueError("Impossibile trovare il token __RequestVerificationToken nella pagina di login Priamo.")
-
-        token = str(token_input.get("value"))
 
         payload = {
             "UserName": self.username,
@@ -151,12 +163,38 @@ class PriamoClient:
         )
         login_response.raise_for_status()
 
+        # Extract .PRIAMOAUTH from Set-Cookie across redirect history or final response
+        # (vital when accessed over Cloudflare Tunnel or reverse-proxy with domain mismatch)
+        all_responses = list(login_response.history) + [login_response]
+        for resp in all_responses:
+            raw_headers = getattr(resp.raw, "headers", None)
+            set_cookies = []
+            if raw_headers and hasattr(raw_headers, "getlist"):
+                set_cookies = raw_headers.getlist("Set-Cookie")
+            elif raw_headers and hasattr(raw_headers, "get_all"):
+                set_cookies = raw_headers.get_all("Set-Cookie")
+            elif "Set-Cookie" in resp.headers:
+                set_cookies = [resp.headers["Set-Cookie"]]
+
+            for sc in set_cookies:
+                match = re.search(r"(?i)\.PRIAMOAUTH=([^;]+)", sc)
+                if match:
+                    priamo_auth_val = match.group(1).strip()
+                    target_host = urlparse(self.base_url).hostname
+                    if target_host:
+                        self.session.cookies.set(".PRIAMOAUTH", priamo_auth_val, domain=target_host, path="/")
+                    break
+
         if ".PRIAMOAUTH" not in self.session.cookies.get_dict():
-            # Check for error message in page
-            soup2 = BeautifulSoup(login_response.text, "html.parser")
             error_msg = ""
-            for msg in soup2.find_all(class_=lambda c: c and ("error" in c or "validation" in c or "alert" in c)):
-                error_msg += msg.get_text(strip=True) + " "
+            if BeautifulSoup:
+                soup2 = BeautifulSoup(login_response.text, "html.parser")
+                for msg in soup2.find_all(class_=lambda c: c and ("error" in c or "validation" in c or "alert" in c)):
+                    error_msg += msg.get_text(strip=True) + " "
+            if not error_msg:
+                m = re.search(r'class=["\'][^"\']*(?:validation|alert|error)[^"\']*["\'][^>]*>([^<]+)<', login_response.text)
+                if m:
+                    error_msg = m.group(1).strip()
             error_detail = error_msg.strip() or "Credenziali non valide o form modificato"
             raise ValueError(f"Autenticazione Priamo fallita: {error_detail}")
 

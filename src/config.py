@@ -65,8 +65,8 @@ class Settings(BaseSettings):
         description="Sampling temperature (0.0 for deterministic factual extraction)"
     )
     ollama_timeout_seconds: int = Field(
-        default=120,
-        description="Timeout in seconds for Ollama LLM requests"
+        default=240,
+        description="Timeout in seconds for Ollama LLM requests (consente inferenza su CPU per form estesi)"
     )
 
     # Priamo .NET HIS Settings (Ospedale Valduce)

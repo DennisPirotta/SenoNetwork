@@ -1,0 +1,68 @@
+# ==============================================================================
+# File di configurazione sensibili ed Environment Variables
+# ==============================================================================
+.env
+.env.*
+!.env.example
+
+# ==============================================================================
+# Dati clinici, referti medici e registri pazienti (Privacy & GDPR)
+# ==============================================================================
+# Tutti i PDF (referti mammografici, istologici, biopsie)
+*.pdf
+*.PDF
+
+# Registri ed estratti Excel/fogli di calcolo pazienti
+*.xls
+*.xlsx
+*.xlsm
+*.csv
+!examples/redcap_metadata_senonetwork.csv
+
+# Directory dati di input, download, output ed elaborazione
+data/downloads/
+data/input_pdf/
+data/output/
+data/state/
+data/patient_repository/
+data/redcap_cache/
+
+# ==============================================================================
+# Python: Bytecode, cache ed ambienti virtuali
+# ==============================================================================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Ambienti virtuali
+.venv/
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# Testing, type checking e coverage
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# ==============================================================================
+# IDE, Editor e file di sistema
+# ==============================================================================
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# ==============================================================================
+# File di log e temporanei
+# ==============================================================================
+*.log
+*.tmp

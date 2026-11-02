@@ -63,12 +63,19 @@ Pipeline clinica per estrazione dati da referti medici PDF (senologia) tramite I
 - **`PriamoDocument(BaseModel)`**: `document_id`, `event_id`, `repository_id`, `exam_name`, `local_path`.
 - **`PriamoPatient(BaseModel)`**: `patient_id` (idAnagPaz1), `name`, `surname`, `date_of_birth`, `slug`.
 - **`PriamoClient(settings=None, ...)`**: Client HTTP stateful con retry (`tenacity`) e Cloudflare Access headers caricati da `Settings`.
-  - `authenticate(force: bool = False) -> None`: GET form login -> estrae `__RequestVerificationToken` -> POST credenziali -> salva cookie `.PRIAMOAUTH`. Re-autentica su 401/403.
+  - `authenticate(force: bool = False) -> None`: GET form login -> estrae `__RequestVerificationToken` -> POST credenziali -> estrae e adatta cookie `.PRIAMOAUTH` anche in caso di domain mismatch su Cloudflare Tunnel. Re-autentica su 401/403.
   - `search_patient(name, surname, dob) -> Optional[PriamoPatient]`: GET `/PriamoCES/api/Anagrafica/GetAnagrafica`.
   - `get_patient_events(patient_id, start_date) -> List[dict]`: GET `/PriamoCES/api/Eventi/GetEvento`.
   - `get_event_documents(event_id) -> List[dict]`: GET `/PriamoCES/api/Documenti/GetDocumento`.
   - `download_document_pdf(doc_id, event_id, repo_id, dest_path) -> Path`: GET `/PriamoCES/Documento/GetReportTextToPdfToView`.
   - `fetch_all_patient_reports(patient, dest_dir) -> List[PriamoDocument]`: Cerca eventi, filtra referti disponibili (`referto!='N'`), scarica tutti i PDF nominati `{doc_id}_{exam}.pdf`.
+
+### `scripts/test_priamo_auth.py`
+- CLI di diagnosi e collaudo per l'autenticazione su Priamo esposto tramite Cloudflare Tunnel (`cloudflared`):
+  - Verifica connettività, header Cloudflare e Cloudflare Access Service Tokens.
+  - Ispeziona il form login e il token Anti-CSRF (`__RequestVerificationToken`).
+  - Analizza gli attributi del cookie `.PRIAMOAUTH` (evidenzia Cookie Domain Mismatch RFC 6265 responsabile del redirect loop su browser).
+  - Collauda gli endpoint REST `/PriamoCES/api/Anagrafica/GetAnagrafica` e `/PriamoCES/api/Eventi/GetEvento`.
 
 ### `src/dotnet_client.py`
 - **`DotNetApiClient(settings=None, ...)`**: Facade di accesso ai dati ospedalieri configurata con `Settings`.

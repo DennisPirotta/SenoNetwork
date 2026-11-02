@@ -131,8 +131,10 @@ class PatientPipeline:
             live_cache = self.settings.redcap_cache_file
             if live_cache and live_cache.exists():
                 self._all_metadata_fields = self.redcap_service.load_metadata_from_file(live_cache)
+                logger.info(f"-> Data dictionary caricato dalla cache locale ({len(self._all_metadata_fields)} campi totali).")
             else:
                 self._all_metadata_fields = self.redcap_service.fetch_metadata_from_api()
+                logger.info(f"-> Data dictionary scaricato via API ({len(self._all_metadata_fields)} campi totali).")
 
     def get_fields_for_form(self, form_name: str) -> List[REDCapField]:
         """Returns the extractable fields for a specific form, always including record_id."""
@@ -175,6 +177,8 @@ class PatientPipeline:
 
         total_pdfs = len(pdfs_to_process)
         logger.info(f"-> Trovati {total_pdfs} PDF di referti per il paziente {patient_id}.")
+        if total_pdfs == 0:
+            logger.warning(f"-> Nessun PDF di referto associato al paziente {patient_id}. Salto l'estrazione clinica IA.")
 
         # Step 2: Elaborazione IA
         doc_results: List[DocumentProcessingResult] = []
@@ -218,6 +222,10 @@ class PatientPipeline:
 
                 # 2.3 Estrazione strutturata dei campi del form
                 target_fields = self.get_fields_for_form(classified_form)
+                logger.info(
+                    f"-> Invio prompt al motore IA per estrazione di {len(target_fields)} campi "
+                    f"sul form '{classified_form}' (backend: {self.settings.ai_backend})..."
+                )
                 extraction_res = self.ai_extractor.extract_from_text(
                     report_text=report_text,
                     fields=target_fields,
