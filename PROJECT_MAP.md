@@ -28,10 +28,11 @@ Pipeline clinica per estrazione dati da referti medici PDF (senologia) tramite I
 | | `src/pipeline.py` | Pipeline generica batch su cartelle/file PDF locali con type hints unificati. |
 | **Interfaces** | `src/api_server.py` | FastAPI REST microservice con Dependency Injection, health-check completo e background tasks asincroni. |
 | | `src/cli.py` / `main.py` | CLI avanzata per esecuzione paziente, batch Excel, batch PDF, o server mode (immutabile kwargs init). |
-| **Scripts** | `scripts/start_llama_rpc_cluster.sh` | Bash script per avvio cluster distribuito llama.cpp su 2 GPU via RPC. |
+| **Scripts** | `scripts/test_remote_llamacpp.py` | Diagnostica e benchmarking server llama.cpp remoto/RPC (latenza, GBNF schema, estrazione clinica). |
+| | `scripts/start_llama_rpc_cluster.sh` | Bash script per avvio cluster distribuito llama.cpp su 2 GPU via RPC. |
+| | `scripts/create_sample_data.py` | Generatore referti sintetici PDF A4 per test. |
 | | `scripts/inspect_redcap_project.py` | Utility di test e dump metadata live da REDCap API. |
 | | `scripts/generate_redcap_summary.py`| Generatore documentazione markdown struttura REDCap (`docs/REDCAP_STRUCTURE.md`). |
-| | `scripts/create_sample_data.py` | Generatore referti sintetici PDF A4 per test. |
 
 ---
 
@@ -45,7 +46,7 @@ Pipeline clinica per estrazione dati da referti medici PDF (senologia) tramite I
   - `llama_cpp_api_mode: str = "chat"` ("chat" | "completion")
   - `llama_cpp_temperature: float = 0.0`, `llama_cpp_timeout_seconds: int = 180`
   - `ollama_base_url: str = "http://localhost:11434"`, `ollama_model: str = "llama3.2:3b"`
-  - `priamo_api_url`, `priamo_username`, `priamo_password`, `cloudflared_client_id` (alias `cf_client_id`), `cloudflared_client_secret`
+  - `priamo_api_url`, `priamo_username`, `priamo_password`, `priamo_cloudflared_client_id`, `priamo_cloudflared_client_secret`, `ai_cloudflared_client_id`, `ai_cloudflared_client_secret`
   - `dotnet_api_base_url`, `dotnet_api_key`
   - `allowed_webhook_hosts: Optional[List[str]] = None`, `allow_local_webhooks: bool = False` (protezione SSRF)
   - `pdf_input_dir`, `output_dir`, `downloads_dir`, `state_dir`, `redcap_cache_file`, `patients_excel_path`, `priamo_files_dir`
@@ -67,8 +68,8 @@ Pipeline clinica per estrazione dati da referti medici PDF (senologia) tramite I
   - `search_patient(name, surname, dob) -> Optional[PriamoPatient]`: GET `/PriamoCES/api/Anagrafica/GetAnagrafica`.
   - `get_patient_events(patient_id, start_date) -> List[dict]`: GET `/PriamoCES/api/Eventi/GetEvento`.
   - `get_event_documents(event_id) -> List[dict]`: GET `/PriamoCES/api/Documenti/GetDocumento`.
-  - `download_document_pdf(doc_id, event_id, repo_id, dest_path) -> Path`: GET `/PriamoCES/Documento/GetReportTextToPdfToView`.
-  - `fetch_all_patient_reports(patient, dest_dir) -> List[PriamoDocument]`: Cerca eventi, filtra referti disponibili (`referto!='N'`), scarica tutti i PDF nominati `{doc_id}_{exam}.pdf`.
+  - `download_document_pdf(doc_id, event_id, repo_id, dest_path, event_type, preferred_stato, versione) -> Path`: GET `/PriamoCES/Documento/GetReportTextToPdfToView`. Supporta sia `stato=FIRMATO` (documenti repository) sia `stato=REFERTATO` (testo ambulatoriale on-the-fly con `tipoEvento`, `versione=0`, `repository=N`) con fallback automatico tra le due modalità.
+  - `fetch_all_patient_reports(patient, dest_dir, max_workers) -> List[PriamoDocument]`: Cerca eventi in parallelo, scarica concorrentemente tutti i PDF tramite `ThreadPoolExecutor` con riuso delle connessioni HTTP persistenti, gestendo sia documenti di archivio sia referti ambulatoriali (`referto='S'`).
 
 ### `scripts/test_priamo_auth.py`
 - CLI di diagnosi e collaudo per l'autenticazione su Priamo esposto tramite Cloudflare Tunnel (`cloudflared`):

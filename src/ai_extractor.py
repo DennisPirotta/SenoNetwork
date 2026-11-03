@@ -1,5 +1,6 @@
 import json
 import logging
+import os
 import re
 import time
 from abc import ABC, abstractmethod
@@ -163,8 +164,9 @@ class BaseAIExtractor(ABC):
 
 
 class LlamaCppExtractor(BaseAIExtractor):
-    """Uses llama.cpp server (with distributed multi-GPU inference via RPC protocol)
-    to extract structured REDCap data from clinical report text.
+    """Uses llama.cpp server (with distributed multi-GPU inference via RPC protocol
+    or remote server behind Cloudflare Access) to extract structured REDCap data
+    from clinical report text.
     """
 
     def __init__(
@@ -174,19 +176,50 @@ class LlamaCppExtractor(BaseAIExtractor):
         model: str = "",
         temperature: float = 0.0,
         timeout_seconds: int = 180,
-        max_retries: int = 2
+        max_retries: int = 2,
+        cf_client_id: Optional[str] = None,
+        cf_client_secret: Optional[str] = None,
     ):
         super().__init__(timeout_seconds=timeout_seconds, max_retries=max_retries)
         self.base_url = base_url.rstrip("/")
         self.api_mode = api_mode.lower()
         self.model = model or "llama-cpp-rpc"
         self.temperature = temperature
+        self.cf_client_id = cf_client_id or os.getenv("AI_CLOUDFLARED_CLIENT_ID", "")
+        self.cf_client_secret = cf_client_secret or os.getenv("AI_CLOUDFLARED_CLIENT_SECRET", "")
+
+        self.headers: Dict[str, str] = {}
+        if self.cf_client_id and self.cf_client_secret:
+            self.headers["CF-Access-Client-Id"] = self.cf_client_id
+            self.headers["CF-Access-Client-Secret"] = self.cf_client_secret
+
+    def build_prompts(
+        self,
+        fields: List[REDCapField],
+        report_text: str
+    ) -> Tuple[str, str, Dict[str, Any]]:
+        """Constructs system prompt, user prompt, and JSON Schema for llama.cpp.
+
+        Since llama.cpp natively enforces formal JSON Schema (GBNF grammars) with field
+        descriptions, enums, and types directly at the logit level, we omit redundant
+        text guidelines. On large REDCap forms (e.g. chemioterapia with 68 fields),
+        redundant text adds >11,000 characters (~3,500 tokens), causing Cloudflare HTTP 524
+        gateway timeouts (100s limit).
+        """
+        json_schema = SchemaBuilder.build_json_schema(fields)
+        user_prompt = (
+            f"--- TESTO DEL REFERTO MEDICO ---\n"
+            f"{report_text}\n"
+            f"--- FINE REFERTO ---\n\n"
+            f"Estrai tutti i dati clinici presenti nel referto secondo i campi richiesti e restituisci il JSON:"
+        )
+        return self.SYSTEM_PROMPT, user_prompt, json_schema
 
     def is_available(self) -> bool:
         """Checks if the llama.cpp server is active and reachable."""
         # 1. Check /health
         try:
-            r = requests.get(f"{self.base_url}/health", timeout=5)
+            r = requests.get(f"{self.base_url}/health", headers=self.headers, timeout=5)
             if r.status_code == 200:
                 return True
         except Exception:
@@ -194,7 +227,7 @@ class LlamaCppExtractor(BaseAIExtractor):
 
         # 2. Check /v1/models
         try:
-            r = requests.get(f"{self.base_url}/v1/models", timeout=5)
+            r = requests.get(f"{self.base_url}/v1/models", headers=self.headers, timeout=5)
             if r.status_code == 200:
                 return True
         except Exception:
@@ -202,7 +235,7 @@ class LlamaCppExtractor(BaseAIExtractor):
 
         # 3. Check /props
         try:
-            r = requests.get(f"{self.base_url}/props", timeout=5)
+            r = requests.get(f"{self.base_url}/props", headers=self.headers, timeout=5)
             if r.status_code == 200:
                 return True
         except Exception:
@@ -231,7 +264,7 @@ class LlamaCppExtractor(BaseAIExtractor):
                 "n_predict": 4096,
                 "stream": False
             }
-            response = requests.post(endpoint, json=payload, timeout=self.timeout_seconds)
+            response = requests.post(endpoint, json=payload, headers=self.headers, timeout=self.timeout_seconds)
             response.raise_for_status()
             res_json = response.json()
             return res_json.get("content", "")
@@ -251,11 +284,11 @@ class LlamaCppExtractor(BaseAIExtractor):
             },
             "stream": False
         }
-        response = requests.post(endpoint, json=payload, timeout=self.timeout_seconds)
+        response = requests.post(endpoint, json=payload, headers=self.headers, timeout=self.timeout_seconds)
         if response.status_code != 200:
             # Fallback to general json_object if schema format argument unsupported
             payload["response_format"] = {"type": "json_object"}
-            response = requests.post(endpoint, json=payload, timeout=self.timeout_seconds)
+            response = requests.post(endpoint, json=payload, headers=self.headers, timeout=self.timeout_seconds)
 
         response.raise_for_status()
         res_json = response.json()
@@ -357,7 +390,9 @@ def get_ai_extractor(settings: Optional[Settings] = None) -> Union[LlamaCppExtra
             api_mode=cfg.llama_cpp_api_mode,
             model=cfg.llama_cpp_model,
             temperature=cfg.llama_cpp_temperature,
-            timeout_seconds=cfg.llama_cpp_timeout_seconds
+            timeout_seconds=cfg.llama_cpp_timeout_seconds,
+            cf_client_id=cfg.ai_cloudflared_client_id,
+            cf_client_secret=cfg.ai_cloudflared_client_secret,
         )
         if extractor.is_available():
             logger.info(f"Utilizzo motore IA locale: llama.cpp RPC Server ({cfg.llama_cpp_base_url})")

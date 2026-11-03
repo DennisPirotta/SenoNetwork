@@ -6,11 +6,15 @@ class SchemaBuilder:
     """Builds JSON Schema and prompt documentation from REDCap fields."""
 
     @staticmethod
-    def build_json_schema(fields: List[REDCapField]) -> Dict[str, Any]:
-        """Generates a JSON Schema compatible with Ollama's structured outputs (`format` parameter).
+    def build_json_schema(fields: List[REDCapField], enforce_all_required: bool = False) -> Dict[str, Any]:
+        """Generates a JSON Schema compatible with Ollama and llama.cpp structured outputs (`format`/`json_schema`).
 
         Args:
             fields: List of REDCap fields to include in the schema.
+            enforce_all_required: If True, marks every extractable field as required in the schema.
+                If False (default), only mandatory fields (e.g. required_field='y') are marked as required.
+                This avoids forcing the LLM to output dozens of redundant null entries, dramatically
+                cutting token decoding time and preventing gateway timeouts (Cloudflare 524).
 
         Returns:
             Dictionary representing a JSON Schema object.
@@ -94,14 +98,16 @@ class SchemaBuilder:
                     "description": field_desc
                 }
 
-            # We can mark fields as required in the JSON schema or let all be optional/nullable
-            required.append(field.field_name)
+            # Only mark as required if explicitly enforced or flagged required in REDCap dictionary
+            if enforce_all_required or (field.required_field and field.required_field.strip().lower() == "y"):
+                required.append(field.field_name)
 
-        schema = {
+        schema: Dict[str, Any] = {
             "type": "object",
-            "properties": properties,
-            "required": required
+            "properties": properties
         }
+        if required:
+            schema["required"] = required
         return schema
 
     @staticmethod

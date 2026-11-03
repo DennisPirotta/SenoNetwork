@@ -56,7 +56,11 @@ class AsyncTaskResponse(BaseModel):
 def health_check(settings: Settings = Depends(get_shared_settings)):
     """Checks the status of the local LLM servers (llama.cpp RPC and Ollama) and REDCap connection."""
     ollama = OllamaExtractor(base_url=settings.ollama_base_url)
-    llamacpp = LlamaCppExtractor(base_url=settings.llama_cpp_base_url)
+    llamacpp = LlamaCppExtractor(
+        base_url=settings.llama_cpp_base_url,
+        cf_client_id=settings.ai_cloudflared_client_id,
+        cf_client_secret=settings.ai_cloudflared_client_secret
+    )
     dotnet = DotNetApiClient(settings=settings)
 
     return {

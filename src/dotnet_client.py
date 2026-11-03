@@ -119,7 +119,9 @@ class DotNetApiClient:
         )
 
     def _download_from_generic_api(self, patient_id: str, destination_dir: Path) -> List[Path]:
-        """Queries a generic REST .NET API."""
+        """Queries a generic REST .NET API using multithreaded download workers."""
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
         url = f"{self.base_url}/patients/{patient_id}/documents"
         headers = {"Accept": "application/json"}
         if self.api_key:
@@ -129,18 +131,34 @@ class DotNetApiClient:
         resp.raise_for_status()
         docs = resp.json()
 
-        downloaded = []
-        for doc in docs:
+        if not docs:
+            return []
+
+        def _download_single(doc: Dict[str, Any]) -> Optional[Path]:
             doc_id = str(doc.get("id") or doc.get("document_id"))
             fname = doc.get("filename") or f"{doc_id}.pdf"
             dest = destination_dir / fname
             dl_url = f"{self.base_url}/patients/{patient_id}/documents/{doc_id}/download"
-            with requests.get(dl_url, headers=headers, stream=True, timeout=self.timeout_seconds) as r:
-                r.raise_for_status()
-                with open(dest, "wb") as f:
-                    for chunk in r.iter_content(chunk_size=8192):
-                        f.write(chunk)
-            downloaded.append(dest)
+            try:
+                with requests.get(dl_url, headers=headers, stream=True, timeout=self.timeout_seconds) as r:
+                    r.raise_for_status()
+                    with open(dest, "wb") as f:
+                        for chunk in r.iter_content(chunk_size=8192):
+                            f.write(chunk)
+                return dest
+            except Exception as e:
+                logger.error(f"Errore download doc {doc_id} da generic API: {e}")
+                return None
+
+        workers = getattr(self.settings, "priamo_max_workers", 8)
+        downloaded = []
+        with ThreadPoolExecutor(max_workers=min(workers, max(1, len(docs)))) as executor:
+            futures = [executor.submit(_download_single, doc) for doc in docs]
+            for fut in as_completed(futures):
+                p = fut.result()
+                if p:
+                    downloaded.append(p)
+
         return downloaded
 
     def _get_local_documents_mock(self, patient_id: str) -> List[Path]:
@@ -156,6 +174,8 @@ class DotNetApiClient:
         for sdir in search_dirs:
             if sdir and sdir.exists() and sdir.is_dir():
                 pdfs = sorted(list(sdir.glob("*.pdf")) + list(sdir.glob("*.PDF")))
+                if not pdfs:
+                    pdfs = sorted(list(sdir.rglob("*.pdf")) + list(sdir.rglob("*.PDF")))
                 if pdfs:
                     return pdfs
 

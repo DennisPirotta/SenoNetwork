@@ -739,12 +739,20 @@ def main():
     )
     parser.add_argument(
         "--cf-id",
-        default=env_cfg.get("CLOUDFLARED_CLIENT_ID") or env_cfg.get("CF_CLIENT_ID", ""),
+        default=(
+            env_cfg.get("PRIAMO_CLOUDFLARED_CLIENT_ID")
+            or env_cfg.get("CLOUDFLARED_CLIENT_ID")
+            or env_cfg.get("CF_CLIENT_ID", "")
+        ),
         help="Cloudflare Access Client ID (CF-Access-Client-Id)"
     )
     parser.add_argument(
         "--cf-secret",
-        default=env_cfg.get("CLOUDFLARED_CLIENT_SECRET") or env_cfg.get("CF_CLIENT_SECRET", ""),
+        default=(
+            env_cfg.get("PRIAMO_CLOUDFLARED_CLIENT_SECRET")
+            or env_cfg.get("CLOUDFLARED_CLIENT_SECRET")
+            or env_cfg.get("CF_CLIENT_SECRET", "")
+        ),
         help="Cloudflare Access Client Secret (CF-Access-Client-Secret)"
     )
     parser.add_argument(

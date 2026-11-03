@@ -50,6 +50,16 @@ class Settings(BaseSettings):
         default=180,
         description="Timeout in secondi per llama.cpp (supporta modelli distribuiti su 2 schede RPC)"
     )
+    ai_cloudflared_client_id: str = Field(
+        default="",
+        validation_alias=AliasChoices("ai_cloudflared_client_id", "ai_cf_client_id"),
+        description="Cloudflare Access Client ID per server inferenza llama.cpp (CF-Access-Client-Id)"
+    )
+    ai_cloudflared_client_secret: str = Field(
+        default="",
+        validation_alias=AliasChoices("ai_cloudflared_client_secret", "ai_cf_client_secret"),
+        description="Cloudflare Access Client Secret per server inferenza llama.cpp (CF-Access-Client-Secret)"
+    )
 
     # Local Ollama AI settings
     ollama_base_url: str = Field(
@@ -82,15 +92,29 @@ class Settings(BaseSettings):
         default="",
         description="Password per autenticazione su Priamo .NET"
     )
-    cloudflared_client_id: str = Field(
+    priamo_cloudflared_client_id: str = Field(
         default="",
-        validation_alias=AliasChoices("cloudflared_client_id", "cf_client_id"),
-        description="Cloudflare Access Client ID (CF-Access-Client-Id)"
+        validation_alias=AliasChoices(
+            "priamo_cloudflared_client_id",
+            "priamo_cf_client_id",
+            "cloudflared_client_id",
+            "cf_client_id",
+        ),
+        description="Cloudflare Access Client ID per Priamo (CF-Access-Client-Id)"
     )
-    cloudflared_client_secret: str = Field(
+    priamo_cloudflared_client_secret: str = Field(
         default="",
-        validation_alias=AliasChoices("cloudflared_client_secret", "cf_client_secret"),
-        description="Cloudflare Access Client Secret (CF-Access-Client-Secret)"
+        validation_alias=AliasChoices(
+            "priamo_cloudflared_client_secret",
+            "priamo_cf_client_secret",
+            "cloudflared_client_secret",
+            "cf_client_secret",
+        ),
+        description="Cloudflare Access Client Secret per Priamo (CF-Access-Client-Secret)"
+    )
+    priamo_max_workers: int = Field(
+        default=8,
+        description="Numero massimo di thread concorrenti per il download parallelo dei referti PDF da Priamo"
     )
 
     # Generic .NET API Settings
@@ -152,12 +176,28 @@ class Settings(BaseSettings):
     )
 
     @property
+    def cloudflared_client_id(self) -> str:
+        return self.priamo_cloudflared_client_id
+
+    @property
+    def cloudflared_client_secret(self) -> str:
+        return self.priamo_cloudflared_client_secret
+
+    @property
     def cf_client_id(self) -> str:
-        return self.cloudflared_client_id
+        return self.priamo_cloudflared_client_id
 
     @property
     def cf_client_secret(self) -> str:
-        return self.cloudflared_client_secret
+        return self.priamo_cloudflared_client_secret
+
+    @property
+    def ai_cf_client_id(self) -> str:
+        return self.ai_cloudflared_client_id
+
+    @property
+    def ai_cf_client_secret(self) -> str:
+        return self.ai_cloudflared_client_secret
 
 
 def get_settings() -> Settings:
