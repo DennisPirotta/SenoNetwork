@@ -25,10 +25,15 @@ Pipeline clinica per estrazione dati da referti medici PDF (senologia) tramite I
 | **AI Inference** | `src/ai_extractor.py` | `AIExtractor` Protocol + `BaseAIExtractor` (DRY prompt/schema, retry tenacity) + `LlamaCppExtractor` + `OllamaExtractor`. |
 | | `src/form_classifier.py` | Router automatico referto -> form REDCap (keywords, esame Priamo, fallback LLM basato su `Settings`). |
 | **Orchestration** | `src/patient_pipeline.py` | Pipeline paziente: Download .NET -> Classifica -> Estrai IA -> Carica REDCap -> Webhook SSRF-safe + State Tracking. |
+| | `src/sync_service.py` | Audit & Sync periodico: ispezione REDCap, rilevamento form mancanti (es. post-op histology), rilettura referti, calcolo diff e aggiornamento arricchito. |
+| | `src/audit_service.py` | Data Quality Auditor: matrice di avanzamento form, incongruenze cliniche/temporali, pTNM/grado, generazione report Markdown e JSON. |
 | | `src/pipeline.py` | Pipeline generica batch su cartelle/file PDF locali con type hints unificati. |
-| **Interfaces** | `src/api_server.py` | FastAPI REST microservice con Dependency Injection, health-check completo e background tasks asincroni. |
-| | `src/cli.py` / `main.py` | CLI avanzata per esecuzione paziente, batch Excel, batch PDF, o server mode (immutabile kwargs init). |
-| **Scripts** | `scripts/test_remote_llamacpp.py` | Diagnostica e benchmarking server llama.cpp remoto/RPC (latenza, GBNF schema, estrazione clinica). |
+| **Interfaces** | `src/api_server.py` | FastAPI REST microservice con Dependency Injection, health-check completo, background tasks asincroni, sync e report audit `/api/audit/*`. |
+| | `src/cli.py` / `main.py` | CLI avanzata per esecuzione paziente, batch Excel, batch PDF, server mode, audit (`--audit-redcap`) o sync (`--sync-redcap`). |
+| **Scripts** | `scripts/list_redcap_records.py` | CLI per elencare tutti i record REDCap con visualizzazione tabelle Rich, export JSON/CSV e filtri. |
+| | `scripts/audit_redcap_data.py` | CLI dashboard e generatore report su incongruenze, mancanze e panoramica generale dati REDCap. |
+| | `scripts/run_periodic_redcap_sync.py` | CLI runner / daemon schedulabile per audit periodico e aggiornamento dati clinici su REDCap. |
+| | `scripts/test_remote_llamacpp.py` | Diagnostica e benchmarking server llama.cpp remoto/RPC (latenza, GBNF schema, estrazione clinica). |
 | | `scripts/start_llama_rpc_cluster.sh` | Bash script per avvio cluster distribuito llama.cpp su 2 GPU via RPC. |
 | | `scripts/create_sample_data.py` | Generatore referti sintetici PDF A4 per test. |
 | | `scripts/inspect_redcap_project.py` | Utility di test e dump metadata live da REDCap API. |
@@ -95,6 +100,26 @@ Pipeline clinica per estrazione dati da referti medici PDF (senologia) tramite I
   - `load_metadata_from_file(path) -> List[REDCapField]`: Carica da CSV Data Dictionary o JSON esportato.
   - `filter_fields_by_form(fields, form_name) -> List[REDCapField]`: Filtra per strumento includendo sempre la primary key (`record_id`).
   - `import_records_to_api(records: List[dict]) -> dict`: POST `content=record, type=flat, overwriteBehavior=normal`.
+  - `export_records_from_api(records, fields, forms, events, filter_logic, ...) -> List[dict]`: POST `content=record, type=flat` per interrogazione e audit stato pazienti.
+  - `get_record(record_id, fields, forms) -> Optional[dict]`: Recupera singolo paziente da REDCap.
+  - `get_all_patient_ids() -> List[str]`: Elenco completo di tutti i `record_id` registrati nel progetto.
+  - `list_all_records(fields, forms, include_demographics, include_completion_status, filter_logic) -> List[dict]`: Elenca tutti i record presenti su REDCap con filtri e campi anagrafici/status.
+  - `get_records_summary() -> List[dict]`: Panoramica aggregata di tutti i record con avanzamento form e conteggio form completati.
+  - `find_record_id_by_demographics(name, surname, dob) -> Optional[str]`: Cerca e preserva il `record_id` nativo di REDCap per anagrafica.
+
+### `src/sync_service.py`
+- **`RedCapSyncService(settings, redcap_service, dotnet_client, ai_extractor, ...)`**:
+  - `get_patients_from_redcap(filter_incomplete_forms) -> List[dict]`: Filtra pazienti con form incompleti (`status != '2'`).
+  - `detect_incomplete_forms(redcap_record, candidate_forms) -> List[str]`: Rileva form mancanti/incompleti.
+  - `check_and_update_patient(patient_id, target_forms, auto_upload, dry_run, ...) -> PatientSyncResult`: Ispezione paziente, download e analisi nuovi referti (es. istologico post-operatorio), estrazione IA, diff per campo e upload.
+  - `sync_all(target_forms, auto_upload, dry_run, limit, ...) -> SyncSummaryReport`: Ciclo completo su coorte con salvataggio log in `data/output/sync/`.
+  - `run_periodic(interval_seconds, target_forms, ...) -> None`: Daemon loop per esecuzione schedulata continua.
+
+### `src/audit_service.py`
+- **`RedCapDataAuditor(settings, redcap_service)`**:
+  - `run_audit(records=None, patient_id=None) -> RedCapAuditReport`: Analisi completa di avanzamento form, incongruenze cliniche, date e pTNM.
+  - `generate_markdown_report(report) -> str`: Genera report formattato Markdown con alert e tabelle.
+  - `export_reports(report, output_dir) -> Dict[str, Path]`: Esporta report Markdown e JSON in `data/output/reports/`.
 
 ### `src/schema_builder.py`
 - **`SchemaBuilder`**:

@@ -89,11 +89,27 @@ class DotNetApiClient:
 
         # 3. Local fallback mock / pre-downloaded files
         logger.info(f"Ricerca file locali per paziente {patient_id}...")
-        return self._get_local_documents_mock(patient_id)
+        return self._get_local_documents_mock(
+            patient_id=patient_id,
+            name=name,
+            surname=surname,
+            date_of_birth=date_of_birth
+        )
 
-    def get_patient_documents(self, patient_id: str) -> List[Dict[str, Any]]:
+    def get_patient_documents(
+        self,
+        patient_id: str,
+        name: Optional[str] = None,
+        surname: Optional[str] = None,
+        date_of_birth: Optional[Union[date, str]] = None
+    ) -> List[Dict[str, Any]]:
         """Returns metadata list of available documents for a patient."""
-        pdfs = self._get_local_documents_mock(patient_id)
+        pdfs = self._get_local_documents_mock(
+            patient_id=patient_id,
+            name=name,
+            surname=surname,
+            date_of_birth=date_of_birth
+        )
         return [{"id": p.stem, "document_id": p.stem, "filename": p.name, "path": str(p)} for p in pdfs]
 
     def _resolve_patient(self, identifier: str) -> Optional[PriamoPatient]:
@@ -161,33 +177,53 @@ class DotNetApiClient:
 
         return downloaded
 
-    def _get_local_documents_mock(self, patient_id: str) -> List[Path]:
-        """Checks local directories for documents specifically belonging to patient_id."""
-        search_dirs = [
-            Path("data/patient_repository") / patient_id,
-            self.settings.downloads_dir / patient_id,
-        ]
+    def _get_local_documents_mock(
+        self,
+        patient_id: str,
+        name: Optional[str] = None,
+        surname: Optional[str] = None,
+        date_of_birth: Optional[Union[date, str]] = None
+    ) -> List[Path]:
+        """Checks local directories for documents specifically belonging to patient_id.
+        Preserves REDCap's native patient_id/record_id, while also checking candidate slug
+        subfolders if demographics are known.
+        """
+        candidate_ids = [str(patient_id)]
+        if name and surname:
+            dob_str = ""
+            if date_of_birth:
+                dob_str = date_of_birth.isoformat() if isinstance(date_of_birth, date) else str(date_of_birth)
+            raw_slug = f"{name}-{surname}-{dob_str}".lower().replace(" ", "-").strip("-")
+            clean_slug = re.sub(r"[^a-z0-9\-]", "", raw_slug)
+            if clean_slug and clean_slug not in candidate_ids:
+                candidate_ids.append(clean_slug)
 
-        if self.settings.priamo_files_dir:
-            search_dirs.insert(0, Path(self.settings.priamo_files_dir) / patient_id)
+        for cid in candidate_ids:
+            search_dirs = [
+                Path("data/patient_repository") / cid,
+                self.settings.downloads_dir / cid,
+            ]
+            if self.settings.priamo_files_dir:
+                search_dirs.insert(0, Path(self.settings.priamo_files_dir) / cid)
 
-        for sdir in search_dirs:
-            if sdir and sdir.exists() and sdir.is_dir():
-                pdfs = sorted(list(sdir.glob("*.pdf")) + list(sdir.glob("*.PDF")))
-                if not pdfs:
-                    pdfs = sorted(list(sdir.rglob("*.pdf")) + list(sdir.rglob("*.PDF")))
-                if pdfs:
-                    return pdfs
+            for sdir in search_dirs:
+                if sdir and sdir.exists() and sdir.is_dir():
+                    pdfs = sorted(list(sdir.glob("*.pdf")) + list(sdir.glob("*.PDF")))
+                    if not pdfs:
+                        pdfs = sorted(list(sdir.rglob("*.pdf")) + list(sdir.rglob("*.PDF")))
+                    if pdfs:
+                        return pdfs
 
-        # Also check if files in data/input_pdf contain the patient_id in their filename
+        # Also check if files in data/input_pdf contain any candidate_id in their filename
         input_pdf_dir = Path("data/input_pdf")
         if input_pdf_dir.exists():
-            matched = [
-                p for p in sorted(list(input_pdf_dir.glob("*.pdf")) + list(input_pdf_dir.glob("*.PDF")))
-                if patient_id.lower() in p.stem.lower()
-            ]
-            if matched:
-                return matched
+            for cid in candidate_ids:
+                matched = [
+                    p for p in sorted(list(input_pdf_dir.glob("*.pdf")) + list(input_pdf_dir.glob("*.PDF")))
+                    if cid.lower() in p.stem.lower()
+                ]
+                if matched:
+                    return matched
 
         return []
 

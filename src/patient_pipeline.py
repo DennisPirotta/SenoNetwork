@@ -159,6 +159,24 @@ class PatientPipeline:
     ) -> PatientPipelineResult:
         """Executes the complete pipeline for a single patient."""
         start_time = time.time()
+
+        # Mantenimento del record_id nativo di REDCap:
+        # Se il paziente esiste già su REDCap (verificato tramite nome, cognome e data di nascita),
+        # riutilizza tassativamente il record_id di REDCap per evitare la creazione di duplicati.
+        try:
+            if name and surname and self.redcap_service.api_url and self.redcap_service.api_token:
+                matched_redcap_id = self.redcap_service.find_record_id_by_demographics(
+                    name=name, surname=surname, date_of_birth=date_of_birth
+                )
+                if matched_redcap_id and matched_redcap_id != str(patient_id):
+                    logger.info(
+                        f"-> Mantenuto record_id nativo di REDCap: '{matched_redcap_id}' "
+                        f"(invece dell'identificatore transitorio '{patient_id}')"
+                    )
+                    patient_id = matched_redcap_id
+        except Exception as e:
+            logger.debug(f"Verifica record_id REDCap su anagrafica non riuscita: {e}")
+
         logger.info(f"=== INIZIO PIPELINE PER PAZIENTE: {patient_id} ({name or ''} {surname or ''}) ===")
 
         # Step 1: Estrazione PDF da API .NET (Priamo o REST) se non forniti manualmente

@@ -1,4 +1,5 @@
 import csv
+from datetime import date, datetime
 import io
 import json
 import logging
@@ -193,3 +194,252 @@ class REDCapService:
         response = requests.post(self.api_url, data=payload, timeout=60)
         response.raise_for_status()
         return response.json()
+
+    def export_records_from_api(
+        self,
+        records: Optional[List[str]] = None,
+        fields: Optional[List[str]] = None,
+        forms: Optional[List[str]] = None,
+        events: Optional[List[str]] = None,
+        filter_logic: Optional[str] = None,
+        raw_or_label: str = "raw",
+        export_checkbox_label: bool = False,
+    ) -> List[Dict[str, Any]]:
+        """Exports records from REDCap API in flat JSON format.
+
+        Args:
+            records: Optional list of record IDs to retrieve.
+            fields: Optional list of specific field names.
+            forms: Optional list of specific form/instrument names.
+            events: Optional list of event names (for longitudinal projects).
+            filter_logic: Optional REDCap filter logic string (e.g. "[anatomia_patologica_complete] != '2'").
+            raw_or_label: 'raw' (default) or 'label'.
+            export_checkbox_label: Whether to export checkbox labels instead of 0/1.
+
+        Returns:
+            List of records in REDCap flat format.
+        """
+        if not self.api_url or not self.api_token:
+            raise ValueError("REDCap API URL and Token are required to export records.")
+
+        payload: Dict[str, Any] = {
+            "token": self.api_token,
+            "content": "record",
+            "format": "json",
+            "type": "flat",
+            "rawOrLabel": raw_or_label,
+            "rawOrLabelHeaders": "raw",
+            "exportCheckboxLabel": "true" if export_checkbox_label else "false",
+            "exportSurveyFields": "false",
+            "exportDataAccessGroups": "false",
+            "returnFormat": "json"
+        }
+        if records:
+            for idx, rec in enumerate(records):
+                payload[f"records[{idx}]"] = str(rec)
+        if fields:
+            for idx, f in enumerate(fields):
+                payload[f"fields[{idx}]"] = str(f)
+        if forms:
+            for idx, frm in enumerate(forms):
+                payload[f"forms[{idx}]"] = str(frm)
+        if events:
+            for idx, evt in enumerate(events):
+                payload[f"events[{idx}]"] = str(evt)
+        if filter_logic:
+            payload["filterLogic"] = filter_logic
+
+        response = requests.post(self.api_url, data=payload, timeout=60)
+        response.raise_for_status()
+        data = response.json()
+        if not isinstance(data, list):
+            raise ValueError(f"Unexpected response from REDCap API: {data}")
+        return data
+
+    def get_record(
+        self,
+        record_id: str,
+        fields: Optional[List[str]] = None,
+        forms: Optional[List[str]] = None
+    ) -> Optional[Dict[str, Any]]:
+        """Fetches a single record by record_id. Returns None if not found."""
+        records = self.export_records_from_api(
+            records=[str(record_id)],
+            fields=fields,
+            forms=forms
+        )
+        if records and len(records) > 0:
+            return records[0]
+        return None
+
+    def get_all_patient_ids(self) -> List[str]:
+        """Returns all record_ids currently present in the REDCap project."""
+        records = self.export_records_from_api(fields=["record_id"])
+        ids = []
+        for r in records:
+            rec_id = str(r.get("record_id", "")).strip()
+            if rec_id and rec_id not in ids:
+                ids.append(rec_id)
+        return ids
+
+    def find_record_id_by_demographics(
+        self,
+        name: Optional[str] = None,
+        surname: Optional[str] = None,
+        date_of_birth: Optional[Union[date, str]] = None
+    ) -> Optional[str]:
+        """Searches REDCap for an existing patient by name, surname and date of birth.
+
+        Returns the native REDCap 'record_id' if found, preserving the original project
+        primary key and avoiding accidental creation of duplicate patient records.
+        """
+        if not name or not surname:
+            return None
+
+        clean_name = name.strip().lower()
+        clean_surname = surname.strip().lower()
+        dob_str = ""
+        if date_of_birth:
+            if isinstance(date_of_birth, date):
+                dob_str = date_of_birth.strftime("%Y-%m-%d")
+            else:
+                s = str(date_of_birth).strip()
+                for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%Y/%m/%d", "%d-%m-%Y"):
+                    try:
+                        dob_str = datetime.strptime(s[:10], fmt).strftime("%Y-%m-%d")
+                        break
+                    except ValueError:
+                        continue
+                if not dob_str:
+                    dob_str = s
+
+        try:
+            records = self.export_records_from_api(
+                fields=["record_id", "name", "surname", "date_of_birth"]
+            )
+            for r in records:
+                r_name = str(r.get("name") or "").strip().lower()
+                r_surname = str(r.get("surname") or "").strip().lower()
+                r_dob = str(r.get("date_of_birth") or "").strip()
+
+                if r_name == clean_name and r_surname == clean_surname:
+                    if dob_str and r_dob:
+                        if r_dob == dob_str:
+                            return str(r.get("record_id"))
+                    else:
+                        return str(r.get("record_id"))
+        except Exception as e:
+            logger.warning(f"Errore ricerca record_id su REDCap tramite anagrafica: {e}")
+
+        return None
+
+    def list_all_records(
+        self,
+        fields: Optional[List[str]] = None,
+        forms: Optional[List[str]] = None,
+        include_demographics: bool = True,
+        include_completion_status: bool = False,
+        filter_logic: Optional[str] = None
+    ) -> List[Dict[str, Any]]:
+        """Lists all records from the REDCap project.
+
+        Args:
+            fields: Specific list of fields to retrieve. If None, retrieves all project fields or default summary fields.
+            forms: Optional list of form names to retrieve.
+            include_demographics: If True, ensures record_id, name, surname, date_of_birth are included.
+            include_completion_status: If True, ensures {form}_complete fields are included.
+            filter_logic: Optional REDCap filter logic expression.
+
+        Returns:
+            List of record dictionaries from REDCap.
+        """
+        target_fields = list(fields) if fields else []
+        if include_demographics:
+            for f in ["record_id", "name", "surname", "date_of_birth"]:
+                if f not in target_fields:
+                    target_fields.append(f)
+
+        if include_completion_status:
+            for frm in [
+                "dati_del_paziente",
+                "radiologia",
+                "anatomia_patologica_preoperatoria",
+                "struttura_della_lesione",
+                "anatomia_patologica",
+                "chemioterapia",
+                "radioterapia",
+                "recidiva",
+            ]:
+                flag_key = f"{frm}_complete"
+                if flag_key not in target_fields:
+                    target_fields.append(flag_key)
+
+        query_fields = target_fields if (fields or include_completion_status or (include_demographics and not forms)) else None
+
+        return self.export_records_from_api(
+            fields=query_fields,
+            forms=forms,
+            filter_logic=filter_logic
+        )
+
+    def get_records_summary(self) -> List[Dict[str, Any]]:
+        """Returns a high-level summary list of all records with demographics and form status flags."""
+        records = self.list_all_records(include_demographics=True, include_completion_status=True)
+        summary = []
+        for r in records:
+            forms_status = {}
+            completed_count = 0
+            for frm in [
+                "dati_del_paziente",
+                "radiologia",
+                "anatomia_patologica_preoperatoria",
+                "struttura_della_lesione",
+                "anatomia_patologica",
+                "chemioterapia",
+                "radioterapia",
+                "recidiva",
+            ]:
+                st = str(r.get(f"{frm}_complete") or "").strip()
+                label = "Completato" if st == "2" else ("Non verificato" if st == "1" else ("Incompleto" if st == "0" else "Non iniziato"))
+                forms_status[frm] = label
+                if st == "2":
+                    completed_count += 1
+
+            summary.append({
+                "record_id": str(r.get("record_id", "")),
+                "name": r.get("name", ""),
+                "surname": r.get("surname", ""),
+                "date_of_birth": r.get("date_of_birth", ""),
+                "forms_completed_count": completed_count,
+                "forms_status": forms_status,
+                "raw_record": r
+            })
+        return summary
+
+
+def list_redcap_records(
+    api_url: Optional[str] = None,
+    api_token: Optional[str] = None,
+    fields: Optional[List[str]] = None,
+    forms: Optional[List[str]] = None,
+    include_demographics: bool = True,
+    include_completion_status: bool = True,
+    filter_logic: Optional[str] = None
+) -> List[Dict[str, Any]]:
+    """Convenience top-level function to list all records from REDCap.
+
+    If api_url and api_token are omitted, they are automatically read from environment/.env.
+    """
+    from src.config import get_settings
+    cfg = get_settings()
+    service = REDCapService(
+        api_url=api_url or cfg.redcap_api_url,
+        api_token=api_token or cfg.redcap_api_token
+    )
+    return service.list_all_records(
+        fields=fields,
+        forms=forms,
+        include_demographics=include_demographics,
+        include_completion_status=include_completion_status,
+        filter_logic=filter_logic
+    )

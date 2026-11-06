@@ -154,3 +154,57 @@ def test_load_metadata_json_and_csv():
     field_names_csv = [f.field_name for f in fields_csv]
     assert "record_id" in field_names_csv
     assert "istotipo" in field_names_csv
+
+
+def test_list_all_records_and_summary():
+    """Tests list_all_records and get_records_summary methods."""
+    from unittest.mock import patch, MagicMock
+
+    service = REDCapService(api_url="https://mock.redcap/api/", api_token="TOKEN")
+    mock_records = [
+        {
+            "record_id": "PZ-01",
+            "name": "Maria",
+            "surname": "Rossi",
+            "date_of_birth": "1965-01-01",
+            "dati_del_paziente_complete": "2",
+            "radiologia_complete": "2",
+            "anatomia_patologica_complete": "0"
+        },
+        {
+            "record_id": "PZ-02",
+            "name": "Luisa",
+            "surname": "Verdi",
+            "date_of_birth": "1970-05-15",
+            "dati_del_paziente_complete": "2",
+            "radiologia_complete": "0",
+            "anatomia_patologica_complete": "2"
+        }
+    ]
+
+    with patch.object(service, "export_records_from_api", return_value=mock_records) as mock_export:
+        records = service.list_all_records(include_demographics=True, include_completion_status=True)
+        assert len(records) == 2
+        assert records[0]["record_id"] == "PZ-01"
+        assert mock_export.called
+
+        # Test summary
+        summary = service.get_records_summary()
+        assert len(summary) == 2
+        assert summary[0]["record_id"] == "PZ-01"
+        assert summary[0]["name"] == "Maria"
+        assert summary[0]["forms_completed_count"] == 2
+        assert summary[0]["forms_status"]["dati_del_paziente"] == "Completato"
+        assert summary[0]["forms_status"]["anatomia_patologica"] == "Incompleto"
+
+
+def test_list_redcap_records_top_level_function():
+    """Tests top-level helper function list_redcap_records."""
+    from unittest.mock import patch
+    from src.redcap_service import list_redcap_records
+
+    mock_records = [{"record_id": "1", "name": "Anna", "surname": "Neri"}]
+    with patch("src.redcap_service.REDCapService.export_records_from_api", return_value=mock_records):
+        res = list_redcap_records(api_url="https://mock.url/api/", api_token="TOKEN")
+        assert len(res) == 1
+        assert res[0]["record_id"] == "1"

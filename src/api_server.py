@@ -11,8 +11,10 @@ from pydantic import BaseModel
 from src.ai_extractor import LlamaCppExtractor, OllamaExtractor
 from src.config import Settings, get_settings
 from src.dotnet_client import DotNetApiClient
+from src.audit_service import RedCapAuditReport, RedCapDataAuditor
 from src.patient_pipeline import PatientPipeline, PatientPipelineResult
 from src.redcap_service import REDCapService
+from src.sync_service import PatientSyncResult, RedCapSyncService, SyncSummaryReport
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +36,24 @@ def get_shared_settings() -> Settings:
 def get_pipeline(settings: Settings = Depends(get_shared_settings)) -> PatientPipeline:
     """Dependency provider for PatientPipeline."""
     return PatientPipeline(settings=settings)
+
+
+def get_sync_service(settings: Settings = Depends(get_shared_settings)) -> RedCapSyncService:
+    """Dependency provider for RedCapSyncService."""
+    return RedCapSyncService(settings=settings)
+
+
+class SyncTriggerRequest(BaseModel):
+    patient_id: Optional[str] = None
+    name: Optional[str] = None
+    surname: Optional[str] = None
+    date_of_birth: Optional[str] = None
+    target_forms: Optional[List[str]] = None
+    auto_upload: bool = True
+    dry_run: bool = False
+    force_reprocess: bool = False
+    limit: Optional[int] = None
+    only_incomplete: bool = True
 
 
 class PatientTriggerRequest(BaseModel):
@@ -258,6 +278,209 @@ async def process_patient_uploaded_pdfs(
         return result
     except Exception as e:
         logger.error(f"Errore elaborazione PDF caricati per {patient_id}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+def _run_background_sync(
+    task_id: str,
+    sync_service: RedCapSyncService,
+    req: SyncTriggerRequest
+):
+    """Executes the audit & sync pipeline in background worker."""
+    _tasks_store[task_id]["status"] = "processing"
+    _tasks_store[task_id]["started_at"] = time.time()
+    try:
+        if req.patient_id:
+            res = sync_service.check_and_update_patient(
+                patient_id=req.patient_id,
+                name=req.name,
+                surname=req.surname,
+                dob=req.date_of_birth,
+                target_forms=req.target_forms,
+                auto_upload=req.auto_upload,
+                dry_run=req.dry_run,
+                force_reprocess=req.force_reprocess
+            )
+            _tasks_store[task_id]["status"] = "completed"
+            _tasks_store[task_id]["result"] = res.model_dump()
+        else:
+            report = sync_service.sync_all(
+                target_forms=req.target_forms,
+                auto_upload=req.auto_upload,
+                dry_run=req.dry_run,
+                force_reprocess=req.force_reprocess,
+                limit=req.limit,
+                only_incomplete=req.only_incomplete
+            )
+            _tasks_store[task_id]["status"] = "completed"
+            _tasks_store[task_id]["result"] = report.model_dump()
+    except Exception as e:
+        logger.error(f"Errore task background sync {task_id}: {e}")
+        _tasks_store[task_id]["status"] = "failed"
+        _tasks_store[task_id]["error"] = str(e)
+    finally:
+        _tasks_store[task_id]["finished_at"] = time.time()
+
+
+@app.post("/api/sync/check-updates")
+def sync_check_updates_sync(
+    req: Optional[SyncTriggerRequest] = None,
+    sync_service: RedCapSyncService = Depends(get_sync_service)
+):
+    """Synchronous audit and sync:
+    Checks REDCap records, discovers new reports or incomplete forms (e.g. post-op histopathology),
+    runs local AI extraction and updates REDCap.
+    """
+    params = req or SyncTriggerRequest()
+    try:
+        if params.patient_id:
+            return sync_service.check_and_update_patient(
+                patient_id=params.patient_id,
+                name=params.name,
+                surname=params.surname,
+                dob=params.date_of_birth,
+                target_forms=params.target_forms,
+                auto_upload=params.auto_upload,
+                dry_run=params.dry_run,
+                force_reprocess=params.force_reprocess
+            )
+        else:
+            return sync_service.sync_all(
+                target_forms=params.target_forms,
+                auto_upload=params.auto_upload,
+                dry_run=params.dry_run,
+                force_reprocess=params.force_reprocess,
+                limit=params.limit,
+                only_incomplete=params.only_incomplete
+            )
+    except Exception as e:
+        logger.error(f"Errore esecuzione sync REDCap: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/sync/check-updates-async", response_model=AsyncTaskResponse)
+def sync_check_updates_async(
+    background_tasks: BackgroundTasks,
+    req: Optional[SyncTriggerRequest] = None,
+    sync_service: RedCapSyncService = Depends(get_sync_service)
+):
+    """Asynchronous audit and sync:
+    Queues sync in background and returns task_id immediately.
+    """
+    params = req or SyncTriggerRequest()
+    task_id = str(uuid.uuid4())
+    p_id = params.patient_id or "all_patients"
+
+    _tasks_store[task_id] = {
+        "task_id": task_id,
+        "patient_id": p_id,
+        "status": "queued",
+        "created_at": time.time(),
+        "result": None,
+        "error": None
+    }
+
+    background_tasks.add_task(
+        _run_background_sync,
+        task_id=task_id,
+        sync_service=sync_service,
+        req=params
+    )
+
+    return AsyncTaskResponse(
+        task_id=task_id,
+        status="queued",
+        patient_id=p_id,
+        message=f"Sync REDCap accodato in background per {p_id}."
+    )
+
+
+@app.get("/api/sync/incomplete-patients")
+def get_incomplete_patients(
+    form: Optional[str] = None,
+    sync_service: RedCapSyncService = Depends(get_sync_service)
+):
+    """Returns patients currently in REDCap who have incomplete forms (e.g. form=anatomia_patologica)."""
+    filter_forms = [form] if form else None
+    try:
+        return sync_service.get_patients_from_redcap(filter_incomplete_forms=filter_forms)
+    except Exception as e:
+        logger.error(f"Errore recupero pazienti incompleti: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/sync/latest-report")
+def get_latest_sync_report(settings: Settings = Depends(get_shared_settings)):
+    """Returns the most recent sync audit report JSON from disk."""
+    audit_dir = settings.sync_audit_dir
+    if not audit_dir.exists():
+        raise HTTPException(status_code=404, detail="Nessun report di audit trovato.")
+
+    reports = sorted(list(audit_dir.glob("sync_report_*.json")), reverse=True)
+    if not reports:
+        raise HTTPException(status_code=404, detail="Nessun report di audit trovato.")
+
+    try:
+        with open(reports[0], "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Errore lettura report: {e}")
+
+
+@app.get("/api/audit/report", response_model=RedCapAuditReport)
+def get_audit_data_quality_report(
+    patient_id: Optional[str] = None,
+    settings: Settings = Depends(get_shared_settings)
+):
+    """Executes a full live data quality audit of REDCap records,
+    detecting clinical inconsistencies, missing post-operative pathology,
+    temporal date anomalies, and calculating completion rates.
+    """
+    auditor = RedCapDataAuditor(settings=settings)
+    try:
+        report = auditor.run_audit(patient_id=patient_id)
+        auditor.export_reports(report)
+        return report
+    except Exception as e:
+        logger.error(f"Errore generazione audit report: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/redcap/records")
+def get_all_redcap_records(
+    limit: Optional[int] = None,
+    filter_logic: Optional[str] = None,
+    form: Optional[str] = None,
+    settings: Settings = Depends(get_shared_settings)
+):
+    """Returns list of all records in the REDCap project with demographics and form status flags."""
+    svc = REDCapService(api_url=settings.redcap_api_url, api_token=settings.redcap_api_token)
+    forms_list = [form] if form else None
+    try:
+        records = svc.list_all_records(
+            forms=forms_list,
+            include_demographics=True,
+            include_completion_status=True,
+            filter_logic=filter_logic
+        )
+        if limit:
+            records = records[:limit]
+        return records
+    except Exception as e:
+        logger.error(f"Errore recupero lista record REDCap: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/redcap/records/summary")
+def get_redcap_records_summary(
+    settings: Settings = Depends(get_shared_settings)
+):
+    """Returns high-level summary overview of all records on REDCap."""
+    svc = REDCapService(api_url=settings.redcap_api_url, api_token=settings.redcap_api_token)
+    try:
+        return svc.get_records_summary()
+    except Exception as e:
+        logger.error(f"Errore generazione riassunto record REDCap: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 

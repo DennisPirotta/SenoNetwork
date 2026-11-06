@@ -145,6 +145,28 @@ class Settings(BaseSettings):
         description="Consenti webhook verso localhost o IP privati (usare solo in ambiente di sviluppo locale)"
     )
 
+    # Sync / Audit Settings (Controllo periodico e aggiornamento dati REDCap)
+    sync_interval_minutes: int = Field(
+        default=60,
+        description="Intervallo in minuti per il controllo periodico di aggiornamento dei referti su REDCap"
+    )
+    sync_auto_upload: bool = Field(
+        default=True,
+        description="Se True, carica automaticamente le modifiche e i nuovi dati estratti su REDCap"
+    )
+    sync_overwrite_mode: str = Field(
+        default="fill_missing",
+        description="Modalità di aggiornamento: 'fill_missing' (arricchisce solo campi vuoti/nuovi) o 'overwrite' (sovrascrive sempre)"
+    )
+    sync_target_forms: Optional[List[str]] = Field(
+        default=None,
+        description="Lista opzionale di form REDCap prioritari da controllare (es. ['anatomia_patologica', 'struttura_della_lesione'])"
+    )
+    sync_audit_dir: Path = Field(
+        default=Path("./data/output/sync"),
+        description="Cartella in cui archiviare i report di audit e riconciliazione periodica"
+    )
+
     # Paths and Cohort Directories
     pdf_input_dir: Path = Field(
         default=Path("./data/input_pdf"),
