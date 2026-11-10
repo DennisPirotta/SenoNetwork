@@ -46,21 +46,44 @@ def test_split_nominativo_prefixes():
     assert split_nominativo("De Martinis Annunziata") == ("De Martinis", "Annunziata")
     assert split_nominativo("La Delfa Rita") == ("La Delfa", "Rita")
     assert split_nominativo("De Giani Sonia") == ("De Giani", "Sonia")
+    assert split_nominativo("El Sayed Fatima") == ("El Sayed", "Fatima")
+
+    # Prefissi composti all'inizio (es. De La, Van Der)
+    assert split_nominativo("De La Cruz Maria") == ("De La Cruz", "Maria")
+    assert split_nominativo("De La Cruz") == ("De La Cruz", None)
+    assert split_nominativo("Van Der Bellen Alexander") == ("Van Der Bellen", "Alexander")
 
     # Prefisso solo cognome (2 parti)
     assert split_nominativo("Di Grigoli") == ("Di Grigoli", None)
 
 
 def test_split_nominativo_intermediate_particles():
-    # Preposizioni intermedie nel cognome
+    # Preposizioni intermedie nel cognome con 2 particelle (spagnolo/portoghese)
+    assert split_nominativo("Herrera de la rosa Rosaura") == ("Herrera De La Rosa", "Rosaura")
     assert split_nominativo("Herrera della rosa Rosaura") == ("Herrera Della Rosa", "Rosaura")
     assert split_nominativo("Mateo De Los Santos Arelis") == ("Mateo De Los Santos", "Arelis")
 
+    # Preposizioni intermedie con 1 particella o congiunzione
+    assert split_nominativo("Lopez del Rio Juan Carlos") == ("Lopez Del Rio", "Juan Carlos")
+    assert split_nominativo("Garcia y Vega Carmen") == ("Garcia Y Vega", "Carmen")
+    assert split_nominativo("Silva da Costa Maria") == ("Silva Da Costa", "Maria")
+    assert split_nominativo("Pereira dos Santos Ana") == ("Pereira Dos Santos", "Ana")
+
 
 def test_split_nominativo_compound_surnames():
-    # Doppi cognomi
+    # Doppi cognomi asindetici
     assert split_nominativo("Cantali Carnesano Francesca") == ("Cantali Carnesano", "Francesca")
     assert split_nominativo("Jaime Rojas Leonor") == ("Jaime Rojas", "Leonor")
+
+
+def test_split_nominativo_arabic_and_hyphenated():
+    # Nomi arabi con patronimici
+    assert split_nominativo("Ismail Sohair Farouk Abdelmeguid") == ("Ismail", "Sohair Farouk Abdelmeguid")
+    assert split_nominativo("Mekhaeel Mariam Fayez Camel") == ("Mekhaeel", "Mariam Fayez Camel")
+
+    # Nomi con trattino interno
+    assert split_nominativo("Al-Hassan Omar") == ("Al-Hassan", "Omar")
+    assert split_nominativo("Smith-Jones Anna") == ("Smith-Jones", "Anna")
 
 
 def test_split_nominativo_multiple_first_names():

@@ -212,3 +212,47 @@ def test_search_patient_with_accents_converted(mock_priamo_settings):
             params = call_kwargs["params"]
             assert params["Cognome"] == "Salvade'"
 
+
+def test_search_patient_compound_permutation_fallback(mock_priamo_settings):
+    """Verifica che search_patient provi automaticamente le permutazioni di partizione
+
+    (es. per doppi cognomi ispanici) quando la ricerca standard fallisce.
+    """
+    client = PriamoClient(settings=mock_priamo_settings)
+
+    empty_resp = MagicMock()
+    empty_resp.status_code = 200
+    empty_resp.json.return_value = []
+
+    success_resp = MagicMock()
+    success_resp.status_code = 200
+    success_resp.json.return_value = [
+        {
+            "datiMef": {
+                "cognome": "JAIME ROJAS",
+                "nome": "LEONOR ISIDORA",
+                "codiceFiscale": "JMRLRS74P42Z611W",
+                "comuneNascita": {"nome": "PERU'"}
+            },
+            "datiAa": {
+                "progressivoPaz1": 1613811
+            }
+        }
+    ]
+
+    # Simula primo tentativo fallito (Jaime / Rojas Leonor), ma successo con la permutazione (Jaime Rojas / Leonor)
+    def mock_request(method, url, params=None, **kwargs):
+        if params.get("Cognome") == "Jaime Rojas" and params.get("Nome") == "Leonor":
+            return success_resp
+        return empty_resp
+
+    with patch.object(client, "authenticate"):
+        with patch.object(client, "_request", side_effect=mock_request):
+            p = client.search_patient(name="Rojas Leonor", surname="Jaime", date_of_birth="1974-09-02")
+            assert p is not None
+            assert p.patient_id == "1613811"
+            assert p.surname == "Jaime Rojas"
+            assert p.name == "Leonor Isidora"
+            assert p.codice_fiscale == "JMRLRS74P42Z611W"
+            assert p.comune_nascita == "PERU'"
+

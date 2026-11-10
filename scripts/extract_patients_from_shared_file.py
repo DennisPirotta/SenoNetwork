@@ -49,9 +49,9 @@ logger = logging.getLogger("SharedPatientExtractor")
 
 
 def clean_title(s: str) -> str:
-    """Capitalizza correttamente le parole gestendo apostrofi interni o finali
+    """Capitalizza correttamente le parole gestendo trattini, apostrofi interni o finali
 
-    (es. D'Elia, Dell'Anna, Spano') e caratteri accentati (es. Salvadé).
+    (es. D'Elia, Dell'Anna, Spano', Al-Hassan) e caratteri accentati (es. Salvadé).
     """
     if not s or not str(s).strip():
         return ""
@@ -59,6 +59,9 @@ def clean_title(s: str) -> str:
     def _cap_word(w: str) -> str:
         if not w:
             return ""
+        # Gestione trattino interno (es. Al-Hassan, Smith-Jones, Jean-Pierre)
+        if "-" in w:
+            return "-".join(_cap_word(p) for p in w.split("-"))
         # Gestione apostrofo interno o finale (es. d'elia -> D'Elia, spano' -> Spano')
         if "'" in w:
             parts = w.split("'")
@@ -69,14 +72,15 @@ def clean_title(s: str) -> str:
 
 
 def split_nominativo(raw_name: str) -> Tuple[str, Optional[str]]:
-    """Separa una stringa nominativo 'COGNOME NOME' tipica dei registri clinici italiani.
+    """Separa una stringa nominativo 'COGNOME NOME' tipica dei registri clinici italiani ed esteri.
 
     Riconosce e gestisce:
-      - Prefissi patronimici/nobiliari italiani (De, Di, Del, Della, La, San, ecc.)
-      - Particelle intermedie in cognomi composti (es. 'Herrera della rosa Rosaura', 'Mateo De Los Santos Arelis')
-      - Doppi cognomi noti o composti (es. 'Cantali Carnesano Francesca', 'Jaime Rojas Leonor')
-      - Nomi composti multipli (es. 'Ciceri Luigia Maria', 'Balducchi Maria Clelia')
-      - Nominativi composti da un solo termine (es. 'Ndiaye', 'Volpi')
+      - Prefissi patronimici/nobiliari italiani ed esteri singoli o doppi (De, Di, Del, Della, La, San, De La, Van Der, Al, El, ecc.)
+      - Particelle intermedie in cognomi composti ispanici/portoghesi/francesi (es. 'Herrera de la rosa Rosaura', 'Mateo De Los Santos Arelis', 'Lopez del Rio Juan')
+      - Doppi cognomi composti o asindetici (es. 'Cantali Carnesano Francesca', 'Jaime Rojas Leonor')
+      - Nomi composti multipli tradizionali (es. 'Ciceri Luigia Maria', 'Balducchi Maria Clelia')
+      - Patronimici arabi e convenzioni internazionali (es. 'Ismail Sohair Farouk Abdelmeguid', 'Mekhaeel Mariam Fayez Camel')
+      - Nominativi composti da un solo termine (mononimi, es. 'Ndiaye', 'Volpi')
     """
     if not raw_name or not str(raw_name).strip():
         return "", None
@@ -86,44 +90,72 @@ def split_nominativo(raw_name: str) -> Tuple[str, Optional[str]]:
     if len(parts) == 1:
         return clean_title(parts[0]), None
 
-    prefissi = {
+    prefissi_singoli = {
         "de", "di", "da", "del", "della", "delle", "dello", "degli",
-        "la", "le", "lo", "li", "san", "santa"
+        "la", "le", "lo", "li", "san", "santa",
+        "al", "el", "ben", "ibn", "von", "van", "ter"
     }
     particelle_intermedie = {
         "de", "di", "da", "del", "della", "delle", "dello", "degli",
-        "los", "las", "el", "al", "san", "santa", "von", "van"
+        "la", "le", "lo", "li", "los", "las", "el", "al", "san", "santa",
+        "dos", "das", "do", "von", "van", "der", "den", "ter", "y", "e"
     }
     known_compound_surnames = {
         "cantali carnesano",
         "jaime rojas"
     }
 
-    # 1. Prefisso all'inizio del nominativo (es. 'Di Leo Maria Grazia', 'De Martinis Annunziata', 'La Delfa Rita')
-    if parts[0].lower() in prefissi:
+    # 1. Prefisso all'inizio del nominativo
+    if parts[0].lower() in prefissi_singoli:
+        # 1a. Prefisso composto all'inizio (es. 'De La Cruz Maria', 'Van Der Bellen Alexander')
+        if len(parts) >= 3 and parts[1].lower() in particelle_intermedie:
+            if len(parts) == 3:
+                return clean_title(f"{parts[0]} {parts[1]} {parts[2]}"), None
+            cognome = clean_title(f"{parts[0]} {parts[1]} {parts[2]}")
+            nome = clean_title(" ".join(parts[3:]))
+            return cognome, nome
+
+        # 1b. Prefisso singolo all'inizio (es. 'Di Leo Maria Grazia', 'La Delfa Rita', 'El Sayed Fatima')
         if len(parts) == 2:
-            # Caso in cui è presente solo il cognome con prefisso (es. 'Di Grigoli')
             return clean_title(f"{parts[0]} {parts[1]}"), None
         cognome = clean_title(f"{parts[0]} {parts[1]}")
         nome = clean_title(" ".join(parts[2:]))
         return cognome, nome
 
     # 2. Preposizione o particella intermedia nel cognome
-    # Es: 'Herrera della rosa Rosaura' (4 parti) -> Cognome: 'Herrera Della Rosa', Nome: 'Rosaura'
-    # Es: 'Mateo De Los Santos Arelis' (5 parti) -> Cognome: 'Mateo De Los Santos', Nome: 'Arelis'
-    if len(parts) >= 4 and parts[1].lower() in particelle_intermedie:
-        if parts[2].lower() in particelle_intermedie and len(parts) >= 5:
+    # 2a. Posizione 1 (es. 'Herrera de la rosa Rosaura', 'Mateo De Los Santos Arelis', 'Lopez del Rio Juan')
+    if len(parts) >= 3 and parts[1].lower() in particelle_intermedie:
+        if len(parts) >= 4 and parts[2].lower() in particelle_intermedie:
+            # Due particelle (es. 'Herrera de la rosa Rosaura', 'Mateo De Los Santos Arelis')
+            if len(parts) == 4:
+                return clean_title(" ".join(parts[:4])), None
             cognome = clean_title(" ".join(parts[:4]))
             nome = clean_title(" ".join(parts[4:]))
             return cognome, nome
         else:
+            # Una sola particella (es. 'Lopez del Rio Juan', 'Garcia y Vega Carmen')
+            if len(parts) == 3:
+                return clean_title(" ".join(parts[:3])), None
             cognome = clean_title(" ".join(parts[:3]))
             nome = clean_title(" ".join(parts[3:]))
             return cognome, nome
 
+    # 2b. Posizione 2 per cognomi composti complessi (es. 'Gomez Perez de la Rosa Ana')
+    if len(parts) >= 5 and parts[2].lower() in particelle_intermedie:
+        if len(parts) >= 6 and parts[3].lower() in particelle_intermedie:
+            cognome = clean_title(" ".join(parts[:5]))
+            nome = clean_title(" ".join(parts[5:]))
+            return cognome, nome
+        else:
+            cognome = clean_title(" ".join(parts[:4]))
+            nome = clean_title(" ".join(parts[4:]))
+            return cognome, nome
+
     # 3. Doppi cognomi noti o composti
     first_two = f"{parts[0]} {parts[1]}".lower()
-    if first_two in known_compound_surnames and len(parts) >= 3:
+    if first_two in known_compound_surnames:
+        if len(parts) == 2:
+            return clean_title(f"{parts[0]} {parts[1]}"), None
         cognome = clean_title(f"{parts[0]} {parts[1]}")
         nome = clean_title(" ".join(parts[2:]))
         return cognome, nome

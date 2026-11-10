@@ -329,6 +329,62 @@ class PriamoClient:
                             data = [cand]
                             break
 
+            # 5. Fallback con permutazioni di partizione per doppi cognomi / nominativi composti esteri
+            if not data or not isinstance(data, list):
+                all_tokens = f"{priamo_surname} {priamo_name}".split()
+                if len(all_tokens) >= 3:
+                    candidates_to_try = []
+                    # Prova doppio cognome (2 token cognome, restante nome)
+                    c_sur2 = " ".join(all_tokens[:2])
+                    c_nam2 = " ".join(all_tokens[2:])
+                    if c_sur2 != priamo_surname:
+                        candidates_to_try.append((c_sur2, c_nam2))
+
+                    # Prova triplo cognome (3 token cognome, restante nome)
+                    if len(all_tokens) >= 4:
+                        c_sur3 = " ".join(all_tokens[:3])
+                        c_nam3 = " ".join(all_tokens[3:])
+                        if c_sur3 != priamo_surname:
+                            candidates_to_try.append((c_sur3, c_nam3))
+
+                    # Prova quadruplo cognome per composti con particelle (4 token cognome, restante nome)
+                    if len(all_tokens) >= 5:
+                        c_sur4 = " ".join(all_tokens[:4])
+                        c_nam4 = " ".join(all_tokens[4:])
+                        if c_sur4 != priamo_surname:
+                            candidates_to_try.append((c_sur4, c_nam4))
+
+                    # Prova singolo cognome (1 token cognome, restante nome)
+                    c_sur1 = all_tokens[0]
+                    c_nam1 = " ".join(all_tokens[1:])
+                    if c_sur1 != priamo_surname:
+                        candidates_to_try.append((c_sur1, c_nam1))
+
+                    for cand_sur, cand_nam in candidates_to_try:
+                        p_cand = {
+                            "Nome": cand_nam,
+                            "Cognome": cand_sur,
+                            "DataNascita": dob_str,
+                        }
+                        resp_cand = self._request("GET", self.get_anagrafica_url, params=p_cand)
+                        d_cand = resp_cand.json()
+                        if d_cand and isinstance(d_cand, list):
+                            data = d_cand
+                            break
+                        # Prova con primo nome del candidato se composto
+                        cand_first = cand_nam.split()[0] if cand_nam else ""
+                        if cand_first and cand_first.lower() != cand_nam.lower():
+                            p_cand_first = {
+                                "Nome": cand_first,
+                                "Cognome": cand_sur,
+                                "DataNascita": dob_str,
+                            }
+                            resp_cand_first = self._request("GET", self.get_anagrafica_url, params=p_cand_first)
+                            d_cand_first = resp_cand_first.json()
+                            if d_cand_first and isinstance(d_cand_first, list):
+                                data = d_cand_first
+                                break
+
 
         if not data or not isinstance(data, list):
             logger.warning(f"Paziente non trovato su Priamo: {clean_name} {clean_surname} ({dob_str})")
