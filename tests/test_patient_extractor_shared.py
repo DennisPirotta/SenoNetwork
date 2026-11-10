@@ -115,16 +115,20 @@ def test_estrai_pazienti_univoci_real_file():
     assert len(balzarotti[0].righe_excel) == 2
     assert balzarotti[0].righe_excel == [63, 98]
 
-    # Verifica presenza dei record incompleti
-    incompleti = [p for p in pazienti if not p.is_complete]
-    assert len(incompleti) == 2
-    inc_cognomi = {p.cognome for p in incompleti}
-    assert "Ndiaye" in inc_cognomi
-    assert "Volpi" in inc_cognomi
+    # Verifica Ndiaye e Volpi presenti e completi con nome e data nascita
+    ndiaye = [p for p in pazienti if p.cognome == "Ndiaye"]
+    assert len(ndiaye) == 1
+    assert ndiaye[0].nome == "Khady"
+    assert ndiaye[0].data_nascita == date(1987, 3, 14)
+
+    volpi = [p for p in pazienti if p.cognome == "Volpi"]
+    assert len(volpi) == 1
+    assert volpi[0].nome == "Gabriella"
+    assert volpi[0].data_nascita == date(1978, 5, 24)
 
     # Filtro only_complete
     completi = estrai_pazienti_univoci(excel_path, only_complete=True)
-    assert len(completi) == 213
+    assert len(completi) == 215
     assert all(p.is_complete for p in completi)
 
 
@@ -134,7 +138,7 @@ def test_dotnet_client_loads_positivi_2026():
         pytest.skip("data/positivi_2026.xls non presente")
 
     pts = DotNetApiClient.load_patients_from_excel(excel_path)
-    assert len(pts) == 213
+    assert len(pts) == 215
     assert pts[0]["surname"] == "Acquati"
     assert pts[0]["name"] == "Lidia"
     assert pts[0]["date_of_birth"] == date(1959, 8, 1)

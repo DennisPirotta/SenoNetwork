@@ -43,16 +43,22 @@ class PriamoDocument(BaseModel):
 class PriamoPatient(BaseModel):
     """Represents patient identification and demographics in Priamo."""
 
-    patient_id: str  # idAnagPaz1
+    patient_id: str  # idAnagPaz1 o progressivoPaz1
     name: str
     surname: str
     date_of_birth: Optional[date] = None
+    codice_fiscale: Optional[str] = None
+    comune_nascita: Optional[str] = None
+    sesso: Optional[str] = None
+    tessera_sanitaria: Optional[str] = None
+    telefono: Optional[str] = None
 
     @property
     def slug(self) -> str:
         dob_str = self.date_of_birth.isoformat() if self.date_of_birth else "unknown"
         raw = f"{self.name}-{self.surname}-{dob_str}".lower().replace(" ", "-")
         return re.sub(r"[^a-z0-9\-]", "", raw)
+
 
 
 class PriamoClient:
@@ -227,41 +233,113 @@ class PriamoClient:
         self,
         name: str,
         surname: str,
-        date_of_birth: Union[date, str]
+        date_of_birth: Union[date, str],
+        exact_only: bool = False
     ) -> Optional[PriamoPatient]:
-        """Searches for a patient in Priamo by Name, Surname, and Date of Birth."""
+        """Searches for a patient in Priamo by Name, Surname, and Date of Birth.
+
+        Extracts progressivoPaz1 as patient_id, Codice Fiscale, and demographics.
+        Supports automatic fallback for composite first names and diacritics.
+        """
         self.authenticate()
 
         dob_str = date_of_birth.strftime("%Y-%m-%d") if isinstance(date_of_birth, date) else str(date_of_birth)
+        clean_name = name.strip()
+        clean_surname = surname.strip()
+
+        # 1. Ricerca primaria con Nome, Cognome, DataNascita
         params = {
-            "Nome": name.strip(),
-            "Cognome": surname.strip(),
+            "Nome": clean_name,
+            "Cognome": clean_surname,
             "DataNascita": dob_str,
         }
 
         response = self._request("GET", self.get_anagrafica_url, params=params)
         data = response.json()
 
+        # 2. Se non trovato e exact_only=False, prova fallback su primo nome (se composto)
+        if (not data or not isinstance(data, list)) and not exact_only:
+            first_name = clean_name.split()[0] if clean_name else ""
+            if first_name and first_name.lower() != clean_name.lower():
+                params_fallback = {
+                    "Nome": first_name,
+                    "Cognome": clean_surname,
+                    "DataNascita": dob_str,
+                }
+                response = self._request("GET", self.get_anagrafica_url, params=params_fallback)
+                data = response.json()
+
+            # 3. Fallback con solo Cognome e DataNascita (confrontando poi il nome con i candidati restituiti)
+            if not data or not isinstance(data, list):
+                params_dob = {
+                    "Cognome": clean_surname,
+                    "DataNascita": dob_str,
+                }
+                response = self._request("GET", self.get_anagrafica_url, params=params_dob)
+                candidate_data = response.json()
+                if candidate_data and isinstance(candidate_data, list):
+                    target_name_clean = clean_name.lower()
+                    for cand in candidate_data:
+                        cand_name = (cand.get("datiMef") or {}).get("nome", "").strip().lower()
+                        if target_name_clean in cand_name or cand_name in target_name_clean or (first_name and first_name.lower() in cand_name):
+                            data = [cand]
+                            break
+
         if not data or not isinstance(data, list):
-            logger.warning(f"Paziente non trovato su Priamo: {name} {surname} ({dob_str})")
+            logger.warning(f"Paziente non trovato su Priamo: {clean_name} {clean_surname} ({dob_str})")
             return None
 
-        # Look for consents containing patient ID
         first_match = data[0]
-        consensi = first_match.get("consensi", [])
-        if not consensi:
-            logger.warning(f"Paziente trovato su Priamo ma senza consensi associati: {name} {surname}")
+
+        # Estrazione ID paziente (progressivoPaz1 in datiAa, id in datiAa, idAnagPaz1 in consensi)
+        patient_id = None
+        dati_aa = first_match.get("datiAa") or {}
+        if dati_aa.get("progressivoPaz1"):
+            patient_id = str(dati_aa.get("progressivoPaz1")).strip()
+        elif dati_aa.get("id"):
+            patient_id = str(dati_aa.get("id")).strip()
+
+        if not patient_id:
+            consensi = first_match.get("consensi") or []
+            if consensi and consensi[0].get("idAnagPaz1"):
+                patient_id = str(consensi[0].get("idAnagPaz1")).strip()
+
+        if not patient_id:
+            cf = (first_match.get("datiMef") or {}).get("codiceFiscale")
+            if cf:
+                patient_id = str(cf).strip()
+
+        if not patient_id:
+            logger.warning(f"Paziente trovato su Priamo ma senza identificativo estraibile: {clean_name} {clean_surname}")
             return None
 
-        patient_id = str(consensi[0].get("idAnagPaz1"))
-        parsed_dob = date.fromisoformat(dob_str) if isinstance(date_of_birth, str) else date_of_birth
+        dati_mef = first_match.get("datiMef") or {}
+        dati_asl = first_match.get("datiAsl") or {}
+
+        codice_fiscale = dati_mef.get("codiceFiscale")
+        comune_nascita = (dati_mef.get("comuneNascita") or {}).get("nome")
+        sesso = dati_mef.get("sesso")
+        tessera = dati_asl.get("tesseraSanitaria")
+        telefono = dati_aa.get("cellulare") or dati_aa.get("telefono")
+
+        parsed_dob = date.fromisoformat(dob_str[:10]) if isinstance(date_of_birth, str) else date_of_birth
+
+        # Nome e cognome ufficiali da anagrafica fiscale/sanitaria Priamo se presenti
+        mef_name = dati_mef.get("nome", "").strip().title() or clean_name
+        mef_surname = dati_mef.get("cognome", "").strip().title() or clean_surname
 
         return PriamoPatient(
             patient_id=patient_id,
-            name=name.strip(),
-            surname=surname.strip(),
-            date_of_birth=parsed_dob
+            name=mef_name,
+            surname=mef_surname,
+            date_of_birth=parsed_dob,
+            codice_fiscale=codice_fiscale,
+            comune_nascita=comune_nascita,
+            sesso=sesso,
+            tessera_sanitaria=tessera,
+            telefono=telefono
         )
+
 
     def get_patient_events(
         self,
@@ -522,6 +600,111 @@ class PriamoClient:
 
         logger.info(f"Download concorrente completato: {len(documents)}/{len(download_tasks)} referti acquisiti con successo per {patient.name} {patient.surname}.")
         return documents
+
+    def verify_patient_cohort(
+        self,
+        patients: List[Union[Dict[str, Any], Any]],
+        max_workers: int = 4
+    ) -> List[Dict[str, Any]]:
+        """Verifies a cohort of patients against Priamo in parallel.
+
+        For each patient, queries GetAnagrafica and enriches the result with
+        Priamo status ('found', 'not_found', 'incomplete', 'error'), priamo_id,
+        codice_fiscale, and demographics.
+
+        Args:
+            patients: List of patient dicts or Paziente objects.
+            max_workers: Concurrency level.
+
+        Returns:
+            List of verification result dictionaries in the original order.
+        """
+        self.authenticate()
+
+        def _verify_single(p_item: Union[Dict[str, Any], Any]) -> Dict[str, Any]:
+            if hasattr(p_item, "model_dump"):
+                d = p_item.model_dump()
+            elif hasattr(p_item, "__dict__"):
+                d = dict(p_item.__dict__)
+            else:
+                d = dict(p_item)
+
+            name = str(d.get("name") or d.get("nome") or "").strip()
+            surname = str(d.get("surname") or d.get("cognome") or "").strip()
+            dob = d.get("date_of_birth") or d.get("data_nascita")
+            patient_id = d.get("patient_id") or ""
+            righe_excel = d.get("righe_excel") or []
+
+            dob_str = ""
+            if dob:
+                dob_str = dob.isoformat() if hasattr(dob, "isoformat") else str(dob)[:10]
+
+            res: Dict[str, Any] = {
+                "patient_id": patient_id,
+                "name": name,
+                "surname": surname,
+                "date_of_birth": dob_str,
+                "righe_excel": righe_excel,
+                "exists_in_priamo": False,
+                "priamo_id": None,
+                "codice_fiscale": None,
+                "comune_nascita": None,
+                "sesso": None,
+                "status": "not_checked",
+                "message": ""
+            }
+
+            if not surname:
+                res["status"] = "invalid"
+                res["message"] = "Cognome non specificato."
+                return res
+
+            if not dob or not name:
+                res["status"] = "incomplete"
+                res["message"] = "Dati insufficienti: nome o data di nascita mancante."
+                return res
+
+            try:
+                found_patient = self.search_patient(
+                    name=name,
+                    surname=surname,
+                    date_of_birth=dob
+                )
+                if found_patient:
+                    res["exists_in_priamo"] = True
+                    res["status"] = "found"
+                    res["priamo_id"] = found_patient.patient_id
+                    res["codice_fiscale"] = found_patient.codice_fiscale
+                    res["comune_nascita"] = found_patient.comune_nascita
+                    res["sesso"] = found_patient.sesso
+                    res["message"] = f"Trovato su Priamo (ID: {found_patient.patient_id})"
+                else:
+                    res["status"] = "not_found"
+                    res["message"] = "Non trovato in anagrafica Priamo."
+            except Exception as e:
+                res["status"] = "error"
+                res["message"] = f"Errore ricerca Priamo: {e}"
+
+            return res
+
+        workers = max(1, min(max_workers, len(patients)))
+        results: List[Dict[str, Any]] = [None] * len(patients)
+
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            fut_to_idx = {executor.submit(_verify_single, p): idx for idx, p in enumerate(patients)}
+            for fut in as_completed(fut_to_idx):
+                idx = fut_to_idx[fut]
+                try:
+                    results[idx] = fut.result()
+                except Exception as ex:
+                    results[idx] = {
+                        "name": getattr(patients[idx], "nome", ""),
+                        "surname": getattr(patients[idx], "cognome", ""),
+                        "status": "error",
+                        "message": str(ex)
+                    }
+
+        return results
 
     def close(self) -> None:
         if self.session:

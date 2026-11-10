@@ -30,7 +30,8 @@ Pipeline clinica per estrazione dati da referti medici PDF (senologia) tramite I
 | | `src/pipeline.py` | Pipeline generica batch su cartelle/file PDF locali con type hints unificati. |
 | **Interfaces** | `src/api_server.py` | FastAPI REST microservice con Dependency Injection, health-check completo, background tasks asincroni, sync e report audit `/api/audit/*`. |
 | | `src/cli.py` / `main.py` | CLI avanzata per esecuzione paziente, batch Excel, batch PDF, server mode, audit (`--audit-redcap`) o sync (`--sync-redcap`). |
-| **Scripts** | `scripts/extract_patients_from_shared_file.py` | Estrazione, deduplicazione e normalizzazione dell'anagrafica pazienti dal file Excel condiviso multidisciplinare (`positivi_2026.xls`). |
+| **Scripts** | `scripts/verify_patients_in_priamo.py` | Controllo e verifica concorrente dell'esistenza dei pazienti su Priamo con arricchimento ID MEF, Codice Fiscale e report visuale. |
+| | `scripts/extract_patients_from_shared_file.py` | Estrazione, deduplicazione e normalizzazione dell'anagrafica pazienti dal file Excel condiviso multidisciplinare (`positivi_2026.xls`). |
 | | `scripts/delete_redcap_records.py` | CLI per eliminazione sicura di record da REDCap (singolo per record_id o totale con conferma di sicurezza). |
 | | `scripts/list_redcap_records.py` | CLI per elencare tutti i record REDCap con visualizzazione tabelle Rich, export JSON/CSV e filtri. |
 | | `scripts/audit_redcap_data.py` | CLI dashboard e generatore report su incongruenze, mancanze e panoramica generale dati REDCap. |
@@ -69,10 +70,11 @@ Pipeline clinica per estrazione dati da referti medici PDF (senologia) tramite I
 
 ### `src/priamo_client.py`
 - **`PriamoDocument(BaseModel)`**: `document_id`, `event_id`, `repository_id`, `exam_name`, `local_path`.
-- **`PriamoPatient(BaseModel)`**: `patient_id` (idAnagPaz1), `name`, `surname`, `date_of_birth`, `slug`.
+- **`PriamoPatient(BaseModel)`**: `patient_id` (progressivoPaz1 / idAnagPaz1), `name`, `surname`, `date_of_birth`, `codice_fiscale`, `comune_nascita`, `sesso`, `tessera_sanitaria`, `telefono`, `slug`.
 - **`PriamoClient(settings=None, ...)`**: Client HTTP stateful con retry (`tenacity`) e Cloudflare Access headers caricati da `Settings`.
   - `authenticate(force: bool = False) -> None`: GET form login -> estrae `__RequestVerificationToken` -> POST credenziali -> estrae e adatta cookie `.PRIAMOAUTH` anche in caso di domain mismatch su Cloudflare Tunnel. Re-autentica su 401/403.
-  - `search_patient(name, surname, dob) -> Optional[PriamoPatient]`: GET `/PriamoCES/api/Anagrafica/GetAnagrafica`.
+  - `search_patient(name, surname, dob, exact_only=False) -> Optional[PriamoPatient]`: GET `/PriamoCES/api/Anagrafica/GetAnagrafica` con estrazione progressivo da `datiAa.progressivoPaz1` e fallback sui nomi composti.
+  - `verify_patient_cohort(patients, max_workers=4) -> List[dict]`: Controllo concorrente di coorte per verificare esistenza in Priamo e arricchimento dati anagrafici.
   - `get_patient_events(patient_id, start_date) -> List[dict]`: GET `/PriamoCES/api/Eventi/GetEvento`.
   - `get_event_documents(event_id) -> List[dict]`: GET `/PriamoCES/api/Documenti/GetDocumento`.
   - `download_document_pdf(doc_id, event_id, repo_id, dest_path, event_type, preferred_stato, versione) -> Path`: GET `/PriamoCES/Documento/GetReportTextToPdfToView`. Supporta sia `stato=FIRMATO` (documenti repository) sia `stato=REFERTATO` (testo ambulatoriale on-the-fly con `tipoEvento`, `versione=0`, `repository=N`) con fallback automatico tra le due modalità.
@@ -89,7 +91,9 @@ Pipeline clinica per estrazione dati da referti medici PDF (senologia) tramite I
 - **`DotNetApiClient(settings=None, ...)`**: Facade di accesso ai dati ospedalieri configurata con `Settings`.
   - `download_all_patient_pdfs(patient_id, dest_dir, name, surname, dob) -> List[Path]`: Prova `PriamoClient`, poi generic REST API, poi fallback cartelle configurate (`priamo_files_dir`, `downloads_dir`).
   - `get_patient_documents(patient_id) -> List[dict]`: Elenco metadati documenti disponibili.
-  - `load_patients_from_excel(excel_path=None, header_row=4, settings=None) -> List[dict]`: Legge registro chirurgico, deduplica per `(nome, cognome, dob)` e ritorna lista pazienti.
+  - `load_patients_from_excel(excel_path=None, header_row=4, settings=None) -> List[dict]`: Legge registro chirurgico (supporta sia `interventi.xls` che `positivi_2026.xls`), deduplica e ritorna lista pazienti.
+  - `verify_patient_in_priamo(name, surname, dob) -> Optional[PriamoPatient]`: Facade per verifica singolo paziente.
+  - `verify_patients_cohort(patients, max_workers) -> List[dict]`: Facade per verifica batch di coorte su Priamo.
 
 ### `src/pdf_extractor.py`
 - **`PDFExtractor`**:

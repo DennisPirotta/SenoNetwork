@@ -276,6 +276,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Esegue l'audit completo di qualità dati su REDCap, rilevando incongruenze cliniche, mancanze e producendo un report generale."
     )
     parser.add_argument(
+        "--verify-priamo",
+        action="store_true",
+        help="Verifica l'esistenza dei pazienti su Priamo (HIS Ospedale Valduce) interrogando l'API GetAnagrafica."
+    )
+    parser.add_argument(
         "--audit-min-severity",
         choices=["critical", "warning", "info"],
         default="info",
@@ -452,6 +457,47 @@ def main():
             clean_local_state=args.clean_local_state
         )
         print(f"[OK] Eliminazione completata: eliminati con successo {count} record da REDCap.")
+        return
+
+    # 6. Mode: Verify patients on Priamo
+    if args.verify_priamo:
+        from src.dotnet_client import DotNetApiClient
+        from scripts.verify_patients_in_priamo import display_results_dashboard
+
+        dotnet = DotNetApiClient(settings=settings)
+        if args.patient_id or (args.name and args.surname):
+            p_name = args.name or ""
+            p_surname = args.surname or ""
+            p_dob = args.dob or ""
+            print(f"-> Verifica esistenza paziente singolo su Priamo: {p_name} {p_surname} ({p_dob})...")
+            res = dotnet.verify_patient_in_priamo(name=p_name, surname=p_surname, date_of_birth=p_dob)
+            if res:
+                print(f"[OK] Paziente TROVATO su Priamo: ID={res.patient_id}, CF={res.codice_fiscale or 'N.D.'}")
+            else:
+                print(f"[WARN] Paziente non trovato su Priamo.")
+            return
+
+        target_excel = args.excel or settings.patients_excel_path
+        if not target_excel or not Path(target_excel).exists():
+            candidate_shared = Path("data/positivi_2026.xls")
+            if candidate_shared.exists():
+                target_excel = candidate_shared
+            else:
+                print("[ERRORE] Nessun file pazienti specificato (--excel <path>).", file=sys.stderr)
+                sys.exit(1)
+
+        print(f"-> Caricamento pazienti da {target_excel} per verifica su Priamo...")
+        cohort = DotNetApiClient.load_patients_from_excel(target_excel)
+        if args.limit:
+            cohort = cohort[:args.limit]
+
+        print(f"-> Verifica di {len(cohort)} pazienti su Priamo...")
+        results = dotnet.verify_patients_cohort(cohort, max_workers=4)
+        if HAS_RICH:
+            display_results_dashboard(results, title="Esito Verifica Priamo")
+        else:
+            for r in results:
+                print(f"- {r.get('surname')} {r.get('name')} -> {r.get('status')} (ID: {r.get('priamo_id') or '-'})")
         return
 
     # 4. Mode: REDCap Periodic Audit & Sync

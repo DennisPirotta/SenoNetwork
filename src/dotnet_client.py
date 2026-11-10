@@ -134,6 +134,28 @@ class DotNetApiClient:
             surname=identifier
         )
 
+    def verify_patient_in_priamo(
+        self,
+        name: str,
+        surname: str,
+        date_of_birth: Union[date, str]
+    ) -> Optional[PriamoPatient]:
+        """Verifies if a patient exists in Priamo."""
+        if not self.is_priamo_configured:
+            raise ValueError("Priamo non configurato. Impostare PRIAMO_API_URL, PRIAMO_USERNAME e PRIAMO_PASSWORD.")
+        return self.priamo.search_patient(name=name, surname=surname, date_of_birth=date_of_birth)
+
+    def verify_patients_cohort(
+        self,
+        patients: List[Union[Dict[str, Any], Any]],
+        max_workers: int = 4
+    ) -> List[Dict[str, Any]]:
+        """Verifies a cohort of patients in Priamo in parallel."""
+        if not self.is_priamo_configured:
+            raise ValueError("Priamo non configurato. Impostare PRIAMO_API_URL, PRIAMO_USERNAME e PRIAMO_PASSWORD.")
+        return self.priamo.verify_patient_cohort(patients=patients, max_workers=max_workers)
+
+
     def _download_from_generic_api(self, patient_id: str, destination_dir: Path) -> List[Path]:
         """Queries a generic REST .NET API using multithreaded download workers."""
         from concurrent.futures import ThreadPoolExecutor, as_completed
