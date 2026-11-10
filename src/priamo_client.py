@@ -28,6 +28,36 @@ RETRYABLE = retry(
     reraise=True,
 )
 
+ACCENT_TO_APOSTROPHE_MAP = {
+    "à": "a'", "á": "a'",
+    "è": "e'", "é": "e'",
+    "ì": "i'", "í": "i'",
+    "ò": "o'", "ó": "o'",
+    "ù": "u'", "ú": "u'",
+    "À": "A'", "Á": "A'",
+    "È": "E'", "É": "E'",
+    "Ì": "I'", "Í": "I'",
+    "Ò": "O'", "Ó": "O'",
+    "Ù": "U'", "Ú": "U'",
+}
+
+
+def normalize_priamo_accents(text: Optional[str]) -> str:
+    """Normalizza i caratteri accentati secondo la convenzione del registro Priamo (lettera + apostrofo).
+
+    Nel database di Priamo (HIS Valduce), i nomi e cognomi con vocali accentate sono
+    archiviati sostituendo la vocale accentata con la corrispondente lettera base seguita
+    da apostrofo singolo (es: Salvadè / Salvadé -> Salvade', D'Angiò -> D'Angio', Nicolò -> Nicolo').
+    Normalizza inoltre virgolette curve o backtick nell'apostrofo standard ASCII.
+    """
+    if not text:
+        return ""
+    s = str(text).strip()
+    s = re.sub(r"[’‘`´]", "'", s)
+    for acc, rep in ACCENT_TO_APOSTROPHE_MAP.items():
+        s = s.replace(acc, rep)
+    return s
+
 
 class PriamoDocument(BaseModel):
     """Represents a medical document / report discovered in Priamo."""
@@ -247,43 +277,58 @@ class PriamoClient:
         clean_name = name.strip()
         clean_surname = surname.strip()
 
-        # 1. Ricerca primaria con Nome, Cognome, DataNascita
+        # Nel registro Priamo le vocali accentate sono registrate con vocale + apostrofo (es: Salvadé -> Salvade')
+        priamo_name = normalize_priamo_accents(clean_name)
+        priamo_surname = normalize_priamo_accents(clean_surname)
+
+        # 1. Ricerca primaria con Nome e Cognome normalizzati per Priamo
         params = {
-            "Nome": clean_name,
-            "Cognome": clean_surname,
+            "Nome": priamo_name,
+            "Cognome": priamo_surname,
             "DataNascita": dob_str,
         }
 
         response = self._request("GET", self.get_anagrafica_url, params=params)
         data = response.json()
 
-        # 2. Se non trovato e exact_only=False, prova fallback su primo nome (se composto)
+        # 2. Se non trovato e la versione con accenti originali era diversa, prova con la forma originale
+        if (not data or not isinstance(data, list)) and (priamo_name != clean_name or priamo_surname != clean_surname):
+            params_raw = {
+                "Nome": clean_name,
+                "Cognome": clean_surname,
+                "DataNascita": dob_str,
+            }
+            response = self._request("GET", self.get_anagrafica_url, params=params_raw)
+            data = response.json()
+
+        # 3. Se non trovato e exact_only=False, prova fallback su primo nome (se composto)
         if (not data or not isinstance(data, list)) and not exact_only:
-            first_name = clean_name.split()[0] if clean_name else ""
-            if first_name and first_name.lower() != clean_name.lower():
+            first_name = priamo_name.split()[0] if priamo_name else ""
+            if first_name and first_name.lower() != priamo_name.lower():
                 params_fallback = {
                     "Nome": first_name,
-                    "Cognome": clean_surname,
+                    "Cognome": priamo_surname,
                     "DataNascita": dob_str,
                 }
                 response = self._request("GET", self.get_anagrafica_url, params=params_fallback)
                 data = response.json()
 
-            # 3. Fallback con solo Cognome e DataNascita (confrontando poi il nome con i candidati restituiti)
+            # 4. Fallback con solo Cognome e DataNascita (confrontando poi il nome con i candidati restituiti)
             if not data or not isinstance(data, list):
                 params_dob = {
-                    "Cognome": clean_surname,
+                    "Cognome": priamo_surname,
                     "DataNascita": dob_str,
                 }
                 response = self._request("GET", self.get_anagrafica_url, params=params_dob)
                 candidate_data = response.json()
                 if candidate_data and isinstance(candidate_data, list):
-                    target_name_clean = clean_name.lower()
+                    target_name_clean = priamo_name.lower()
                     for cand in candidate_data:
-                        cand_name = (cand.get("datiMef") or {}).get("nome", "").strip().lower()
+                        cand_name = normalize_priamo_accents((cand.get("datiMef") or {}).get("nome", "")).lower()
                         if target_name_clean in cand_name or cand_name in target_name_clean or (first_name and first_name.lower() in cand_name):
                             data = [cand]
                             break
+
 
         if not data or not isinstance(data, list):
             logger.warning(f"Paziente non trovato su Priamo: {clean_name} {clean_surname} ({dob_str})")

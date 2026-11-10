@@ -73,7 +73,8 @@ Pipeline clinica per estrazione dati da referti medici PDF (senologia) tramite I
 - **`PriamoPatient(BaseModel)`**: `patient_id` (progressivoPaz1 / idAnagPaz1), `name`, `surname`, `date_of_birth`, `codice_fiscale`, `comune_nascita`, `sesso`, `tessera_sanitaria`, `telefono`, `slug`.
 - **`PriamoClient(settings=None, ...)`**: Client HTTP stateful con retry (`tenacity`) e Cloudflare Access headers caricati da `Settings`.
   - `authenticate(force: bool = False) -> None`: GET form login -> estrae `__RequestVerificationToken` -> POST credenziali -> estrae e adatta cookie `.PRIAMOAUTH` anche in caso di domain mismatch su Cloudflare Tunnel. Re-autentica su 401/403.
-  - `search_patient(name, surname, dob, exact_only=False) -> Optional[PriamoPatient]`: GET `/PriamoCES/api/Anagrafica/GetAnagrafica` con estrazione progressivo da `datiAa.progressivoPaz1` e fallback sui nomi composti.
+  - `search_patient(name, surname, dob, exact_only=False) -> Optional[PriamoPatient]`: GET `/PriamoCES/api/Anagrafica/GetAnagrafica` con conversione automatica delle vocali accentate in lettera+apostrofo (`normalize_priamo_accents`, es. `Salvadé` -> `Salvade'`, `D'Angiò` -> `D'Angio'`), estrazione progressivo da `datiAa.progressivoPaz1` e fallback sui nomi composti.
+- **`normalize_priamo_accents(text: str) -> str`**: Funzione di normalizzazione per il database Priamo: converte le vocali accentate (à, è, é, ì, ò, ù) nella vocale base seguita da apostrofo (a', e', i', o', u') e normalizza virgolette/accenti curvi.
   - `verify_patient_cohort(patients, max_workers=4) -> List[dict]`: Controllo concorrente di coorte per verificare esistenza in Priamo e arricchimento dati anagrafici.
   - `get_patient_events(patient_id, start_date) -> List[dict]`: GET `/PriamoCES/api/Eventi/GetEvento`.
   - `get_event_documents(event_id) -> List[dict]`: GET `/PriamoCES/api/Documenti/GetDocumento`.

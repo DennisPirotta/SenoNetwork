@@ -4,7 +4,11 @@ from datetime import date
 from unittest.mock import MagicMock, patch
 import pytest
 
-from src.priamo_client import PriamoClient, PriamoPatient
+from src.priamo_client import (
+    PriamoClient,
+    PriamoPatient,
+    normalize_priamo_accents
+)
 from src.dotnet_client import DotNetApiClient
 
 
@@ -159,3 +163,52 @@ def test_dotnet_client_verification_methods(mock_priamo_settings):
         res_cohort = client.verify_patients_cohort([{"name": "A", "surname": "B"}])
         assert len(res_cohort) == 1
         assert res_cohort[0]["status"] == "found"
+
+
+def test_normalize_priamo_accents():
+    """Verifica che le vocali accentate vengano convertite in lettera + apostrofo
+
+    secondo la convenzione del database Priamo.
+    """
+    assert normalize_priamo_accents("Salvadé") == "Salvade'"
+    assert normalize_priamo_accents("Salvadè") == "Salvade'"
+    assert normalize_priamo_accents("D'Angiò") == "D'Angio'"
+    assert normalize_priamo_accents("Nicolò") == "Nicolo'"
+    assert normalize_priamo_accents("Cantù") == "Cantu'"
+    assert normalize_priamo_accents("D’Elia") == "D'Elia"  # Fancy apostrophe
+    assert normalize_priamo_accents("Èlena") == "E'lena"
+    assert normalize_priamo_accents("") == ""
+    assert normalize_priamo_accents(None) == ""
+
+
+def test_search_patient_with_accents_converted(mock_priamo_settings):
+    """Verifica che search_patient invii a Priamo i parametri con accenti convertiti in apostrofi."""
+    client = PriamoClient(settings=mock_priamo_settings)
+
+    mock_resp = MagicMock()
+    mock_resp.status_code = 200
+    mock_resp.json.return_value = [
+        {
+            "datiMef": {
+                "cognome": "SALVADE'",
+                "nome": "ANNA MARIA",
+                "codiceFiscale": "SLVNMR62C60L956G"
+            },
+            "datiAa": {
+                "progressivoPaz1": 1508277
+            }
+        }
+    ]
+
+    with patch.object(client, "authenticate"):
+        with patch.object(client, "_request", return_value=mock_resp) as mock_req:
+            p = client.search_patient(name="Anna Maria", surname="Salvadé", date_of_birth="1962-03-20")
+            assert p is not None
+            assert p.patient_id == "1508277"
+            assert p.surname == "Salvade'"
+
+            # Verifica che la chiamata sia partita con Cognome="Salvade'"
+            call_kwargs = mock_req.call_args[1]
+            params = call_kwargs["params"]
+            assert params["Cognome"] == "Salvade'"
+
