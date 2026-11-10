@@ -281,5 +281,27 @@ class DotNetApiClient:
             except Exception as e:
                 logger.warning(f"Riga Excel {idx} scartata: {e}")
 
+        # Se il file usa il formato registro condiviso multidisciplinare (es. positivi_2026.xls con colonne 'PZ' e 'gg/m/aa')
+        if not patients:
+            try:
+                from scripts.extract_patients_from_shared_file import estrai_pazienti_univoci
+                pzs = estrai_pazienti_univoci(path, only_complete=True)
+                for p in pzs:
+                    patients.append({
+                        "patient_id": p.patient_id,
+                        "name": p.nome or "",
+                        "surname": p.cognome,
+                        "date_of_birth": p.data_nascita,
+                        "raw_row": {
+                            "COGNOME": p.cognome,
+                            "NOME": p.nome or "",
+                            "DATA_NASCITA": str(p.data_nascita) if p.data_nascita else "",
+                            "RIGHE_EXCEL": p.righe_excel,
+                            "NOTE": p.note or ""
+                        }
+                    })
+            except Exception as ex:
+                logger.debug(f"Tentativo fallback estrai_pazienti_univoci: {ex}")
+
         logger.info(f"Caricati {len(patients)} pazienti univoci dal file Excel {path.name}")
         return patients

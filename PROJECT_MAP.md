@@ -30,7 +30,8 @@ Pipeline clinica per estrazione dati da referti medici PDF (senologia) tramite I
 | | `src/pipeline.py` | Pipeline generica batch su cartelle/file PDF locali con type hints unificati. |
 | **Interfaces** | `src/api_server.py` | FastAPI REST microservice con Dependency Injection, health-check completo, background tasks asincroni, sync e report audit `/api/audit/*`. |
 | | `src/cli.py` / `main.py` | CLI avanzata per esecuzione paziente, batch Excel, batch PDF, server mode, audit (`--audit-redcap`) o sync (`--sync-redcap`). |
-| **Scripts** | `scripts/delete_redcap_records.py` | CLI per eliminazione sicura di record da REDCap (singolo per record_id o totale con conferma di sicurezza). |
+| **Scripts** | `scripts/extract_patients_from_shared_file.py` | Estrazione, deduplicazione e normalizzazione dell'anagrafica pazienti dal file Excel condiviso multidisciplinare (`positivi_2026.xls`). |
+| | `scripts/delete_redcap_records.py` | CLI per eliminazione sicura di record da REDCap (singolo per record_id o totale con conferma di sicurezza). |
 | | `scripts/list_redcap_records.py` | CLI per elencare tutti i record REDCap con visualizzazione tabelle Rich, export JSON/CSV e filtri. |
 | | `scripts/audit_redcap_data.py` | CLI dashboard e generatore report su incongruenze, mancanze e panoramica generale dati REDCap. |
 | | `scripts/run_periodic_redcap_sync.py` | CLI runner / daemon schedulabile per audit periodico e aggiornamento dati clinici su REDCap. |
