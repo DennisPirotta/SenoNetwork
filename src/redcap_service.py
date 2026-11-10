@@ -416,6 +416,138 @@ class REDCapService:
             })
         return summary
 
+    def delete_records(
+        self,
+        record_ids: List[str],
+        arm: Optional[str] = None,
+        chunk_size: int = 100
+    ) -> int:
+        """Deletes a list of records from the REDCap project.
+
+        Args:
+            record_ids: List of record_id strings to delete.
+            arm: Optional arm number (for longitudinal projects).
+            chunk_size: Number of records to delete per API request (default: 100).
+
+        Returns:
+            Total count of deleted records.
+        """
+        if not self.api_url or not self.api_token:
+            raise ValueError("REDCap API URL and Token are required to delete records.")
+
+        if not record_ids:
+            return 0
+
+        clean_ids = [str(rid).strip() for rid in record_ids if str(rid).strip()]
+        if not clean_ids:
+            return 0
+
+        total_deleted = 0
+        step = max(1, chunk_size)
+
+        for i in range(0, len(clean_ids), step):
+            chunk = clean_ids[i:i + step]
+            payload: Dict[str, Any] = {
+                "token": self.api_token,
+                "content": "record",
+                "action": "delete"
+            }
+            if arm:
+                payload["arm"] = str(arm)
+
+            for idx, rid in enumerate(chunk):
+                payload[f"records[{idx}]"] = str(rid)
+
+            response = requests.post(self.api_url, data=payload, timeout=60)
+            response.raise_for_status()
+
+            # Parse deleted count from REDCap response
+            chunk_deleted = 0
+            try:
+                txt = response.text.strip()
+                if txt.isdigit():
+                    chunk_deleted = int(txt)
+                else:
+                    data = response.json()
+                    if isinstance(data, int):
+                        chunk_deleted = data
+                    elif isinstance(data, dict) and "count" in data:
+                        chunk_deleted = int(data["count"])
+                    else:
+                        chunk_deleted = len(chunk)
+            except Exception:
+                chunk_deleted = len(chunk)
+
+            total_deleted += chunk_deleted
+
+        return total_deleted
+
+    def delete_record(
+        self,
+        record_id: str,
+        arm: Optional[str] = None
+    ) -> bool:
+        """Deletes a single record from REDCap.
+
+        Args:
+            record_id: Record identifier to delete.
+            arm: Optional arm number.
+
+        Returns:
+            True if deleted, False otherwise.
+        """
+        if not record_id or not str(record_id).strip():
+            raise ValueError("record_id non specificato o vuoto.")
+
+        count = self.delete_records(record_ids=[str(record_id).strip()], arm=arm)
+        return count > 0
+
+    def delete_all_records(
+        self,
+        confirm: bool = False,
+        arm: Optional[str] = None,
+        chunk_size: int = 100,
+        clean_local_state: bool = False
+    ) -> int:
+        """Deletes all records currently present in the REDCap project.
+
+        Args:
+            confirm: Safety confirmation flag. Must be explicitly True.
+            arm: Optional arm number.
+            chunk_size: Number of records per API chunk.
+            clean_local_state: If True, also unlinks corresponding local data/state/{id}_state.json.
+
+        Returns:
+            Total count of deleted records.
+        """
+        if not confirm:
+            raise ValueError(
+                "Operazione ad alto rischio: per eliminare tutti i record presenti su REDCap "
+                "è obbligatorio impostare confirm=True."
+            )
+
+        all_ids = self.get_all_patient_ids()
+        if not all_ids:
+            logger.info("Nessun record presente su REDCap da eliminare.")
+            return 0
+
+        logger.warning(f"Avvio eliminazione massiva di {len(all_ids)} record da REDCap...")
+        deleted_count = self.delete_records(record_ids=all_ids, arm=arm, chunk_size=chunk_size)
+
+        if clean_local_state:
+            from src.config import get_settings
+            state_dir = get_settings().state_dir
+            for pid in all_ids:
+                sf = state_dir / f"{pid}_state.json"
+                if sf.exists():
+                    try:
+                        sf.unlink(missing_ok=True)
+                    except Exception as e:
+                        logger.debug(f"Impossibile rimuovere file di stato locale {sf}: {e}")
+
+        logger.info(f"Eliminati con successo {deleted_count} record da REDCap.")
+        return deleted_count
+
 
 def list_redcap_records(
     api_url: Optional[str] = None,
@@ -443,3 +575,64 @@ def list_redcap_records(
         include_completion_status=include_completion_status,
         filter_logic=filter_logic
     )
+
+
+def delete_redcap_records(
+    record_id: Optional[str] = None,
+    all_records: bool = False,
+    confirm: bool = False,
+    api_url: Optional[str] = None,
+    api_token: Optional[str] = None,
+    arm: Optional[str] = None,
+    chunk_size: int = 100,
+    clean_local_state: bool = False
+) -> int:
+    """Convenience top-level function to delete records from REDCap.
+
+    Supports either single record deletion (`record_id="ID"`) or mass deletion (`all_records=True`).
+    For mass deletion, `confirm=True` is strictly required to prevent accidental project wipe.
+
+    Args:
+        record_id: Specific record_id to delete (single record mode).
+        all_records: Flag to delete all records currently present in the REDCap project.
+        confirm: Confirmation flag required when all_records=True.
+        api_url: Optional REDCap API URL (falls back to config).
+        api_token: Optional REDCap API Token (falls back to config).
+        arm: Optional longitudinal arm number.
+        chunk_size: Chunk size for batch API requests.
+        clean_local_state: If True, also unlinks corresponding local data/state/{id}_state.json.
+
+    Returns:
+        Number of deleted records.
+    """
+    from src.config import get_settings
+    cfg = get_settings()
+    service = REDCapService(
+        api_url=api_url or cfg.redcap_api_url,
+        api_token=api_token or cfg.redcap_api_token
+    )
+
+    if record_id and not all_records:
+        success = service.delete_record(record_id=record_id, arm=arm)
+        if success and clean_local_state:
+            state_file = cfg.state_dir / f"{record_id}_state.json"
+            if state_file.exists():
+                try:
+                    state_file.unlink(missing_ok=True)
+                except Exception as e:
+                    logger.debug(f"Impossibile rimuovere file di stato locale {state_file}: {e}")
+        return 1 if success else 0
+
+    if all_records:
+        return service.delete_all_records(
+            confirm=confirm,
+            arm=arm,
+            chunk_size=chunk_size,
+            clean_local_state=clean_local_state
+        )
+
+    raise ValueError(
+        "È necessario specificare 'record_id' per eliminare un singolo record, "
+        "oppure 'all_records=True' (con 'confirm=True') per eliminare tutti i record."
+    )
+

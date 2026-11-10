@@ -484,6 +484,72 @@ def get_redcap_records_summary(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.delete("/api/redcap/records/{record_id}")
+def delete_single_redcap_record(
+    record_id: str,
+    clean_local_state: bool = False,
+    settings: Settings = Depends(get_shared_settings)
+):
+    """Deletes a single patient record from REDCap by its record_id."""
+    from src.redcap_service import delete_redcap_records
+    try:
+        count = delete_redcap_records(
+            record_id=record_id,
+            clean_local_state=clean_local_state,
+            api_url=settings.redcap_api_url,
+            api_token=settings.redcap_api_token
+        )
+        if count == 0:
+            raise HTTPException(status_code=404, detail=f"Record '{record_id}' non trovato o non eliminato da REDCap.")
+        return {
+            "status": "deleted",
+            "record_id": record_id,
+            "deleted_count": count,
+            "message": f"Record '{record_id}' eliminato con successo da REDCap."
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Errore eliminazione record {record_id}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/api/redcap/records")
+def delete_all_redcap_records(
+    confirm: bool = False,
+    clean_local_state: bool = False,
+    settings: Settings = Depends(get_shared_settings)
+):
+    """Deletes ALL records currently present on REDCap.
+
+    Requires explicit query parameter confirm=true to safeguard against accidental project wipe.
+    """
+    if not confirm:
+        raise HTTPException(
+            status_code=400,
+            detail="Operazione ad alto rischio: per eliminare tutti i record è obbligatorio specificare il parametro ?confirm=true."
+        )
+
+    from src.redcap_service import delete_redcap_records
+    try:
+        count = delete_redcap_records(
+            all_records=True,
+            confirm=True,
+            clean_local_state=clean_local_state,
+            api_url=settings.redcap_api_url,
+            api_token=settings.redcap_api_token
+        )
+        return {
+            "status": "deleted",
+            "deleted_count": count,
+            "message": f"Eliminati con successo {count} record da REDCap."
+        }
+    except Exception as e:
+        logger.error(f"Errore eliminazione massiva record REDCap: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+
 def run_server(host: str = "0.0.0.0", port: int = 8000):
     import uvicorn
     uvicorn.run("src.api_server:app", host=host, port=port, reload=False)

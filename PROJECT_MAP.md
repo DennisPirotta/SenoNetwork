@@ -30,7 +30,8 @@ Pipeline clinica per estrazione dati da referti medici PDF (senologia) tramite I
 | | `src/pipeline.py` | Pipeline generica batch su cartelle/file PDF locali con type hints unificati. |
 | **Interfaces** | `src/api_server.py` | FastAPI REST microservice con Dependency Injection, health-check completo, background tasks asincroni, sync e report audit `/api/audit/*`. |
 | | `src/cli.py` / `main.py` | CLI avanzata per esecuzione paziente, batch Excel, batch PDF, server mode, audit (`--audit-redcap`) o sync (`--sync-redcap`). |
-| **Scripts** | `scripts/list_redcap_records.py` | CLI per elencare tutti i record REDCap con visualizzazione tabelle Rich, export JSON/CSV e filtri. |
+| **Scripts** | `scripts/delete_redcap_records.py` | CLI per eliminazione sicura di record da REDCap (singolo per record_id o totale con conferma di sicurezza). |
+| | `scripts/list_redcap_records.py` | CLI per elencare tutti i record REDCap con visualizzazione tabelle Rich, export JSON/CSV e filtri. |
 | | `scripts/audit_redcap_data.py` | CLI dashboard e generatore report su incongruenze, mancanze e panoramica generale dati REDCap. |
 | | `scripts/run_periodic_redcap_sync.py` | CLI runner / daemon schedulabile per audit periodico e aggiornamento dati clinici su REDCap. |
 | | `scripts/test_remote_llamacpp.py` | Diagnostica e benchmarking server llama.cpp remoto/RPC (latenza, GBNF schema, estrazione clinica). |
@@ -106,6 +107,12 @@ Pipeline clinica per estrazione dati da referti medici PDF (senologia) tramite I
   - `list_all_records(fields, forms, include_demographics, include_completion_status, filter_logic) -> List[dict]`: Elenca tutti i record presenti su REDCap con filtri e campi anagrafici/status.
   - `get_records_summary() -> List[dict]`: Panoramica aggregata di tutti i record con avanzamento form e conteggio form completati.
   - `find_record_id_by_demographics(name, surname, dob) -> Optional[str]`: Cerca e preserva il `record_id` nativo di REDCap per anagrafica.
+  - `delete_records(record_ids: List[str], arm, chunk_size) -> int`: Eliminazione a lotti (chunked POST con `action=delete`) di record su REDCap.
+  - `delete_record(record_id: str, arm) -> bool`: Eliminazione di un singolo record da REDCap.
+  - `delete_all_records(confirm=False, arm, chunk_size, clean_local_state) -> int`: Eliminazione massiva protetta da flag `confirm=True` di tutti i record presenti su REDCap con pulizia facoltativa dello stato locale.
+- **Funzioni di modulo**:
+  - `list_redcap_records(...) -> List[dict]`: Helper top-level per elencare tutti i record.
+  - `delete_redcap_records(record_id, all_records, confirm, clean_local_state, ...) -> int`: Helper top-level unificato per eliminazione singola o totale da REDCap.
 
 ### `src/sync_service.py`
 - **`RedCapSyncService(settings, redcap_service, dotnet_client, ai_extractor, ...)`**:
@@ -179,11 +186,17 @@ Pipeline clinica per estrazione dati da referti medici PDF (senologia) tramite I
   - `GET /api/tasks/{task_id}`: Polling stato ed esito elaborazione background.
   - `POST /api/patient/{id}/upload-pdfs`: Upload multipart di PDF direttamente da applicazione .NET.
   - `POST /api/batch/excel`: Elaborazione batch di coorte da file Excel configurato in `Settings`.
+  - `GET /api/redcap/records`: Elenco completo dei record presenti su REDCap con filtri.
+  - `GET /api/redcap/records/summary`: Panoramica aggregata di avanzamento e form completati.
+  - `DELETE /api/redcap/records/{record_id}`: Eliminazione singolo record paziente con opzione `clean_local_state`.
+  - `DELETE /api/redcap/records?confirm=true`: Eliminazione massiva di tutti i record da REDCap protetta da `confirm=true`.
 
 ### `src/cli.py` & `main.py`
 - Entrypoint CLI:
   - Inizializza `Settings(**overrides)` in modo immutabile.
   - Supporta `--patient-id`, `--name`, `--surname`, `--dob`, `--excel`, `--pdf`, `--serve`, `--backend`.
+  - Supporta `--audit-redcap`, `--sync-redcap`, `--list-records`.
+  - Supporta `--delete-record <ID>` e `--delete-all-records --confirm` (con opzione `--clean-local-state`).
 
 ---
 

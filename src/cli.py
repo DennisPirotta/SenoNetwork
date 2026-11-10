@@ -287,6 +287,26 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Elenca tutti i record presenti in REDCap mostrando anagrafica e avanzamento form."
     )
     parser.add_argument(
+        "--delete-record",
+        default=None,
+        help="Elimina un singolo record da REDCap specificando il suo record_id (es. --delete-record 101)."
+    )
+    parser.add_argument(
+        "--delete-all-records",
+        action="store_true",
+        help="Elimina TUTTI i record attualmente presenti nel progetto REDCap (richiede --confirm)."
+    )
+    parser.add_argument(
+        "--confirm",
+        action="store_true",
+        help="Conferma esplicita richiesta per operazioni irreversibili (es. --delete-all-records)."
+    )
+    parser.add_argument(
+        "--clean-local-state",
+        action="store_true",
+        help="Rimuove anche i file di stato locali (data/state/{id}_state.json) dei record eliminati."
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Esegue il controllo in modalità simulazione: visualizza i campi che verrebbero aggiornati senza scrivere su REDCap."
@@ -393,6 +413,45 @@ def main():
             display_rich_table(records)
         else:
             display_plain_table(records)
+        return
+
+    # 4. Mode: Delete single record from REDCap
+    if args.delete_record:
+        from src.redcap_service import delete_redcap_records
+        print(f"-> Richiesta eliminazione record REDCap: {args.delete_record}...")
+        count = delete_redcap_records(
+            record_id=args.delete_record,
+            api_url=settings.redcap_api_url,
+            api_token=settings.redcap_api_token,
+            clean_local_state=args.clean_local_state
+        )
+        if count > 0:
+            print(f"[OK] Record '{args.delete_record}' eliminato con successo da REDCap.")
+        else:
+            print(f"[WARN] Nessun record eliminato per ID '{args.delete_record}'.", file=sys.stderr)
+        return
+
+    # 5. Mode: Delete ALL records from REDCap
+    if args.delete_all_records:
+        from src.redcap_service import delete_redcap_records
+        if not args.confirm:
+            print(
+                "\n[ERRORE DI SICUREZZA] L'eliminazione massiva di tutti i record su REDCap richiede conferma esplicita.",
+                file=sys.stderr
+            )
+            print("Per procedere, riesegui il comando aggiungendo il flag '--confirm':", file=sys.stderr)
+            print("  uv run python -m src.cli --delete-all-records --confirm\n", file=sys.stderr)
+            sys.exit(1)
+
+        print("-> [ATTENZIONE] Avvio eliminazione di TUTTI i record presenti su REDCap...")
+        count = delete_redcap_records(
+            all_records=True,
+            confirm=True,
+            api_url=settings.redcap_api_url,
+            api_token=settings.redcap_api_token,
+            clean_local_state=args.clean_local_state
+        )
+        print(f"[OK] Eliminazione completata: eliminati con successo {count} record da REDCap.")
         return
 
     # 4. Mode: REDCap Periodic Audit & Sync

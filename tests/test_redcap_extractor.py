@@ -208,3 +208,148 @@ def test_list_redcap_records_top_level_function():
         res = list_redcap_records(api_url="https://mock.url/api/", api_token="TOKEN")
         assert len(res) == 1
         assert res[0]["record_id"] == "1"
+
+
+def test_delete_record_single():
+    """Tests single record deletion via REDCapService.delete_record."""
+    from unittest.mock import patch, MagicMock
+
+    service = REDCapService(api_url="https://mock.redcap/api/", api_token="TOKEN")
+    
+    # Empty ID raises ValueError
+    with pytest.raises(ValueError):
+        service.delete_record(record_id="")
+
+    # Mock successful POST response returning 1
+    mock_resp = MagicMock()
+    mock_resp.text = "1"
+    mock_resp.status_code = 200
+    mock_resp.raise_for_status = MagicMock()
+
+    with patch("requests.post", return_value=mock_resp) as mock_post:
+        success = service.delete_record(record_id="PZ-999")
+        assert success is True
+        mock_post.assert_called_once()
+        call_kwargs = mock_post.call_args[1]
+        assert call_kwargs["data"]["content"] == "record"
+        assert call_kwargs["data"]["action"] == "delete"
+        assert call_kwargs["data"]["records[0]"] == "PZ-999"
+
+
+def test_delete_records_chunked():
+    """Tests batch deletion with chunking in REDCapService.delete_records."""
+    from unittest.mock import patch, MagicMock
+
+    service = REDCapService(api_url="https://mock.redcap/api/", api_token="TOKEN")
+    ids = ["PZ-01", "PZ-02", "PZ-03", "PZ-04", "PZ-05"]
+
+    mock_resp = MagicMock()
+    mock_resp.text = "2"
+    mock_resp.status_code = 200
+
+    with patch("requests.post", return_value=mock_resp) as mock_post:
+        total = service.delete_records(record_ids=ids, chunk_size=2)
+        # 5 items chunked at 2 -> 3 chunks (2, 2, 1)
+        assert mock_post.call_count == 3
+        # In our mock, each chunk returned text "2", so 3 * 2 = 6
+        assert total == 6
+
+
+def test_delete_all_records_safety_and_execution(tmp_path):
+    """Tests that delete_all_records enforces confirm=True and deletes all records."""
+    from unittest.mock import patch, MagicMock
+
+    service = REDCapService(api_url="https://mock.redcap/api/", api_token="TOKEN")
+
+    # Safety check: confirm=False must raise ValueError
+    with pytest.raises(ValueError, match="confirm=True"):
+        service.delete_all_records(confirm=False)
+
+    # Empty project
+    with patch.object(service, "get_all_patient_ids", return_value=[]):
+        assert service.delete_all_records(confirm=True) == 0
+
+    # With records and clean_local_state
+    fake_state_dir = tmp_path / "state"
+    fake_state_dir.mkdir()
+    state_file1 = fake_state_dir / "PZ-01_state.json"
+    state_file1.write_text("{}")
+
+    with patch.object(service, "get_all_patient_ids", return_value=["PZ-01", "PZ-02"]), \
+         patch.object(service, "delete_records", return_value=2) as mock_del, \
+         patch("src.config.get_settings") as mock_settings:
+        
+        mock_cfg = MagicMock()
+        mock_cfg.state_dir = fake_state_dir
+        mock_settings.return_value = mock_cfg
+
+        count = service.delete_all_records(confirm=True, clean_local_state=True)
+        assert count == 2
+        mock_del.assert_called_once_with(record_ids=["PZ-01", "PZ-02"], arm=None, chunk_size=100)
+        assert not state_file1.exists()
+
+
+def test_delete_redcap_records_helper():
+    """Tests top-level convenience delete_redcap_records function."""
+    from unittest.mock import patch
+    from src.redcap_service import delete_redcap_records
+
+    # Neither single record nor all_records
+    with pytest.raises(ValueError, match="È necessario specificare"):
+        delete_redcap_records()
+
+    # Single record deletion
+    with patch("src.redcap_service.REDCapService.delete_record", return_value=True) as mock_single:
+        deleted = delete_redcap_records(record_id="PZ-01", api_url="https://m/api/", api_token="T")
+        assert deleted == 1
+        mock_single.assert_called_once_with(record_id="PZ-01", arm=None)
+
+    # Mass deletion
+    with patch("src.redcap_service.REDCapService.delete_all_records", return_value=5) as mock_all:
+        deleted = delete_redcap_records(all_records=True, confirm=True, api_url="https://m/api/", api_token="T")
+        assert deleted == 5
+        mock_all.assert_called_once_with(confirm=True, arm=None, chunk_size=100, clean_local_state=False)
+
+
+def test_api_server_delete_endpoints():
+    """Tests FastAPI delete endpoints in src.api_server."""
+    from unittest.mock import patch, MagicMock
+    from fastapi import HTTPException
+    from src.api_server import delete_single_redcap_record, delete_all_redcap_records
+
+    mock_cfg = MagicMock()
+    mock_cfg.redcap_api_url = "https://mock.redcap/api/"
+    mock_cfg.redcap_api_token = "TOKEN"
+
+    # 1. Single delete success
+    with patch("src.redcap_service.delete_redcap_records", return_value=1) as mock_del:
+        res = delete_single_redcap_record(record_id="PZ-01", clean_local_state=False, settings=mock_cfg)
+        assert res["status"] == "deleted"
+        assert res["record_id"] == "PZ-01"
+        assert res["deleted_count"] == 1
+
+    # 2. Single delete not found (returns 0) -> HTTPException 404
+    with patch("src.redcap_service.delete_redcap_records", return_value=0):
+        with pytest.raises(HTTPException) as exc_info:
+            delete_single_redcap_record(record_id="PZ-NONEXIST", clean_local_state=False, settings=mock_cfg)
+        assert exc_info.value.status_code == 404
+
+    # 3. Mass delete without confirm -> HTTPException 400
+    with pytest.raises(HTTPException) as exc_info:
+        delete_all_redcap_records(confirm=False, settings=mock_cfg)
+    assert exc_info.value.status_code == 400
+
+    # 4. Mass delete with confirm=True -> success
+    with patch("src.redcap_service.delete_redcap_records", return_value=12) as mock_mass:
+        res = delete_all_redcap_records(confirm=True, clean_local_state=True, settings=mock_cfg)
+        assert res["status"] == "deleted"
+        assert res["deleted_count"] == 12
+        mock_mass.assert_called_once_with(
+            all_records=True,
+            confirm=True,
+            clean_local_state=True,
+            api_url="https://mock.redcap/api/",
+            api_token="TOKEN"
+        )
+
+
