@@ -8,6 +8,7 @@ dei fogli di lavoro ambulatoriali (worksheets) in formato Excel (.xlsx) per:
   - Agende Ambulatoriali: 3000, 3003, 3004, 3035, 3036
 """
 
+import calendar
 from datetime import date, datetime, timedelta
 import logging
 from pathlib import Path
@@ -369,3 +370,130 @@ class PriamoCupClient:
             curr_lunedi += timedelta(days=7)
 
         return saved_paths
+
+    def export_ytd(
+        self,
+        ref_date: Optional[Union[date, str]] = None,
+        **kwargs
+    ) -> Path:
+        """Esporta tutti i fogli di lavoro dall'inizio dell'anno (1° Gennaio) fino a Oggi - 1 giorno (Ieri).
+
+        Parametri:
+          ref_date: Data di riferimento (default: data odierna).
+          **kwargs: Parametri aggiuntivi per export_worksheets (es. output_dir, codice_unita, agende).
+        """
+        if ref_date is None:
+            base_date = date.today()
+        elif isinstance(ref_date, str):
+            base_date = date.fromisoformat(ref_date[:10])
+        else:
+            base_date = ref_date
+
+        start_date = date(base_date.year, 1, 1)
+        end_date = base_date - timedelta(days=1)
+
+        # Se oggi fosse il 1° gennaio, copri il singolo giorno
+        if end_date < start_date:
+            end_date = start_date
+
+        codice_unita = kwargs.get("codice_unita", UNITA_SENOLOGIA)
+        default_fn = f"fogli_lavoro_unita_{codice_unita}_YTD_{start_date.strftime('%Y%m%d')}_{end_date.strftime('%Y%m%d')}.xlsx"
+        custom_fn = kwargs.pop("custom_filename", None) or default_fn
+
+        logger.info(f"Esportazione YTD (1° Gennaio -> Ieri): {start_date.strftime('%d/%m/%Y')} -> {end_date.strftime('%d/%m/%Y')}")
+        return self.export_worksheets(
+            start_date=start_date,
+            end_date=end_date,
+            custom_filename=custom_fn,
+            **kwargs
+        )
+
+    def export_year(
+        self,
+        year: int,
+        up_to_yesterday_if_current: bool = True,
+        **kwargs
+    ) -> Path:
+        """Esporta il foglio di lavoro per un intero anno solare (es. 2025, 2024, ecc.).
+
+        Se l'anno richiesto è quello corrente e up_to_yesterday_if_current=True,
+        la data di fine viene impostata a Oggi - 1 giorno.
+        """
+        start_date = date(year, 1, 1)
+        today = date.today()
+
+        if year == today.year and up_to_yesterday_if_current:
+            end_date = max(start_date, today - timedelta(days=1))
+        else:
+            end_date = date(year, 12, 31)
+
+        codice_unita = kwargs.get("codice_unita", UNITA_SENOLOGIA)
+        default_fn = f"fogli_lavoro_unita_{codice_unita}_anno_{year}.xlsx"
+        custom_fn = kwargs.pop("custom_filename", None) or default_fn
+
+        logger.info(f"Esportazione anno {year}: {start_date.strftime('%d/%m/%Y')} -> {end_date.strftime('%d/%m/%Y')}")
+        return self.export_worksheets(
+            start_date=start_date,
+            end_date=end_date,
+            custom_filename=custom_fn,
+            **kwargs
+        )
+
+    def export_month(
+        self,
+        year: int,
+        month: int,
+        **kwargs
+    ) -> Path:
+        """Esporta il foglio di lavoro per uno specifico mese di un anno (es. anno 2025, mese 10)."""
+        start_date = date(year, month, 1)
+        _, last_day = calendar.monthrange(year, month)
+        end_date = date(year, month, last_day)
+
+        codice_unita = kwargs.get("codice_unita", UNITA_SENOLOGIA)
+        default_fn = f"fogli_lavoro_unita_{codice_unita}_mese_{year}{month:02d}.xlsx"
+        custom_fn = kwargs.pop("custom_filename", None) or default_fn
+
+        logger.info(f"Esportazione mese {month:02d}/{year}: {start_date.strftime('%d/%m/%Y')} -> {end_date.strftime('%d/%m/%Y')}")
+        return self.export_worksheets(
+            start_date=start_date,
+            end_date=end_date,
+            custom_filename=custom_fn,
+            **kwargs
+        )
+
+    def export_last_months(
+        self,
+        num_months: int = 1,
+        ref_date: Optional[Union[date, str]] = None,
+        **kwargs
+    ) -> Path:
+        """Esporta il foglio di lavoro per gli ultimi N mesi fino a Oggi - 1 giorno."""
+        if ref_date is None:
+            base_date = date.today()
+        elif isinstance(ref_date, str):
+            base_date = date.fromisoformat(ref_date[:10])
+        else:
+            base_date = ref_date
+
+        end_date = base_date - timedelta(days=1)
+
+        # Calcolo mese di inizio
+        year = base_date.year
+        month = base_date.month - num_months
+        while month <= 0:
+            month += 12
+            year -= 1
+        start_date = date(year, month, 1)
+
+        codice_unita = kwargs.get("codice_unita", UNITA_SENOLOGIA)
+        default_fn = f"fogli_lavoro_unita_{codice_unita}_ultimi_{num_months}_mesi_{start_date.strftime('%Y%m%d')}_{end_date.strftime('%Y%m%d')}.xlsx"
+        custom_fn = kwargs.pop("custom_filename", None) or default_fn
+
+        logger.info(f"Esportazione ultimi {num_months} mesi: {start_date.strftime('%d/%m/%Y')} -> {end_date.strftime('%d/%m/%Y')}")
+        return self.export_worksheets(
+            start_date=start_date,
+            end_date=end_date,
+            custom_filename=custom_fn,
+            **kwargs
+        )

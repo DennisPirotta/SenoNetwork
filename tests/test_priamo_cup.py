@@ -126,6 +126,62 @@ def test_priamo_cup_client_export_worksheets(tmp_path):
             assert call_kwargs["headers"]["RequestVerificationToken"] == "csrf_abc_123"
 
 
+def test_priamo_cup_client_export_ytd(tmp_path):
+    client = PriamoCupClient(username="test_user", password="test_password")
+
+    with patch.object(client, "export_worksheets") as mock_exp:
+        mock_exp.return_value = tmp_path / "mock_ytd.xlsx"
+        ref_d = date(2026, 11, 11)
+        res = client.export_ytd(ref_date=ref_d, output_dir=tmp_path)
+
+        assert mock_exp.called
+        call_kwargs = mock_exp.call_args[1]
+        assert call_kwargs["start_date"] == date(2026, 1, 1)
+        assert call_kwargs["end_date"] == date(2026, 11, 10)  # Oggi - 1 giorno
+
+
+def test_priamo_cup_client_export_year(tmp_path):
+    client = PriamoCupClient(username="test_user", password="test_password")
+
+    # Anno precedente (2025 intero)
+    with patch.object(client, "export_worksheets") as mock_exp:
+        mock_exp.return_value = tmp_path / "mock_2025.xlsx"
+        res = client.export_year(year=2025, output_dir=tmp_path)
+
+        assert mock_exp.called
+        call_kwargs = mock_exp.call_args[1]
+        assert call_kwargs["start_date"] == date(2025, 1, 1)
+        assert call_kwargs["end_date"] == date(2025, 12, 31)
+
+
+def test_priamo_cup_client_export_month(tmp_path):
+    client = PriamoCupClient(username="test_user", password="test_password")
+
+    # Mese specifico (febbraio 2024, anno bisestile)
+    with patch.object(client, "export_worksheets") as mock_exp:
+        mock_exp.return_value = tmp_path / "mock_month.xlsx"
+        res = client.export_month(year=2024, month=2, output_dir=tmp_path)
+
+        assert mock_exp.called
+        call_kwargs = mock_exp.call_args[1]
+        assert call_kwargs["start_date"] == date(2024, 2, 1)
+        assert call_kwargs["end_date"] == date(2024, 2, 29)
+
+
+def test_priamo_cup_client_export_last_months(tmp_path):
+    client = PriamoCupClient(username="test_user", password="test_password")
+
+    with patch.object(client, "export_worksheets") as mock_exp:
+        mock_exp.return_value = tmp_path / "mock_months.xlsx"
+        ref_d = date(2026, 11, 11)
+        res = client.export_last_months(num_months=3, ref_date=ref_d, output_dir=tmp_path)
+
+        assert mock_exp.called
+        call_kwargs = mock_exp.call_args[1]
+        assert call_kwargs["start_date"] == date(2026, 8, 1)
+        assert call_kwargs["end_date"] == date(2026, 11, 10)
+
+
 def test_estrai_pazienti_da_fogli_cup_dataframe():
     df_cup = pd.DataFrame([
         {

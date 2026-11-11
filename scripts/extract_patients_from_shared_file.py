@@ -627,6 +627,28 @@ def parse_args():
         help="Scarica direttamente i fogli di lavoro da PriamoCUP prima dell'estrazione."
     )
     parser.add_argument(
+        "--ytd", "--da-gennaio",
+        action="store_true",
+        help="Scarica da PriamoCUP da 1° Gennaio fino a Oggi - 1 giorno (Ieri)."
+    )
+    parser.add_argument(
+        "--year", "--anno",
+        type=int,
+        default=None,
+        help="Scarica da PriamoCUP l'intero anno specificato (es. 2025, 2024, ecc.)."
+    )
+    parser.add_argument(
+        "--month", "--mese",
+        default=None,
+        help="Scarica da PriamoCUP uno specifico mese in formato YYYY-MM (es. 2025-10, 2026-03)."
+    )
+    parser.add_argument(
+        "--months", "--ultimi-mesi",
+        type=int,
+        default=None,
+        help="Scarica da PriamoCUP gli ultimi N mesi fino a Oggi - 1 giorno."
+    )
+    parser.add_argument(
         "--start-date",
         default=None,
         help="Data inizio periodo download PriamoCUP (YYYY-MM-DD). Default: inizio settimana corrente."
@@ -659,12 +681,54 @@ def main():
     args = parse_args()
 
     # Se richiesto download diretto da PriamoCUP
-    if args.download_cup:
+    download_requested = args.download_cup or args.ytd or args.year or args.month or args.months
+    if download_requested:
         from src.priamo_cup_client import PriamoCupClient
         cup_client = PriamoCupClient()
         agendas_list = [a.strip() for a in args.agendas.split(",") if a.strip()]
 
-        if args.start_date and args.end_date:
+        if args.ytd:
+            print(f"-> Download fogli lavoro PriamoCUP: YTD (1° Gennaio -> Ieri) per Unità {args.unit}, Agende {agendas_list}...")
+            downloaded_file = cup_client.export_ytd(
+                codice_unita=args.unit,
+                agende=agendas_list,
+                output_dir="data/cup",
+            )
+        elif args.year:
+            print(f"-> Download fogli lavoro PriamoCUP per l'anno {args.year} (Unità {args.unit}, Agende {agendas_list})...")
+            downloaded_file = cup_client.export_year(
+                year=args.year,
+                codice_unita=args.unit,
+                agende=agendas_list,
+                output_dir="data/cup",
+            )
+        elif args.month:
+            month_str = str(args.month).strip()
+            if "-" in month_str:
+                parts = month_str.split("-")
+                target_year = int(parts[0])
+                target_month = int(parts[1])
+            else:
+                target_year = date.today().year
+                target_month = int(month_str)
+
+            print(f"-> Download fogli lavoro PriamoCUP per il mese {target_month:02d}/{target_year} (Unità {args.unit}, Agende {agendas_list})...")
+            downloaded_file = cup_client.export_month(
+                year=target_year,
+                month=target_month,
+                codice_unita=args.unit,
+                agende=agendas_list,
+                output_dir="data/cup",
+            )
+        elif args.months:
+            print(f"-> Download fogli lavoro PriamoCUP per gli ultimi {args.months} mesi (Unità {args.unit}, Agende {agendas_list})...")
+            downloaded_file = cup_client.export_last_months(
+                num_months=args.months,
+                codice_unita=args.unit,
+                agende=agendas_list,
+                output_dir="data/cup",
+            )
+        elif args.start_date and args.end_date:
             print(f"-> Download fogli lavoro PriamoCUP (Unità {args.unit}, Agende {agendas_list}, Periodo {args.start_date} -> {args.end_date})...")
             downloaded_file = cup_client.export_worksheets(
                 start_date=args.start_date,
