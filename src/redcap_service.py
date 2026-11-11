@@ -459,6 +459,17 @@ class REDCapService:
                 payload[f"records[{idx}]"] = str(rid)
 
             response = requests.post(self.api_url, data=payload, timeout=60)
+            if response.status_code == 403:
+                raw_text = response.text.strip()
+                # Estrae il messaggio di errore da XML/JSON se presente
+                clean_msg = raw_text
+                if "<error>" in raw_text and "</error>" in raw_text:
+                    clean_msg = raw_text.split("<error>")[1].split("</error>")[0].strip()
+                raise PermissionError(
+                    f"Errore 403 Forbidden da REDCap API: '{clean_msg}'. "
+                    "L'account REDCap associato al token non possiede i permessi per eliminare i record. "
+                    "Per abilitarlo: accedi al progetto REDCap -> 'User Rights' -> seleziona l'utente -> abilita la spunta 'Delete Records'."
+                )
             response.raise_for_status()
 
             # Parse deleted count from REDCap response
