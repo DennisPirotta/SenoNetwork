@@ -167,7 +167,7 @@ def split_nominativo(raw_name: str) -> Tuple[str, Optional[str]]:
 
 
 class Paziente(BaseModel):
-    """Rappresentazione di un paziente univoco estratto dal registro."""
+    """Rappresentazione di un paziente univoco estratto dal registro o foglio lavoro."""
     model_config = ConfigDict(frozen=True, str_strip_whitespace=True)
 
     patient_id: str = Field(default="", description="ID o slug normalizzato per REDCap/SenoNetwork")
@@ -175,7 +175,14 @@ class Paziente(BaseModel):
     nome: Optional[str] = Field(None, description="Nome del paziente (se presente)")
     data_nascita: Optional[date] = Field(None, description="Data di nascita (YYYY-MM-DD)")
     righe_excel: List[int] = Field(default_factory=list, description="Indici di riga nel file Excel originale (1-based)")
-    note: Optional[str] = Field(None, description="Note cliniche o di follow-up registrate")
+    note: Optional[str] = Field(None, description="Note cliniche, prestazioni o orari registrati")
+    codice_fiscale: Optional[str] = Field(None, description="Codice Fiscale ufficiale MEF")
+    sesso: Optional[str] = Field(None, description="Sesso del paziente ('M' o 'F')")
+    comune_nascita: Optional[str] = Field(None, description="Comune o stato estero di nascita")
+    priamo_id: Optional[str] = Field(None, description="ID o progressivo paziente in Priamo (progressivoPaz1)")
+    telefono: Optional[str] = Field(None, description="Recapito telefonico o cellulare")
+    agende: List[str] = Field(default_factory=list, description="Agende/erogatori Priamo CUP associati")
+    num_appuntamenti: int = Field(default=1, description="Numero di appuntamenti registrati")
 
     @model_validator(mode="before")
     @classmethod
@@ -210,43 +217,205 @@ class Paziente(BaseModel):
 
     def to_redcap_dict(self) -> Dict[str, Any]:
         """Converte l'anagrafica nel dizionario standard compatibile con REDCap."""
-        return {
+        res = {
             "record_id": self.patient_id,
             "name": self.nome or "",
             "surname": self.cognome,
             "date_of_birth": self.data_nascita.isoformat() if self.data_nascita else ""
         }
+        if self.codice_fiscale:
+            res["codice_fiscale"] = self.codice_fiscale
+        if self.priamo_id:
+            res["priamo_id"] = self.priamo_id
+        return res
+
+    def to_export_dict(self) -> Dict[str, Any]:
+        """Restituisce un dizionario completo per esportazione tabellare con colonne PAZ_..."""
+        return {
+            "patient_id": self.patient_id,
+            "PAZ_COGNOME": self.cognome,
+            "PAZ_NOME": self.nome or "",
+            "PAZ_DATA_NASCITA": self.data_nascita.isoformat() if self.data_nascita else "",
+            "cognome": self.cognome,
+            "nome": self.nome or "",
+            "data_nascita": self.data_nascita.isoformat() if self.data_nascita else "",
+            "codice_fiscale": self.codice_fiscale or "",
+            "priamo_id": self.priamo_id or "",
+            "sesso": self.sesso or "",
+            "comune_nascita": self.comune_nascita or "",
+            "telefono": self.telefono or "",
+            "agende": ", ".join(self.agende),
+            "num_appuntamenti": self.num_appuntamenti,
+            "righe_excel": ", ".join(map(str, self.righe_excel)),
+            "is_complete": self.is_complete,
+            "note": self.note or "",
+        }
+
+
+def estrai_pazienti_da_fogli_cup(
+    filepath_or_df: Union[str, Path, pd.DataFrame],
+    sheet_name: Optional[Union[str, int]] = 0,
+    only_complete: bool = False,
+) -> List[Paziente]:
+    """Estrae l'anagrafica univoca dei pazienti (PAZ_NOME, PAZ_COGNOME, PAZ_DATA_NASCITA)
+
+    da un file report di foglio di lavoro esportato da PriamoCUP.
+    Deduplica i pazienti univoci, normalizza i nominativi e include metadati essenziali
+    (Codice Fiscale, Sesso, Comune Nascita, ID Priamo, Agende, Note appuntamento).
+    """
+    if isinstance(filepath_or_df, pd.DataFrame):
+        df = filepath_or_df.copy()
+    else:
+        p = Path(filepath_or_df)
+        if not p.exists():
+            raise FileNotFoundError(f"File foglio lavoro non trovato: {p.resolve()}")
+        df = pd.read_excel(p, sheet_name=sheet_name or 0)
+
+    if df.empty:
+        return []
+
+    # Normalizza colonne (stripped, maiuscolo)
+    col_map = {c: str(c).strip().upper() for c in df.columns}
+    df = df.rename(columns=col_map)
+
+    req_cols = ["PAZ_COGNOME", "PAZ_NOME"]
+    for col in req_cols:
+        if col not in df.columns:
+            raise ValueError(f"Colonna obbligatoria '{col}' assente nel foglio lavoro PriamoCUP.")
+
+    pazienti_map: Dict[Tuple[str, str, Optional[str]], Dict[str, Any]] = {}
+
+    for idx, row in df.iterrows():
+        excel_row_num = int(idx) + 2  # 1-based, riga 1 intestazione
+
+        raw_cognome = row.get("PAZ_COGNOME")
+        raw_nome = row.get("PAZ_NOME")
+        raw_dob = row.get("PAZ_DATA_NASCITA")
+
+        if pd.isna(raw_cognome) or not str(raw_cognome).strip():
+            continue
+
+        cognome = clean_title(raw_cognome)
+        nome = clean_title(raw_nome) if pd.notna(raw_nome) and str(raw_nome).strip() else None
+
+        dob: Optional[date] = None
+        dob_iso: Optional[str] = None
+        if pd.notna(raw_dob):
+            try:
+                ts = pd.to_datetime(raw_dob, errors="coerce")
+                if not pd.isna(ts):
+                    dob = ts.date()
+                    dob_iso = dob.isoformat()
+            except Exception:
+                pass
+
+        cf = str(row.get("PAZ_CODICE_FISCALE") or "").strip() or None
+        sesso = str(row.get("PAZ_SESSO") or "").strip().upper() or None
+        comune = clean_title(row.get("PAZ_COMUNE_NASCITA")) or None
+        priamo_id = str(row.get("PAZ_PROGRESSIVO_PAZ1") or "").strip() or None
+        telefono = str(row.get("PRENO_CELLULARE") or row.get("PRENO_TELEFONO") or "").strip() or None
+
+        agenda_codice = str(row.get("EROG_CODICE") or "").strip()
+        slot_data = str(row.get("SLOT_DATA"))[:10] if pd.notna(row.get("SLOT_DATA")) else ""
+        slot_ora = str(row.get("SLOT_ORA") or "").strip()
+        prestazione = str(row.get("PREST_DESCRIZIONE") or "").strip()
+
+        app_info = f"{slot_data} {slot_ora} - Agenda {agenda_codice} ({prestazione})".strip()
+
+        dedup_key = (cognome.lower(), (nome or "").lower(), dob_iso)
+
+        if dedup_key in pazienti_map:
+            p = pazienti_map[dedup_key]
+            p["righe_excel"].append(excel_row_num)
+            p["num_appuntamenti"] += 1
+            if agenda_codice and agenda_codice not in p["agende"]:
+                p["agende"].append(agenda_codice)
+            if app_info and app_info not in p["note_list"]:
+                p["note_list"].append(app_info)
+            if not p["codice_fiscale"] and cf:
+                p["codice_fiscale"] = cf
+            if not p["priamo_id"] and priamo_id:
+                p["priamo_id"] = priamo_id
+            if not p["telefono"] and telefono:
+                p["telefono"] = telefono
+        else:
+            pazienti_map[dedup_key] = {
+                "cognome": cognome,
+                "nome": nome,
+                "data_nascita": dob,
+                "righe_excel": [excel_row_num],
+                "codice_fiscale": cf,
+                "sesso": sesso,
+                "comune_nascita": comune,
+                "priamo_id": priamo_id,
+                "telefono": telefono,
+                "agende": [agenda_codice] if agenda_codice else [],
+                "num_appuntamenti": 1,
+                "note_list": [app_info] if app_info else [],
+            }
+
+    pazienti: List[Paziente] = []
+    for data in pazienti_map.values():
+        note_str = "; ".join(data.pop("note_list", [])) or None
+        p = Paziente(**data, note=note_str)
+        if only_complete and not p.is_complete:
+            continue
+        pazienti.append(p)
+
+    pazienti.sort(key=lambda p: (
+        p.cognome,
+        p.nome or "",
+        p.data_nascita or date(1900, 1, 1)
+    ))
+    return pazienti
 
 
 def estrai_pazienti_univoci(
-    filepath: Union[str, Path],
-    sheet_name: Optional[str] = None,
+    filepath: Union[str, Path, pd.DataFrame],
+    sheet_name: Optional[Union[str, int]] = None,
     only_complete: bool = False
 ) -> List[Paziente]:
-    """Legge il file Excel condiviso (es. positivi_2026.xls), individua l'intestazione
+    """Legge il file Excel (file condiviso multidisciplinare es. positivi_2026.xls oppure
 
-    e la colonna pazienti/data nascita, filtra i placeholder, deduplica le occorrenze
-    multiple e restituisce l'elenco ordinato di Pazienti univoci.
+    foglio di lavoro PriamoCUP), individua il formato, deduplica le occorrenze multiple
+    e restituisce l'elenco ordinato di Pazienti univoci.
 
     Args:
-        filepath: Percorso del file Excel (.xls o .xlsx).
-        sheet_name: Nome del foglio da leggere (default: 'Foglio1' o primo foglio con dati).
+        filepath: Percorso del file Excel (.xls o .xlsx) o DataFrame pandas.
+        sheet_name: Nome o indice del foglio da leggere.
         only_complete: Se True, esclude i record privi di data di nascita o nome.
 
     Returns:
         Lista ordinata di oggetti Paziente deduplicati.
     """
-    path = Path(filepath)
-    if not path.exists():
-        raise FileNotFoundError(f"File non trovato: {path}")
+    if isinstance(filepath, pd.DataFrame):
+        cols_upper = [str(c).strip().upper() for c in filepath.columns]
+        if "PAZ_COGNOME" in cols_upper and "PAZ_NOME" in cols_upper:
+            return estrai_pazienti_da_fogli_cup(filepath, only_complete=only_complete)
+        df = filepath
+        path_name = "DataFrame"
+    else:
+        path = Path(filepath)
+        if not path.exists():
+            raise FileNotFoundError(f"File non trovato: {path}")
 
-    # Carica il file Excel per determinare il foglio corretto
-    xl = pd.ExcelFile(path)
-    target_sheet = sheet_name or ("Foglio1" if "Foglio1" in xl.sheet_names else xl.sheet_names[0])
-    df = pd.read_excel(path, sheet_name=target_sheet, header=None)
+        path_name = path.name
+        xl = pd.ExcelFile(path)
+        target_sheet = sheet_name if sheet_name is not None else ("Foglio1" if "Foglio1" in xl.sheet_names else xl.sheet_names[0])
+
+        # Verifica preliminare delle intestazioni per rilevamento automatico formato PriamoCUP
+        df_sample = pd.read_excel(path, sheet_name=target_sheet, nrows=5)
+        cols_upper = [str(c).strip().upper() for c in df_sample.columns]
+
+        if "PAZ_COGNOME" in cols_upper and "PAZ_NOME" in cols_upper:
+            # È un report esportato da PriamoCUP!
+            df_cup = pd.read_excel(path, sheet_name=target_sheet)
+            return estrai_pazienti_da_fogli_cup(df_cup, only_complete=only_complete)
+
+        df = pd.read_excel(path, sheet_name=target_sheet, header=None)
 
     if df.empty:
-        logger.warning(f"Il foglio '{target_sheet}' in {path.name} è vuoto.")
+        logger.warning(f"Il foglio in {path_name} è vuoto.")
         return []
 
     # 1. Rileva dinamicamente la riga di intestazione e le colonne PZ e Data Nascita
@@ -365,6 +534,8 @@ def display_rich_table(pazienti: List[Paziente], title: str = "Anagrafica Pazien
     complete_count = sum(1 for p in pazienti if p.is_complete)
     incomplete_count = total - complete_count
     multi_row_count = sum(1 for p in pazienti if len(p.righe_excel) > 1)
+    has_cf = any(bool(p.codice_fiscale) for p in pazienti)
+    has_agende = any(bool(p.agende) for p in pazienti)
 
     console.print(Panel.fit(
         f"[bold cyan]{title}[/bold cyan]\n"
@@ -378,9 +549,13 @@ def display_rich_table(pazienti: List[Paziente], title: str = "Anagrafica Pazien
     table = Table(show_header=True, header_style="bold cyan")
     table.add_column("#", justify="right", style="dim", width=4)
     table.add_column("Patient ID (Slug)", style="dim cyan")
-    table.add_column("Cognome", style="bold white")
-    table.add_column("Nome", style="white")
-    table.add_column("Data Nascita", justify="center")
+    table.add_column("Cognome (PAZ_COGNOME)", style="bold white")
+    table.add_column("Nome (PAZ_NOME)", style="white")
+    table.add_column("Data Nascita (PAZ_DATA_NASCITA)", justify="center")
+    if has_cf:
+        table.add_column("Codice Fiscale", style="cyan")
+    if has_agende:
+        table.add_column("Agende", justify="center", style="yellow")
     table.add_column("Stato", justify="center")
     table.add_column("Righe Excel", justify="center", style="dim")
 
@@ -391,22 +566,27 @@ def display_rich_table(pazienti: List[Paziente], title: str = "Anagrafica Pazien
         if len(p.righe_excel) > 1:
             rows_str = f"[magenta]{rows_str}[/magenta]"
 
-        table.add_row(
+        row_cells = [
             str(idx),
             p.patient_id,
             p.cognome,
             p.nome or "[yellow]N.D.[/yellow]",
             dob_str,
-            status_badge,
-            rows_str
-        )
+        ]
+        if has_cf:
+            row_cells.append(p.codice_fiscale or "-")
+        if has_agende:
+            row_cells.append(", ".join(p.agende) if p.agende else "-")
+        row_cells.extend([status_badge, rows_str])
+
+        table.add_row(*row_cells)
 
     console.print(table)
 
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Estrae, normalizza e deduplica l'anagrafica pazienti dal file condiviso (es. positivi_2026.xls)."
+        description="Estrae, normalizza e deduplica l'anagrafica pazienti dal file condiviso (es. positivi_2026.xls) o da fogli di lavoro PriamoCUP."
     )
     parser.add_argument(
         "--input", "-i",
@@ -416,16 +596,16 @@ def parse_args():
     parser.add_argument(
         "--output", "-o",
         default="data/output/anagrafica_pazienti_univoci.csv",
-        help="Percorso in cui salvare il file di esportazione (.csv o .json)."
+        help="Percorso in cui salvare il file di esportazione (.csv, .xlsx o .json)."
     )
     parser.add_argument(
         "--sheet", "-s",
-        default="Foglio1",
-        help="Nome del foglio Excel da analizzare (default: Foglio1)."
+        default=None,
+        help="Nome o indice del foglio Excel da analizzare (default: Foglio1 o primo foglio)."
     )
     parser.add_argument(
         "--format", "-f",
-        choices=["table", "csv", "json"],
+        choices=["table", "csv", "xlsx", "json"],
         default="table",
         help="Formato principale di output o visualizzazione (default: table)."
     )
@@ -440,16 +620,89 @@ def parse_args():
         default=None,
         help="Numero massimo di pazienti da visualizzare o esportare."
     )
+    # Parametri per integrazione diretta PriamoCUP
+    parser.add_argument(
+        "--download-cup", "--from-cup",
+        action="store_true",
+        help="Scarica direttamente i fogli di lavoro da PriamoCUP prima dell'estrazione."
+    )
+    parser.add_argument(
+        "--start-date",
+        default=None,
+        help="Data inizio periodo download PriamoCUP (YYYY-MM-DD). Default: inizio settimana corrente."
+    )
+    parser.add_argument(
+        "--end-date",
+        default=None,
+        help="Data fine periodo download PriamoCUP (YYYY-MM-DD). Default: fine settimana corrente."
+    )
+    parser.add_argument(
+        "--weeks",
+        type=int,
+        default=1,
+        help="Numero di settimane da esportare con PriamoCUP (default: 1)."
+    )
+    parser.add_argument(
+        "--unit",
+        default="37002",
+        help="Codice unità operativa per PriamoCUP (default: '37002' Senologia)."
+    )
+    parser.add_argument(
+        "--agendas",
+        default="3000,3003,3004,3035,3036",
+        help="Elenco agende/erogatori PriamoCUP separate da virgola (default: 3000,3003,3004,3035,3036)."
+    )
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
-    input_path = Path(args.input)
 
-    if not input_path.exists():
-        print(f"[ERRORE] File di input non trovato: {input_path}", file=sys.stderr)
-        sys.exit(1)
+    # Se richiesto download diretto da PriamoCUP
+    if args.download_cup:
+        from src.priamo_cup_client import PriamoCupClient
+        cup_client = PriamoCupClient()
+        agendas_list = [a.strip() for a in args.agendas.split(",") if a.strip()]
+
+        if args.start_date and args.end_date:
+            print(f"-> Download fogli lavoro PriamoCUP (Unità {args.unit}, Agende {agendas_list}, Periodo {args.start_date} -> {args.end_date})...")
+            downloaded_file = cup_client.export_worksheets(
+                start_date=args.start_date,
+                end_date=args.end_date,
+                codice_unita=args.unit,
+                agende=agendas_list,
+                output_dir="data/cup",
+            )
+        else:
+            ref_d = args.start_date or date.today()
+            print(f"-> Download fogli lavoro PriamoCUP per {args.weeks} settimana/e a partire da {ref_d} (Unità {args.unit}, Agende {agendas_list})...")
+            if args.weeks > 1:
+                files = cup_client.export_weeks(
+                    start_date=ref_d,
+                    num_weeks=args.weeks,
+                    codice_unita=args.unit,
+                    agende=agendas_list,
+                    output_dir="data/cup",
+                )
+                downloaded_file = files[0] if files else None
+            else:
+                downloaded_file = cup_client.export_week(
+                    ref_date=ref_d,
+                    codice_unita=args.unit,
+                    agende=agendas_list,
+                    output_dir="data/cup",
+                )
+
+        if not downloaded_file:
+            print("[ERRORE] Nessun file scaricato da PriamoCUP.", file=sys.stderr)
+            sys.exit(1)
+
+        input_path = Path(downloaded_file)
+    else:
+        input_path = Path(args.input)
+        if not input_path.exists():
+            print(f"[ERRORE] File di input non trovato: {input_path}", file=sys.stderr)
+            sys.exit(1)
 
     pazienti = estrai_pazienti_univoci(
         filepath=input_path,
@@ -479,23 +732,22 @@ def main():
         out_path.parent.mkdir(parents=True, exist_ok=True)
 
         is_json = out_path.suffix.lower() == ".json" or args.format == "json"
+        is_xlsx = out_path.suffix.lower() == ".xlsx" or args.format == "xlsx"
+
         if is_json:
             import json
-            data = [p.model_dump(mode="json") for p in pazienti]
+            data = [p.to_export_dict() for p in pazienti]
             with open(out_path, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=2, ensure_ascii=False)
             print(f"\n[OK] Esportati {len(pazienti)} record in formato JSON: {out_path}")
+        elif is_xlsx:
+            df_out = pd.DataFrame([p.to_export_dict() for p in pazienti])
+            df_out.to_excel(out_path, index=False)
+            print(f"\n[OK] Esportati {len(pazienti)} record in formato Excel: {out_path}")
         else:
-            # CSV con colonne pulite
-            df_out = pd.DataFrame([{
-                "patient_id": p.patient_id,
-                "cognome": p.cognome,
-                "nome": p.nome or "",
-                "data_nascita": p.data_nascita.isoformat() if p.data_nascita else "",
-                "righe_excel": ",".join(map(str, p.righe_excel)),
-                "note": p.note or ""
-            } for p in pazienti])
-            df_out.to_csv(out_path, index=False)
+            # CSV con colonne PAZ_NOME, PAZ_COGNOME, PAZ_DATA_NASCITA e standard
+            df_out = pd.DataFrame([p.to_export_dict() for p in pazienti])
+            df_out.to_csv(out_path, index=False, encoding="utf-8-sig")
             print(f"\n[OK] Esportati {len(pazienti)} record in formato CSV: {out_path}")
 
 

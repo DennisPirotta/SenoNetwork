@@ -82,7 +82,15 @@ class Settings(BaseSettings):
     # Priamo .NET HIS Settings (Ospedale Valduce)
     priamo_api_url: str = Field(
         default="",
-        description="URL base per il portale/servizi Priamo (es. https://priamo-home.valduce.it:8062)"
+        description="URL base per il portale/servizi Priamo (es. https://priamo-home.valduce.it:8062 o https://priamo.dennispirotta.com)"
+    )
+    priamo_cup_url: str = Field(
+        default="http://srv-priamo-fe1.valduce.it:8082/PriamoCUP",
+        description="URL base per il modulo PriamoCUP (es. http://srv-priamo-fe1.valduce.it:8082/PriamoCUP)"
+    )
+    priamo_home_url: str = Field(
+        default="https://priamo-home.valduce.it:8062/PriamoHOME",
+        description="URL base per il portale PriamoHOME per autenticazione (es. https://priamo-home.valduce.it:8062/PriamoHOME)"
     )
     priamo_username: str = Field(
         default="",

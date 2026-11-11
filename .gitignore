@@ -23,6 +23,7 @@
 data/downloads/
 data/input_pdf/
 data/output/
+data/cup/
 data/state/
 data/patient_repository/
 data/redcap_cache/
