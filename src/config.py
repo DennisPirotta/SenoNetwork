@@ -153,6 +153,33 @@ class Settings(BaseSettings):
         description="Consenti webhook verso localhost o IP privati (usare solo in ambiente di sviluppo locale)"
     )
 
+    # API Server & Security (Web Dashboard Integration)
+    api_key: Optional[str] = Field(
+        default=None,
+        validation_alias=AliasChoices("senonetwork_api_key", "api_key"),
+        description="API Key opzionale per autenticare le richieste dalla dashboard web via header X-API-Key"
+    )
+    cors_origins: List[str] = Field(
+        default=[
+            "http://localhost:3000",
+            "http://localhost:5173",
+            "http://localhost:8000",
+            "http://127.0.0.1:8000",
+            "http://127.0.0.1:5173",
+            "http://localhost:8080",
+            "*"
+        ],
+        description="Elenco delle origini consentite dal middleware CORS per chiamate da browser"
+    )
+    api_host: str = Field(
+        default="0.0.0.0",
+        description="Host predefinito per il server HTTP FastAPI"
+    )
+    api_port: int = Field(
+        default=8000,
+        description="Porta predefinita per il server HTTP FastAPI"
+    )
+
     # Sync / Audit Settings (Controllo periodico e aggiornamento dati REDCap)
     sync_interval_minutes: int = Field(
         default=60,

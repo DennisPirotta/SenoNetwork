@@ -1,31 +1,95 @@
+"""SenoNetwork FastAPI Microservice & Backend API.
+
+Exposes REST endpoints and SSE streams for:
+- PriamoCUP Worksheets Download & Unique Patient Extraction
+- Priamo HIS Valduce Patient & Cohort Verification
+- Clinical AI Extraction Pipeline (llama.cpp RPC / Ollama)
+- Data Quality & Inconsistency Audit on REDCap
+- Periodic Reconciliation & Sync
+- REDCap Records & Forms Management
+- System Health & Dashboard Overview KPIs
+"""
+
+import argparse
 from functools import lru_cache
 import logging
-from pathlib import Path
-import shutil
-import time
+import sys
 from typing import Any, Dict, List, Optional
-import uuid
-from fastapi import BackgroundTasks, Depends, FastAPI, File, HTTPException, UploadFile
-from pydantic import BaseModel
+import uvicorn
+from fastapi import BackgroundTasks, Depends, FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import RedirectResponse
 
 from src.ai_extractor import LlamaCppExtractor, OllamaExtractor
+from src.audit_service import RedCapAuditReport, RedCapDataAuditor
 from src.config import Settings, get_settings
 from src.dotnet_client import DotNetApiClient
-from src.audit_service import RedCapAuditReport, RedCapDataAuditor
-from src.patient_pipeline import PatientPipeline, PatientPipelineResult
-from src.redcap_service import REDCapService
-from src.sync_service import PatientSyncResult, RedCapSyncService, SyncSummaryReport
+
+# Import modular routers
+from src.routers.security import router as security_router, generate_api_key
+from src.routers.dashboard import router as dashboard_router
+from src.routers.cup import router as cup_router
+from src.routers.priamo import router as priamo_router
+from src.routers.pipeline import (
+    router as pipeline_router,
+    _tasks_store,
+    process_patient_async,
+    get_task_status,
+)
+from src.routers.audit import router as audit_router, get_audit_report as get_audit_data_quality_report
+from src.routers.sync import (
+    router as sync_router,
+    SyncTriggerRequest,
+    get_incomplete_patients,
+    sync_check_updates_async,
+    sync_check_updates_sync,
+)
+from src.routers.redcap import (
+    router as redcap_router,
+    delete_single_record as delete_single_redcap_record,
+    delete_all_records as delete_all_redcap_records,
+)
 
 logger = logging.getLogger(__name__)
 
+settings = get_settings()
+
+openapi_tags = [
+    {"name": "Dashboard", "description": "KPI riassuntivi e statistiche generali per la schermata iniziale della dashboard."},
+    {"name": "Priamo CUP", "description": "Download fogli di lavoro ambulatoriali (Unità 37002 Senologia) ed estrazione anagrafica pazienti."},
+    {"name": "Priamo HIS", "description": "Verifica anagrafica certificata e ricerca eventi su HIS Ospedale Valduce."},
+    {"name": "Clinical Pipeline", "description": "Pipeline di estrazione clinica IA locale (llama.cpp RPC / Ollama) e tracking task con SSE."},
+    {"name": "Data Quality & Audit", "description": "Audit automatico di conformità dati, rilevamento anomalie e incongruenze su REDCap."},
+    {"name": "REDCap Sync", "description": "Riconciliazione e aggiornamento periodico dei referti mancanti su REDCap."},
+    {"name": "REDCap Records", "description": "Consultazione, esportazione ed eliminazione record dal database REDCap."},
+    {"name": "Security & Auth", "description": "Gestione e generazione delle API Key per l'accesso protetto via header."},
+    {"name": "System", "description": "Verifica dello stato di salute dei sottosistemi e connettività."},
+]
+
 app = FastAPI(
-    title="SenoNetwork Medical PDF Extraction Service",
-    description="Microservizio per la pipeline: Estrazione PDF (.NET) -> Elaborazione IA Locale -> Caricamento REDCap",
-    version="1.1.0"
+    title="SenoNetwork Medical Report Extractor & Quality API",
+    description=(
+        "Backend REST API per SenoNetwork. Consente l'integrazione completa con dashboard web esterne "
+        "(Laravel/FilamentPHP, SvelteKit, React, Vue) per l'ingestione da PriamoCUP, estrazione IA e audit REDCap."
+    ),
+    version="2.0.0",
+    openapi_tags=openapi_tags,
 )
 
-# In-memory store for async background tasks
-_tasks_store: Dict[str, Dict[str, Any]] = {}
+# CORS Middleware per consentire chiamate dalla dashboard web esterna
+origins = settings.cors_origins
+if "*" in origins:
+    allow_origins = ["*"]
+else:
+    allow_origins = origins
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=allow_origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 @lru_cache
@@ -33,48 +97,9 @@ def get_shared_settings() -> Settings:
     return get_settings()
 
 
-def get_pipeline(settings: Settings = Depends(get_shared_settings)) -> PatientPipeline:
-    """Dependency provider for PatientPipeline."""
-    return PatientPipeline(settings=settings)
-
-
-def get_sync_service(settings: Settings = Depends(get_shared_settings)) -> RedCapSyncService:
-    """Dependency provider for RedCapSyncService."""
-    return RedCapSyncService(settings=settings)
-
-
-class SyncTriggerRequest(BaseModel):
-    patient_id: Optional[str] = None
-    name: Optional[str] = None
-    surname: Optional[str] = None
-    date_of_birth: Optional[str] = None
-    target_forms: Optional[List[str]] = None
-    auto_upload: bool = True
-    dry_run: bool = False
-    force_reprocess: bool = False
-    limit: Optional[int] = None
-    only_incomplete: bool = True
-
-
-class PatientTriggerRequest(BaseModel):
-    patient_id: Optional[str] = None
-    name: Optional[str] = None
-    surname: Optional[str] = None
-    date_of_birth: Optional[str] = None
-    auto_upload_to_redcap: bool = True
-    webhook_url: Optional[str] = None
-
-
-class AsyncTaskResponse(BaseModel):
-    task_id: str
-    status: str
-    patient_id: str
-    message: str
-
-
-@app.get("/health")
+@app.get("/health", tags=["System"])
 def health_check(settings: Settings = Depends(get_shared_settings)):
-    """Checks the status of the local LLM servers (llama.cpp RPC and Ollama) and REDCap connection."""
+    """Verifica lo stato dei server IA (llama.cpp RPC e Ollama), REDCap e Priamo .NET."""
     ollama = OllamaExtractor(base_url=settings.ollama_base_url)
     llamacpp = LlamaCppExtractor(
         base_url=settings.llama_cpp_base_url,
@@ -85,475 +110,68 @@ def health_check(settings: Settings = Depends(get_shared_settings)):
 
     return {
         "status": "online",
+        "version": "2.0.0",
         "ai_backend_configured": settings.ai_backend,
         "llama_cpp_rpc_available": llamacpp.is_available(),
         "llama_cpp_base_url": settings.llama_cpp_base_url,
         "ollama_available": ollama.is_available(),
         "ollama_model": settings.ollama_model,
         "redcap_configured": bool(settings.redcap_api_url and settings.redcap_api_token),
-        "priamo_dotnet_configured": dotnet.is_priamo_configured
+        "priamo_dotnet_configured": dotnet.is_priamo_configured,
+        "priamo_cup_url": settings.priamo_cup_url,
+        "api_key_required": bool(settings.api_key and settings.api_key.strip())
     }
 
 
-def _run_background_patient_pipeline(
-    task_id: str,
-    pipeline: PatientPipeline,
-    patient_id: str,
-    name: Optional[str],
-    surname: Optional[str],
-    dob: Optional[str],
-    auto_upload: bool,
-    webhook: Optional[str]
-):
-    """Executes the patient pipeline in background worker and records results in task store."""
-    _tasks_store[task_id]["status"] = "processing"
-    _tasks_store[task_id]["started_at"] = time.time()
-    try:
-        result = pipeline.process_patient(
-            patient_id=patient_id,
-            name=name,
-            surname=surname,
-            date_of_birth=dob,
-            auto_upload=auto_upload,
-            webhook_url=webhook
-        )
-        _tasks_store[task_id]["status"] = "completed"
-        _tasks_store[task_id]["result"] = result.model_dump()
-    except Exception as e:
-        logger.error(f"Errore task background {task_id} per paziente {patient_id}: {e}")
-        _tasks_store[task_id]["status"] = "failed"
-        _tasks_store[task_id]["error"] = str(e)
-    finally:
-        _tasks_store[task_id]["finished_at"] = time.time()
+@app.get("/", include_in_schema=False)
+def root():
+    """Reindirizza alla documentazione interattiva Swagger."""
+    return RedirectResponse(url="/docs")
 
 
-@app.post("/api/patient/{patient_id}/process", response_model=PatientPipelineResult)
-def process_patient_from_dotnet(
-    patient_id: str,
-    request: Optional[PatientTriggerRequest] = None,
-    pipeline: PatientPipeline = Depends(get_pipeline)
-):
-    """Synchronous trigger: Downloads patient's PDFs from Priamo/.NET,
-    processes each with local AI, and loads structured data into REDCap.
-    """
-    auto_upload = request.auto_upload_to_redcap if request else True
-    name = request.name if request else None
-    surname = request.surname if request else None
-    dob = request.date_of_birth if request else None
-    webhook = request.webhook_url if request else None
-
-    try:
-        return pipeline.process_patient(
-            patient_id=patient_id,
-            name=name,
-            surname=surname,
-            date_of_birth=dob,
-            auto_upload=auto_upload,
-            webhook_url=webhook
-        )
-    except Exception as e:
-        logger.error(f"Errore esecuzione pipeline paziente {patient_id}: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+# Registrazione dei router modulari
+app.include_router(dashboard_router)
+app.include_router(cup_router)
+app.include_router(priamo_router)
+app.include_router(pipeline_router)
+app.include_router(audit_router)
+app.include_router(sync_router)
+app.include_router(redcap_router)
+app.include_router(security_router)
 
 
-@app.post("/api/patient/{patient_id}/process-async", response_model=AsyncTaskResponse)
-def process_patient_async(
-    patient_id: str,
-    background_tasks: BackgroundTasks,
-    request: Optional[PatientTriggerRequest] = None,
-    pipeline: PatientPipeline = Depends(get_pipeline)
-):
-    """Asynchronous trigger: Enqueues the patient processing task in the background,
-    immediately returning a task_id to avoid HTTP timeout on long clinical LLM runs.
-    """
-    task_id = str(uuid.uuid4())
-    auto_upload = request.auto_upload_to_redcap if request else True
-    name = request.name if request else None
-    surname = request.surname if request else None
-    dob = request.date_of_birth if request else None
-    webhook = request.webhook_url if request else None
-
-    _tasks_store[task_id] = {
-        "task_id": task_id,
-        "patient_id": patient_id,
-        "status": "queued",
-        "created_at": time.time(),
-        "result": None,
-        "error": None
-    }
-
-    background_tasks.add_task(
-        _run_background_patient_pipeline,
-        task_id=task_id,
-        pipeline=pipeline,
-        patient_id=patient_id,
-        name=name,
-        surname=surname,
-        dob=dob,
-        auto_upload=auto_upload,
-        webhook=webhook
-    )
-
-    return AsyncTaskResponse(
-        task_id=task_id,
-        status="queued",
-        patient_id=patient_id,
-        message=f"Elaborazione paziente {patient_id} accodata in background."
-    )
+def run_server(host: Optional[str] = None, port: Optional[int] = None):
+    cfg = get_settings()
+    target_host = host or cfg.api_host
+    target_port = port or cfg.api_port
+    print(f"\n-> Avvio SenoNetwork API Server su http://{target_host}:{target_port}...")
+    print(f"-> Documentazione Swagger interattiva disponibile su: http://{target_host}:{target_port}/docs\n")
+    uvicorn.run("src.api_server:app", host=target_host, port=target_port, reload=False)
 
 
-@app.get("/api/tasks/{task_id}")
-def get_task_status(task_id: str):
-    """Retrieves current status or finished result of a background processing task."""
-    if task_id not in _tasks_store:
-        raise HTTPException(status_code=404, detail="Task non trovato.")
-    return _tasks_store[task_id]
+def main(argv: Optional[List[str]] = None) -> None:
+    args_list = argv if argv is not None else sys.argv[1:]
+    if "--generate-key" in args_list:
+        key = generate_api_key()
+        print("\n" + "=" * 65)
+        print("  CHIAVE API GENERATA PER SENONETWORK DASHBOARD")
+        print("=" * 65)
+        print(f"API Key: {key}")
+        print("-" * 65)
+        print("Per utilizzarla, inserisci nel file .env:")
+        print(f"SENONETWORK_API_KEY={key}")
+        print("\nNelle richieste dalla dashboard (Laravel/SvelteKit), invia l'header:")
+        print(f"X-API-Key: {key}\n")
+        sys.exit(0)
 
+    parser = argparse.ArgumentParser(description="Avvia il server API di SenoNetwork")
+    parser.add_argument("--host", default=None, help="Host di ascolto (default da .env o 0.0.0.0)")
+    parser.add_argument("--port", type=int, default=None, help="Porta di ascolto (default da .env o 8000)")
+    parser.add_argument("--generate-key", action="store_true", help="Genera una nuova API key crittograficamente sicura ed esci")
+    args = parser.parse_args(args_list)
 
-@app.post("/api/batch/excel", response_model=List[PatientPipelineResult])
-def process_excel_batch(
-    excel_path: Optional[str] = None,
-    limit: Optional[int] = None,
-    auto_upload: bool = True,
-    settings: Settings = Depends(get_shared_settings),
-    pipeline: PatientPipeline = Depends(get_pipeline)
-):
-    """Processes a cohort of surgical patients from an Excel register (e.g. interventi.xls),
-    extracting reports from Priamo, processing with AI, and importing into REDCap.
-    """
-    target_excel = excel_path or settings.patients_excel_path
-    if not target_excel:
-        raise HTTPException(
-            status_code=400,
-            detail="Nessun percorso Excel specificato e 'patients_excel_path' non configurato nelle impostazioni."
-        )
-
-    try:
-        cohort = DotNetApiClient.load_patients_from_excel(target_excel, settings=settings)
-        if limit:
-            cohort = cohort[:limit]
-
-        results = []
-        for p in cohort:
-            res = pipeline.process_patient(
-                patient_id=p["patient_id"],
-                name=p["name"],
-                surname=p["surname"],
-                date_of_birth=p["date_of_birth"],
-                auto_upload=auto_upload
-            )
-            results.append(res)
-        return results
-    except Exception as e:
-        logger.error(f"Errore elaborazione batch Excel: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.post("/api/patient/{patient_id}/upload-pdfs", response_model=PatientPipelineResult)
-async def process_patient_uploaded_pdfs(
-    patient_id: str,
-    files: List[UploadFile] = File(...),
-    auto_upload: bool = True,
-    pipeline: PatientPipeline = Depends(get_pipeline)
-):
-    """Allows .NET API to directly upload multiple PDF files for a patient,
-    running local AI extraction and uploading structured records to REDCap.
-    """
-    temp_dir = Path("data/uploads") / patient_id
-    temp_dir.mkdir(parents=True, exist_ok=True)
-    saved_paths: List[Path] = []
-
-    try:
-        for uploaded in files:
-            file_path = temp_dir / uploaded.filename
-            with open(file_path, "wb") as buffer:
-                shutil.copyfileobj(uploaded.file, buffer)
-            saved_paths.append(file_path)
-
-        result = pipeline.process_patient(
-            patient_id=patient_id,
-            pdf_paths=saved_paths,
-            auto_upload=auto_upload
-        )
-        return result
-    except Exception as e:
-        logger.error(f"Errore elaborazione PDF caricati per {patient_id}: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-def _run_background_sync(
-    task_id: str,
-    sync_service: RedCapSyncService,
-    req: SyncTriggerRequest
-):
-    """Executes the audit & sync pipeline in background worker."""
-    _tasks_store[task_id]["status"] = "processing"
-    _tasks_store[task_id]["started_at"] = time.time()
-    try:
-        if req.patient_id:
-            res = sync_service.check_and_update_patient(
-                patient_id=req.patient_id,
-                name=req.name,
-                surname=req.surname,
-                dob=req.date_of_birth,
-                target_forms=req.target_forms,
-                auto_upload=req.auto_upload,
-                dry_run=req.dry_run,
-                force_reprocess=req.force_reprocess
-            )
-            _tasks_store[task_id]["status"] = "completed"
-            _tasks_store[task_id]["result"] = res.model_dump()
-        else:
-            report = sync_service.sync_all(
-                target_forms=req.target_forms,
-                auto_upload=req.auto_upload,
-                dry_run=req.dry_run,
-                force_reprocess=req.force_reprocess,
-                limit=req.limit,
-                only_incomplete=req.only_incomplete
-            )
-            _tasks_store[task_id]["status"] = "completed"
-            _tasks_store[task_id]["result"] = report.model_dump()
-    except Exception as e:
-        logger.error(f"Errore task background sync {task_id}: {e}")
-        _tasks_store[task_id]["status"] = "failed"
-        _tasks_store[task_id]["error"] = str(e)
-    finally:
-        _tasks_store[task_id]["finished_at"] = time.time()
-
-
-@app.post("/api/sync/check-updates")
-def sync_check_updates_sync(
-    req: Optional[SyncTriggerRequest] = None,
-    sync_service: RedCapSyncService = Depends(get_sync_service)
-):
-    """Synchronous audit and sync:
-    Checks REDCap records, discovers new reports or incomplete forms (e.g. post-op histopathology),
-    runs local AI extraction and updates REDCap.
-    """
-    params = req or SyncTriggerRequest()
-    try:
-        if params.patient_id:
-            return sync_service.check_and_update_patient(
-                patient_id=params.patient_id,
-                name=params.name,
-                surname=params.surname,
-                dob=params.date_of_birth,
-                target_forms=params.target_forms,
-                auto_upload=params.auto_upload,
-                dry_run=params.dry_run,
-                force_reprocess=params.force_reprocess
-            )
-        else:
-            return sync_service.sync_all(
-                target_forms=params.target_forms,
-                auto_upload=params.auto_upload,
-                dry_run=params.dry_run,
-                force_reprocess=params.force_reprocess,
-                limit=params.limit,
-                only_incomplete=params.only_incomplete
-            )
-    except Exception as e:
-        logger.error(f"Errore esecuzione sync REDCap: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.post("/api/sync/check-updates-async", response_model=AsyncTaskResponse)
-def sync_check_updates_async(
-    background_tasks: BackgroundTasks,
-    req: Optional[SyncTriggerRequest] = None,
-    sync_service: RedCapSyncService = Depends(get_sync_service)
-):
-    """Asynchronous audit and sync:
-    Queues sync in background and returns task_id immediately.
-    """
-    params = req or SyncTriggerRequest()
-    task_id = str(uuid.uuid4())
-    p_id = params.patient_id or "all_patients"
-
-    _tasks_store[task_id] = {
-        "task_id": task_id,
-        "patient_id": p_id,
-        "status": "queued",
-        "created_at": time.time(),
-        "result": None,
-        "error": None
-    }
-
-    background_tasks.add_task(
-        _run_background_sync,
-        task_id=task_id,
-        sync_service=sync_service,
-        req=params
-    )
-
-    return AsyncTaskResponse(
-        task_id=task_id,
-        status="queued",
-        patient_id=p_id,
-        message=f"Sync REDCap accodato in background per {p_id}."
-    )
-
-
-@app.get("/api/sync/incomplete-patients")
-def get_incomplete_patients(
-    form: Optional[str] = None,
-    sync_service: RedCapSyncService = Depends(get_sync_service)
-):
-    """Returns patients currently in REDCap who have incomplete forms (e.g. form=anatomia_patologica)."""
-    filter_forms = [form] if form else None
-    try:
-        return sync_service.get_patients_from_redcap(filter_incomplete_forms=filter_forms)
-    except Exception as e:
-        logger.error(f"Errore recupero pazienti incompleti: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.get("/api/sync/latest-report")
-def get_latest_sync_report(settings: Settings = Depends(get_shared_settings)):
-    """Returns the most recent sync audit report JSON from disk."""
-    audit_dir = settings.sync_audit_dir
-    if not audit_dir.exists():
-        raise HTTPException(status_code=404, detail="Nessun report di audit trovato.")
-
-    reports = sorted(list(audit_dir.glob("sync_report_*.json")), reverse=True)
-    if not reports:
-        raise HTTPException(status_code=404, detail="Nessun report di audit trovato.")
-
-    try:
-        with open(reports[0], "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Errore lettura report: {e}")
-
-
-@app.get("/api/audit/report", response_model=RedCapAuditReport)
-def get_audit_data_quality_report(
-    patient_id: Optional[str] = None,
-    settings: Settings = Depends(get_shared_settings)
-):
-    """Executes a full live data quality audit of REDCap records,
-    detecting clinical inconsistencies, missing post-operative pathology,
-    temporal date anomalies, and calculating completion rates.
-    """
-    auditor = RedCapDataAuditor(settings=settings)
-    try:
-        report = auditor.run_audit(patient_id=patient_id)
-        auditor.export_reports(report)
-        return report
-    except Exception as e:
-        logger.error(f"Errore generazione audit report: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.get("/api/redcap/records")
-def get_all_redcap_records(
-    limit: Optional[int] = None,
-    filter_logic: Optional[str] = None,
-    form: Optional[str] = None,
-    settings: Settings = Depends(get_shared_settings)
-):
-    """Returns list of all records in the REDCap project with demographics and form status flags."""
-    svc = REDCapService(api_url=settings.redcap_api_url, api_token=settings.redcap_api_token)
-    forms_list = [form] if form else None
-    try:
-        records = svc.list_all_records(
-            forms=forms_list,
-            include_demographics=True,
-            include_completion_status=True,
-            filter_logic=filter_logic
-        )
-        if limit:
-            records = records[:limit]
-        return records
-    except Exception as e:
-        logger.error(f"Errore recupero lista record REDCap: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.get("/api/redcap/records/summary")
-def get_redcap_records_summary(
-    settings: Settings = Depends(get_shared_settings)
-):
-    """Returns high-level summary overview of all records on REDCap."""
-    svc = REDCapService(api_url=settings.redcap_api_url, api_token=settings.redcap_api_token)
-    try:
-        return svc.get_records_summary()
-    except Exception as e:
-        logger.error(f"Errore generazione riassunto record REDCap: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.delete("/api/redcap/records/{record_id}")
-def delete_single_redcap_record(
-    record_id: str,
-    clean_local_state: bool = False,
-    settings: Settings = Depends(get_shared_settings)
-):
-    """Deletes a single patient record from REDCap by its record_id."""
-    from src.redcap_service import delete_redcap_records
-    try:
-        count = delete_redcap_records(
-            record_id=record_id,
-            clean_local_state=clean_local_state,
-            api_url=settings.redcap_api_url,
-            api_token=settings.redcap_api_token
-        )
-        if count == 0:
-            raise HTTPException(status_code=404, detail=f"Record '{record_id}' non trovato o non eliminato da REDCap.")
-        return {
-            "status": "deleted",
-            "record_id": record_id,
-            "deleted_count": count,
-            "message": f"Record '{record_id}' eliminato con successo da REDCap."
-        }
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Errore eliminazione record {record_id}: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.delete("/api/redcap/records")
-def delete_all_redcap_records(
-    confirm: bool = False,
-    clean_local_state: bool = False,
-    settings: Settings = Depends(get_shared_settings)
-):
-    """Deletes ALL records currently present on REDCap.
-
-    Requires explicit query parameter confirm=true to safeguard against accidental project wipe.
-    """
-    if not confirm:
-        raise HTTPException(
-            status_code=400,
-            detail="Operazione ad alto rischio: per eliminare tutti i record è obbligatorio specificare il parametro ?confirm=true."
-        )
-
-    from src.redcap_service import delete_redcap_records
-    try:
-        count = delete_redcap_records(
-            all_records=True,
-            confirm=True,
-            clean_local_state=clean_local_state,
-            api_url=settings.redcap_api_url,
-            api_token=settings.redcap_api_token
-        )
-        return {
-            "status": "deleted",
-            "deleted_count": count,
-            "message": f"Eliminati con successo {count} record da REDCap."
-        }
-    except Exception as e:
-        logger.error(f"Errore eliminazione massiva record REDCap: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-
-def run_server(host: str = "0.0.0.0", port: int = 8000):
-    import uvicorn
-    uvicorn.run("src.api_server:app", host=host, port=port, reload=False)
+    run_server(host=args.host, port=args.port)
 
 
 if __name__ == "__main__":
-    run_server()
+    main()
