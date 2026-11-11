@@ -272,3 +272,113 @@ def test_estrai_pazienti_univoci_auto_detect_cup():
     assert pazienti[0].cognome == "Bianchi"
     assert pazienti[0].nome == "Amelia"
     assert pazienti[0].codice_fiscale == "BNCMLA51E62F205N"
+
+
+def test_priamo_cup_client_download_updated_worksheets_routing(tmp_path):
+    client = PriamoCupClient(username="test_user", password="test_password")
+
+    # 1. Default (nessun parametro -> YTD)
+    with patch.object(client, "export_ytd") as mock_ytd:
+        mock_ytd.return_value = tmp_path / "mock_ytd.xlsx"
+        res = client.download_updated_worksheets(output_dir=tmp_path)
+        assert mock_ytd.called
+        assert res.name == "mock_ytd.xlsx"
+
+    # 2. Year specificato
+    with patch.object(client, "export_year") as mock_yr:
+        mock_yr.return_value = tmp_path / "mock_2025.xlsx"
+        res = client.download_updated_worksheets(year=2025, output_dir=tmp_path)
+        assert mock_yr.called
+        assert mock_yr.call_args[1]["year"] == 2025
+
+    # 3. Month specificato
+    with patch.object(client, "export_month") as mock_mo:
+        mock_mo.return_value = tmp_path / "mock_oct.xlsx"
+        res = client.download_updated_worksheets(month="2026-10", output_dir=tmp_path)
+        assert mock_mo.called
+        assert mock_mo.call_args[1]["year"] == 2026
+        assert mock_mo.call_args[1]["month"] == 10
+
+    # 4. Months specificato
+    with patch.object(client, "export_last_months") as mock_mos:
+        mock_mos.return_value = tmp_path / "mock_3m.xlsx"
+        res = client.download_updated_worksheets(months=3, output_dir=tmp_path)
+        assert mock_mos.called
+        assert mock_mos.call_args[1]["num_months"] == 3
+
+    # 5. Weeks specificato
+    with patch.object(client, "export_week") as mock_wk:
+        mock_wk.return_value = tmp_path / "mock_1w.xlsx"
+        res = client.download_updated_worksheets(weeks=1, output_dir=tmp_path)
+        assert mock_wk.called
+
+
+def test_dotnet_client_load_patients_from_excel_cup(tmp_path):
+    from src.dotnet_client import DotNetApiClient
+
+    excel_file = tmp_path / "cup_report.xlsx"
+    df = pd.DataFrame([
+        {
+            "PAZ_COGNOME": "HERRERA DE LA ROSA",
+            "PAZ_NOME": "ROSAURA",
+            "PAZ_DATA_NASCITA": "1978-08-30",
+            "PAZ_CODICE_FISCALE": "HRRRSR78M70Z505I",
+            "PAZ_PROGRESSIVO_PAZ1": "1536091",
+            "PAZ_SESSO": "F",
+            "PAZ_COMUNE_NASCITA": "SANTO DOMINGO",
+            "EROG_CODICE": "3000",
+            "SLOT_DATA": "2026-11-11",
+            "SLOT_ORA": "1000",
+            "PREST_DESCRIZIONE": "Visita Senologica",
+        }
+    ])
+    df.to_excel(excel_file, index=False)
+
+    patients = DotNetApiClient.load_patients_from_excel(excel_file)
+    assert len(patients) == 1
+    p = patients[0]
+    assert p["name"] == "Rosaura"
+    assert p["surname"] == "Herrera De La Rosa"
+    assert p["date_of_birth"] == date(1978, 8, 30)
+    assert p["codice_fiscale"] == "HRRRSR78M70Z505I"
+    assert p["priamo_id"] == "1536091"
+    assert p["sesso"] == "F"
+    assert p["comune_nascita"] == "Santo Domingo"
+
+
+def test_cli_main_cup_extract(tmp_path):
+    from src.cli import main
+    import sys
+
+    excel_file = tmp_path / "cup_sample.xlsx"
+    df = pd.DataFrame([
+        {
+            "PAZ_COGNOME": "ROSSI",
+            "PAZ_NOME": "MARIA",
+            "PAZ_DATA_NASCITA": "1975-06-15",
+            "PAZ_CODICE_FISCALE": "RSSMRA75H55C933A",
+            "PAZ_PROGRESSIVO_PAZ1": "123456",
+            "EROG_CODICE": "3004",
+        }
+    ])
+    df.to_excel(excel_file, index=False)
+
+    out_csv = tmp_path / "extracted_anagrafica.csv"
+
+    test_args = [
+        "main.py",
+        "--excel", str(excel_file),
+        "--extract-only",
+        "--output", str(out_csv),
+    ]
+
+    with patch.object(sys, "argv", test_args):
+        main()
+
+    assert out_csv.exists()
+    df_out = pd.read_csv(out_csv)
+    assert len(df_out) == 1
+    assert df_out.iloc[0]["PAZ_COGNOME"] == "Rossi"
+    assert df_out.iloc[0]["PAZ_NOME"] == "Maria"
+    assert str(df_out.iloc[0]["PAZ_DATA_NASCITA"]) == "1975-06-15"
+

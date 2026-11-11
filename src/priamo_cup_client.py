@@ -497,3 +497,101 @@ class PriamoCupClient:
             custom_filename=custom_fn,
             **kwargs
         )
+
+    def download_updated_worksheets(
+        self,
+        ytd: bool = False,
+        year: Optional[int] = None,
+        month: Optional[Union[str, int]] = None,
+        months: Optional[int] = None,
+        start_date: Optional[Union[str, date]] = None,
+        end_date: Optional[Union[str, date]] = None,
+        weeks: Optional[int] = None,
+        codice_unita: str = UNITA_SENOLOGIA,
+        agende: Optional[List[str]] = None,
+        output_dir: Union[str, Path] = "data/cup",
+        ref_date: Optional[Union[date, str]] = None,
+    ) -> Path:
+        """Scarica il foglio di lavoro aggiornato da PriamoCUP in base alle opzioni fornite.
+
+        Se nessun intervallo temporale specifico è indicato (oppure se ytd=True),
+        scarica di default tutti i fogli di lavoro da 1° Gennaio fino a ieri (YTD).
+        """
+        agendas = agende or AGENDE_SENOLOGIA
+
+        if year is not None:
+            logger.info(f"Download fogli lavoro PriamoCUP per l'anno {year}...")
+            return self.export_year(
+                year=year,
+                codice_unita=codice_unita,
+                agende=agendas,
+                output_dir=output_dir,
+            )
+
+        if month is not None:
+            month_str = str(month).strip()
+            if "-" in month_str:
+                parts = month_str.split("-")
+                target_year = int(parts[0])
+                target_month = int(parts[1])
+            else:
+                base_year = (ref_date.year if isinstance(ref_date, date) else date.today().year)
+                target_year = base_year
+                target_month = int(month_str)
+
+            logger.info(f"Download fogli lavoro PriamoCUP per il mese {target_month:02d}/{target_year}...")
+            return self.export_month(
+                year=target_year,
+                month=target_month,
+                codice_unita=codice_unita,
+                agende=agendas,
+                output_dir=output_dir,
+            )
+
+        if months is not None:
+            logger.info(f"Download fogli lavoro PriamoCUP per gli ultimi {months} mesi...")
+            return self.export_last_months(
+                num_months=months,
+                ref_date=ref_date,
+                codice_unita=codice_unita,
+                agende=agendas,
+                output_dir=output_dir,
+            )
+
+        if start_date is not None and end_date is not None:
+            logger.info(f"Download fogli lavoro PriamoCUP dal {start_date} al {end_date}...")
+            return self.export_worksheets(
+                start_date=start_date,
+                end_date=end_date,
+                codice_unita=codice_unita,
+                agende=agendas,
+                output_dir=output_dir,
+            )
+
+        if weeks is not None:
+            base_ref = ref_date or start_date or date.today()
+            logger.info(f"Download fogli lavoro PriamoCUP per {weeks} settimana/e da {base_ref}...")
+            if weeks > 1:
+                files = self.export_weeks(
+                    start_date=base_ref,
+                    num_weeks=weeks,
+                    codice_unita=codice_unita,
+                    agende=agendas,
+                    output_dir=output_dir,
+                )
+                return files[0]
+            return self.export_week(
+                ref_date=base_ref,
+                codice_unita=codice_unita,
+                agende=agendas,
+                output_dir=output_dir,
+            )
+
+        # Default: YTD (da 1° Gennaio fino a ieri)
+        logger.info("Download fogli lavoro PriamoCUP: YTD (1° Gennaio -> Ieri)...")
+        return self.export_ytd(
+            ref_date=ref_date,
+            codice_unita=codice_unita,
+            agende=agendas,
+            output_dir=output_dir,
+        )

@@ -263,9 +263,50 @@ class DotNetApiClient:
         if not target_path:
             raise ValueError("Nessun percorso file Excel specificato e 'patients_excel_path' non configurato.")
 
-        path = Path(target_path)
+        # Supporto download automatico da PriamoCUP se indicato "cup"
+        if str(target_path).strip().lower() == "cup":
+            from src.priamo_cup_client import PriamoCupClient
+            cup_client = PriamoCupClient(settings=cfg)
+            path = cup_client.download_updated_worksheets()
+            logger.info(f"Scaricato foglio di lavoro aggiornato da PriamoCUP: {path}")
+        else:
+            path = Path(target_path)
+
         if not path.exists():
             raise FileNotFoundError(f"File Excel non trovato: {path}")
+
+        # Controllo prioritario formato PriamoCUP (intestazioni PAZ_COGNOME, PAZ_NOME a riga 0)
+        try:
+            sample_df = pd.read_excel(path, nrows=5)
+            cols_upper = [str(c).strip().upper() for c in sample_df.columns]
+            if "PAZ_COGNOME" in cols_upper and "PAZ_NOME" in cols_upper:
+                from scripts.extract_patients_from_shared_file import estrai_pazienti_da_fogli_cup
+                pzs = estrai_pazienti_da_fogli_cup(path, only_complete=True)
+                patients = []
+                for p in pzs:
+                    patients.append({
+                        "patient_id": p.patient_id,
+                        "name": p.nome or "",
+                        "surname": p.cognome,
+                        "date_of_birth": p.data_nascita,
+                        "codice_fiscale": p.codice_fiscale,
+                        "priamo_id": p.priamo_id,
+                        "sesso": p.sesso,
+                        "comune_nascita": p.comune_nascita,
+                        "raw_row": {
+                            "COGNOME": p.cognome,
+                            "NOME": p.nome or "",
+                            "DATA_NASCITA": str(p.data_nascita) if p.data_nascita else "",
+                            "CODICE_FISCALE": p.codice_fiscale or "",
+                            "PRIAMO_ID": p.priamo_id or "",
+                            "RIGHE_EXCEL": p.righe_excel,
+                            "NOTE": p.note or ""
+                        }
+                    })
+                logger.info(f"Caricati {len(patients)} pazienti univoci dal foglio PriamoCUP {path.name}")
+                return patients
+        except Exception as ex:
+            logger.debug(f"Controllo formato PriamoCUP: {ex}")
 
         df = pd.read_excel(path, dtype=str, header=header_row)
         patients = []
@@ -314,10 +355,16 @@ class DotNetApiClient:
                         "name": p.nome or "",
                         "surname": p.cognome,
                         "date_of_birth": p.data_nascita,
+                        "codice_fiscale": p.codice_fiscale,
+                        "priamo_id": p.priamo_id,
+                        "sesso": p.sesso,
+                        "comune_nascita": p.comune_nascita,
                         "raw_row": {
                             "COGNOME": p.cognome,
                             "NOME": p.nome or "",
                             "DATA_NASCITA": str(p.data_nascita) if p.data_nascita else "",
+                            "CODICE_FISCALE": p.codice_fiscale or "",
+                            "PRIAMO_ID": p.priamo_id or "",
                             "RIGHE_EXCEL": p.righe_excel,
                             "NOTE": p.note or ""
                         }

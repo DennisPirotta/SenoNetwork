@@ -190,13 +190,88 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--excel",
         default=None,
-        help="Percorso al file Excel degli interventi (es. interventi.xls) per elaborare una coorte di pazienti."
+        help="Percorso al file Excel degli interventi (es. interventi.xls o foglio CUP) per elaborare una coorte di pazienti. Se 'cup', scarica da PriamoCUP."
+    )
+    parser.add_argument(
+        "--cup", "--download-cup",
+        action="store_true",
+        dest="cup",
+        help="Scarica automaticamente il foglio di lavoro aggiornato da PriamoCUP (Unità 37002 Senologia) ed estrae la coorte dei pazienti."
+    )
+    parser.add_argument(
+        "--ytd", "--da-gennaio",
+        action="store_true",
+        help="PriamoCUP: scarica tutti i fogli di lavoro da 1° Gennaio fino a Ieri (Oggi - 1 giorno). È il periodo predefinito per --cup."
+    )
+    parser.add_argument(
+        "--year", "--anno",
+        type=int,
+        default=None,
+        help="PriamoCUP: scarica l'intero anno specificato (es. 2025, 2024)."
+    )
+    parser.add_argument(
+        "--month", "--mese",
+        default=None,
+        help="PriamoCUP: scarica lo specifico mese in formato YYYY-MM o MM (es. '2026-10' o '10')."
+    )
+    parser.add_argument(
+        "--months", "--ultimi-mesi",
+        type=int,
+        default=None,
+        help="PriamoCUP: scarica gli ultimi N mesi fino a ieri."
+    )
+    parser.add_argument(
+        "--start-date",
+        default=None,
+        help="PriamoCUP: data di inizio periodo (YYYY-MM-DD)."
+    )
+    parser.add_argument(
+        "--end-date",
+        default=None,
+        help="PriamoCUP: data di fine periodo (YYYY-MM-DD)."
+    )
+    parser.add_argument(
+        "--weeks", "-w",
+        type=int,
+        default=None,
+        help="PriamoCUP: numero di settimane da esportare."
+    )
+    parser.add_argument(
+        "--cup-unit", "-u",
+        default="37002",
+        help="PriamoCUP: codice unità operativa (default: '37002' Senologia)."
+    )
+    parser.add_argument(
+        "--cup-agendas", "-a",
+        default="3000,3003,3004,3035,3036",
+        help="PriamoCUP: codici agende separati da virgola (default: 3000,3003,3004,3035,3036)."
+    )
+    parser.add_argument(
+        "--only-complete",
+        action="store_true",
+        help="Filtra e include solo i pazienti completi di nome e data di nascita."
+    )
+    parser.add_argument(
+        "--extract-only",
+        action="store_true",
+        help="Estrae e visualizza/esporta l'anagrafica dei pazienti dal file scaricato senza avviare la pipeline clinica IA."
+    )
+    parser.add_argument(
+        "--process", "--pipeline",
+        action="store_true",
+        dest="run_pipeline",
+        help="Esegue l'elaborazione clinica completa (download referti -> IA -> REDCap) per i pazienti estratti."
+    )
+    parser.add_argument(
+        "--output",
+        default=None,
+        help="Percorso di esportazione dell'anagrafica pazienti (.csv, .xlsx o .json). Default: data/output/anagrafica_cup_senologia.csv."
     )
     parser.add_argument(
         "--limit",
         type=int,
         default=None,
-        help="Numero massimo di pazienti da elaborare dal file Excel."
+        help="Numero massimo di pazienti da elaborare dal file Excel o da PriamoCUP."
     )
     parser.add_argument(
         "--serve",
@@ -371,8 +446,19 @@ def main():
 
     settings = Settings(**overrides)
 
-    # Validate REDCap configuration source
-    if not args.metadata_file and (not settings.redcap_api_url or not settings.redcap_api_token):
+    # Validate REDCap configuration source when REDCap operations are requested
+    needs_redcap = (
+        args.audit_redcap
+        or args.list_records
+        or args.delete_record
+        or args.delete_all_records
+        or args.sync_redcap
+        or args.sync_interval
+        or args.import_to_redcap
+        or args.run_pipeline
+        or (args.excel and not args.extract_only)
+    )
+    if needs_redcap and not args.metadata_file and (not settings.redcap_api_url or not settings.redcap_api_token):
         print(
             "\n[ERRORE] È necessario fornire o '--metadata-file <path.csv/.json>' oppure configurare '--redcap-url' e '--redcap-token'.",
             file=sys.stderr)
@@ -478,16 +564,30 @@ def main():
             return
 
         target_excel = args.excel or settings.patients_excel_path
-        if not target_excel or not Path(target_excel).exists():
-            candidate_shared = Path("data/positivi_2026.xls")
-            if candidate_shared.exists():
-                target_excel = candidate_shared
-            else:
-                print("[ERRORE] Nessun file pazienti specificato (--excel <path>).", file=sys.stderr)
-                sys.exit(1)
-
-        print(f"-> Caricamento pazienti da {target_excel} per verifica su Priamo...")
-        cohort = DotNetApiClient.load_patients_from_excel(target_excel)
+        if target_excel and str(target_excel).strip().lower() != "cup" and Path(target_excel).exists():
+            print(f"-> Caricamento pazienti da {target_excel} per verifica su Priamo...")
+            cohort = DotNetApiClient.load_patients_from_excel(target_excel)
+        else:
+            # Download del foglio di lavoro aggiornato direttamente da PriamoCUP
+            from src.priamo_cup_client import AGENDE_SENOLOGIA, UNITA_SENOLOGIA, PriamoCupClient
+            cup_client = PriamoCupClient(settings=settings)
+            agendas_list = [a.strip() for a in args.cup_agendas.split(",")] if args.cup_agendas else AGENDE_SENOLOGIA
+            unit = args.cup_unit or UNITA_SENOLOGIA
+            print(f"-> Download del foglio di lavoro aggiornato da PriamoCUP per verifica (Unità {unit}, Agende {agendas_list})...")
+            downloaded_file = cup_client.download_updated_worksheets(
+                ytd=args.ytd,
+                year=args.year,
+                month=args.month,
+                months=args.months,
+                start_date=args.start_date,
+                end_date=args.end_date,
+                weeks=args.weeks,
+                codice_unita=unit,
+                agende=agendas_list,
+                output_dir="data/cup",
+            )
+            print(f"[OK] Foglio aggiornato scaricato: {downloaded_file.name}")
+            cohort = DotNetApiClient.load_patients_from_excel(downloaded_file)
         if args.limit:
             cohort = cohort[:args.limit]
 
@@ -554,52 +654,7 @@ def main():
         display_sync_summary(report)
         return
 
-    # 3. Mode: Batch Excel Cohort (.NET Priamo -> IA -> REDCap)
-    if args.excel:
-        from src.dotnet_client import DotNetApiClient
-        from src.patient_pipeline import PatientPipeline
-        print(f"-> Caricamento coorte pazienti dal registro Excel: [bold cyan]{args.excel}[/bold cyan]")
-        patients = DotNetApiClient.load_patients_from_excel(args.excel)
-        if args.limit:
-            patients = patients[:args.limit]
-            print(f"-> Limitazione elaborazione ai primi {args.limit} pazienti.")
-
-        pipeline = PatientPipeline(settings=settings)
-        print(f"-> Avvio pipeline su {len(patients)} pazienti...")
-
-        results = []
-        for idx, p in enumerate(patients, 1):
-            # Se il paziente esiste già su REDCap, mantieni il record_id nativo di REDCap
-            target_id = p["patient_id"]
-            if settings.redcap_api_url and settings.redcap_api_token:
-                matched_id = pipeline.redcap_service.find_record_id_by_demographics(
-                    p["name"], p["surname"], p["date_of_birth"]
-                )
-                if matched_id:
-                    target_id = matched_id
-                    print(f"-> Mantenuto record_id nativo di REDCap: '{matched_id}' per {p['name']} {p['surname']}")
-
-            print(
-                f"\n[{idx}/{len(patients)}] Elaborazione: {p['name']} {p['surname']} ({p['date_of_birth']}) -> ID: {target_id}")
-            try:
-                res = pipeline.process_patient(
-                    patient_id=target_id,
-                    name=p["name"],
-                    surname=p["surname"],
-                    date_of_birth=p["date_of_birth"],
-                    auto_upload=args.import_to_redcap
-                )
-                results.append(res)
-            except Exception as e:
-                print(f"[ERRORE] Elaborazione fallita per {target_id}: {e}", file=sys.stderr)
-
-        print("\n=== RIEPILOGO BATCH COORTE EXCEL ===")
-        for r in results:
-            print(
-                f"- Paziente {r.patient_id}: {r.successful_pdfs}/{r.total_pdfs} PDF elaborati | Form: {', '.join(r.forms_populated)} | REDCap: {r.redcap_upload_status}")
-        return
-
-    # 4. Mode: End-to-end Patient Pipeline (.NET Priamo -> IA -> REDCap)
+    # 7. Mode: End-to-end Patient Pipeline (.NET Priamo -> IA -> REDCap)
     if args.patient_id or (args.name and args.surname):
         from src.patient_pipeline import PatientPipeline
         pipeline = PatientPipeline(settings=settings)
@@ -629,7 +684,7 @@ def main():
             surname=args.surname,
             date_of_birth=args.dob,
             pdf_paths=pdf_paths,
-            auto_upload=args.import_to_redcap
+            auto_upload=args.import_to_redcap and not args.dry_run
         )
         print(f"\n-> Risultato Pipeline Paziente {p_id}:")
         print(f"   * PDF totali elaborati: {res.total_pdfs} (Successo: {res.successful_pdfs})")
@@ -638,70 +693,196 @@ def main():
         print(f"   * Tempo totale: {res.total_duration_sec}s")
         return
 
-    # 4. Mode: Direct PDF Batch
-    if not args.pdf:
-        print(
-            "\n[ERRORE] Specificare '--patient-id <ID>', '--name/--surname', '--excel <file.xls>', '--pdf <percorso>', oppure '--serve'.",
-            file=sys.stderr)
-        parser.print_help()
-        sys.exit(1)
+    # 8. Mode: Direct PDF Batch
+    if args.pdf:
+        # Initialize services
+        redcap_svc = REDCapService(api_url=settings.redcap_api_url, api_token=settings.redcap_api_token)
+        ai_extractor = get_ai_extractor(settings)
 
-    # Initialize services
-    redcap_svc = REDCapService(api_url=settings.redcap_api_url, api_token=settings.redcap_api_token)
-    ai_extractor = get_ai_extractor(settings)
+        # Check AI server connection
+        if not ai_extractor.is_available():
+            if isinstance(ai_extractor, LlamaCppExtractor):
+                print(f"\n[AVVISO] Il server llama.cpp non risponde all'indirizzo {settings.llama_cpp_base_url}.", file=sys.stderr)
+                print("Assicurati che llama-server sia avviato (es. con il cluster RPC su 2 schede).\n", file=sys.stderr)
+            else:
+                print(f"\n[AVVISO] Il server Ollama non risponde all'indirizzo {settings.ollama_base_url}.", file=sys.stderr)
+                print("Assicurati che Ollama sia in esecuzione ('ollama serve' o servizio attivo).\n", file=sys.stderr)
 
-    # Check AI server connection
-    if not ai_extractor.is_available():
-        if isinstance(ai_extractor, LlamaCppExtractor):
-            print(f"\n[AVVISO] Il server llama.cpp non risponde all'indirizzo {settings.llama_cpp_base_url}.", file=sys.stderr)
-            print("Assicurati che llama-server sia avviato (es. con il cluster RPC su 2 schede).\n", file=sys.stderr)
-        else:
-            print(f"\n[AVVISO] Il server Ollama non risponde all'indirizzo {settings.ollama_base_url}.", file=sys.stderr)
-            print("Assicurati che Ollama sia in esecuzione ('ollama serve' o servizio attivo).\n", file=sys.stderr)
+        pipeline = ExtractionPipeline(
+            settings=settings,
+            redcap_service=redcap_svc,
+            ai_extractor=ai_extractor,
+            metadata_file=args.metadata_file,
+            target_form=args.form
+        )
 
-    pipeline = ExtractionPipeline(
-        settings=settings,
-        redcap_service=redcap_svc,
-        ai_extractor=ai_extractor,
-        metadata_file=args.metadata_file,
-        target_form=args.form
+        print(f"-> Caricamento metadata REDCap (Sorgente: {args.metadata_file or settings.redcap_api_url})...")
+        fields = pipeline.initialize_metadata()
+        print(f"-> Trovati {len(fields)} campi da estrarre.")
+
+        # Find PDFs
+        pdf_files = PDFExtractor.find_pdf_files(args.pdf)
+        print(f"-> Trovati {len(pdf_files)} file PDF da elaborare in '{args.pdf}'.")
+
+        # Run processing
+        def progress(idx: int, total: int, current_path: Path):
+            print(f"[{idx}/{total}] Elaborazione referto: {current_path.name}...")
+
+        results = pipeline.process_batch(pdf_files, progress_callback=progress)
+
+        # Export
+        json_path = pipeline.export_to_json(results, args.output_json)
+        csv_path = pipeline.export_to_redcap_csv(results, args.output_csv)
+        print(f"\n-> Dati strutturati salvati in JSON: {json_path}")
+        print(f"-> File CSV per importazione REDCap salvato in: {csv_path}")
+
+        # Optional direct import to REDCap
+        if args.import_to_redcap and not args.dry_run:
+            if not settings.redcap_api_url or not settings.redcap_api_token:
+                print("[ERRORE] Impossibile importare su REDCap: URL o Token API mancanti.", file=sys.stderr)
+            else:
+                print("-> Invio dei record estratti a REDCap tramite API...")
+                records_to_upload = [r.redcap_record for r in results if r.status == "success" and r.redcap_record]
+                try:
+                    res = redcap_svc.import_records_to_api(records_to_upload)
+                    print(f"-> Importazione completata con successo! Risposta REDCap: {res}")
+                except Exception as e:
+                    print(f"[ERRORE] Fallimento importazione REDCap: {e}", file=sys.stderr)
+
+        # Display summary table
+        display_results_summary(results)
+        return
+
+    # 9. Mode: Cohort Extraction & Processing (PriamoCUP / Registro Excel)
+    import pandas as pd
+    from src.priamo_cup_client import AGENDE_SENOLOGIA, UNITA_SENOLOGIA, PriamoCupClient
+    from scripts.extract_patients_from_shared_file import (
+        Paziente,
+        display_rich_table,
+        estrai_pazienti_univoci,
     )
 
-    print(f"-> Caricamento metadata REDCap (Sorgente: {args.metadata_file or settings.redcap_api_url})...")
-    fields = pipeline.initialize_metadata()
-    print(f"-> Trovati {len(fields)} campi da estrarre.")
+    using_cup = True
+    input_file = None
 
-    # Find PDFs
-    pdf_files = PDFExtractor.find_pdf_files(args.pdf)
-    print(f"-> Trovati {len(pdf_files)} file PDF da elaborare in '{args.pdf}'.")
+    if args.excel and str(args.excel).strip().lower() != "cup":
+        target_path = Path(args.excel)
+        if not target_path.exists():
+            print(f"[ERRORE] File specificato non trovato: {target_path}", file=sys.stderr)
+            sys.exit(1)
+        input_file = target_path
+        using_cup = False
+        print(f"-> Caricamento coorte pazienti dal registro Excel locale: [bold cyan]{input_file}[/bold cyan]")
+    else:
+        # Download live da PriamoCUP - scarica ogni volta il file aggiornato
+        if not settings.priamo_username or not settings.priamo_password:
+            print("[ERRORE] Credenziali Priamo non configurate in .env (PRIAMO_USERNAME, PRIAMO_PASSWORD).", file=sys.stderr)
+            sys.exit(1)
 
-    # Run processing
-    def progress(idx: int, total: int, current_path: Path):
-        print(f"[{idx}/{total}] Elaborazione referto: {current_path.name}...")
+        cup_client = PriamoCupClient(settings=settings)
+        agendas_list = [a.strip() for a in args.cup_agendas.split(",")] if args.cup_agendas else AGENDE_SENOLOGIA
+        unit = args.cup_unit or UNITA_SENOLOGIA
 
-    results = pipeline.process_batch(pdf_files, progress_callback=progress)
+        print(f"-> Download del foglio di lavoro aggiornato da PriamoCUP (Unità {unit}, Agende {agendas_list})...")
+        input_file = cup_client.download_updated_worksheets(
+            ytd=args.ytd,
+            year=args.year,
+            month=args.month,
+            months=args.months,
+            start_date=args.start_date,
+            end_date=args.end_date,
+            weeks=args.weeks,
+            codice_unita=unit,
+            agende=agendas_list,
+            output_dir="data/cup",
+        )
+        print(f"[OK] Foglio di lavoro aggiornato scaricato con successo: [bold green]{input_file}[/bold green]")
 
-    # Export
-    json_path = pipeline.export_to_json(results, args.output_json)
-    csv_path = pipeline.export_to_redcap_csv(results, args.output_csv)
-    print(f"\n-> Dati strutturati salvati in JSON: {json_path}")
-    print(f"-> File CSV per importazione REDCap salvato in: {csv_path}")
+    # Estrazione anagrafica univoca dei pazienti (PAZ_COGNOME, PAZ_NOME, PAZ_DATA_NASCITA)
+    pazienti = estrai_pazienti_univoci(
+        filepath=input_file,
+        only_complete=args.only_complete
+    )
+    total_extracted = len(pazienti)
 
-    # Optional direct import to REDCap
-    if args.import_to_redcap:
-        if not settings.redcap_api_url or not settings.redcap_api_token:
-            print("[ERRORE] Impossibile importare su REDCap: URL o Token API mancanti.", file=sys.stderr)
+    if args.limit:
+        pazienti = pazienti[:args.limit]
+        print(f"-> Limitazione a {len(pazienti)} pazienti (su {total_extracted} totali estratti).")
+    else:
+        print(f"-> Estratti {len(pazienti)} pazienti univoci dal nuovo file.")
+
+    # Visualizzazione tabella anagrafica
+    if HAS_RICH:
+        display_rich_table(pazienti, title=f"Anagrafica Pazienti Estratti ({input_file.name})")
+    else:
+        print(f"\n--- ANAGRAFICA PAZIENTI ESTRATTI ({input_file.name}) ---")
+        print(f"{'#':<4} {'COGNOME':<22} {'NOME':<25} {'DATA NASCITA':<14} {'ID PRIAMO':<12} {'CF':<18}")
+        print("-" * 95)
+        for idx, p in enumerate(pazienti, 1):
+            dob_str = p.data_nascita.strftime("%d/%m/%Y") if p.data_nascita else "N.D."
+            print(f"{idx:<4} {p.cognome:<22} {p.nome or 'N.D.':<25} {dob_str:<14} {p.priamo_id or '-':<12} {p.codice_fiscale or '-':<18}")
+        print("-" * 95)
+        print(f"Totale pazienti visualizzati: {len(pazienti)} (Totali nel file: {total_extracted})\n")
+
+    # Esportazione anagrafica estratta
+    out_target = args.output or ("data/output/anagrafica_cup_senologia.csv" if using_cup else None)
+    if out_target:
+        out_path = Path(out_target)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        rows = [p.to_export_dict() for p in pazienti]
+        df_out = pd.DataFrame(rows)
+        if out_path.suffix.lower() == ".json":
+            df_out.to_json(out_path, orient="records", indent=2, force_ascii=False)
+        elif out_path.suffix.lower() == ".xlsx":
+            df_out.to_excel(out_path, index=False)
         else:
-            print("-> Invio dei record estratti a REDCap tramite API...")
-            records_to_upload = [r.redcap_record for r in results if r.status == "success" and r.redcap_record]
-            try:
-                res = redcap_svc.import_records_to_api(records_to_upload)
-                print(f"-> Importazione completata con successo! Risposta REDCap: {res}")
-            except Exception as e:
-                print(f"[ERRORE] Fallimento importazione REDCap: {e}", file=sys.stderr)
+            df_out.to_csv(out_path, index=False, encoding="utf-8")
+        print(f"[OK] Anagrafica univoca estratta e salvata in: [bold cyan]{out_path}[/bold cyan]")
 
-    # Display summary table
-    display_results_summary(results)
+    # Pipeline execution check: avvia l'elaborazione se esplicitamente richiesta via --process, --import-to-redcap o --excel
+    should_run_pipeline = args.run_pipeline or args.import_to_redcap or (args.excel and not args.extract_only)
+    if args.extract_only or not should_run_pipeline:
+        print(
+            "\n[TIP] Per avviare l'elaborazione clinica IA sui pazienti estratti (download referti -> IA -> REDCap):"
+        )
+        print("      uv run python main.py --process [--limit N] [--import-to-redcap] [--dry-run]\n")
+        return
+
+    # Avvio PatientPipeline
+    from src.patient_pipeline import PatientPipeline
+    pipeline = PatientPipeline(settings=settings)
+    print(f"\n-> Avvio pipeline clinica IA su {len(pazienti)} pazienti...")
+
+    results = []
+    for idx, p in enumerate(pazienti, 1):
+        target_id = p.patient_id
+        if settings.redcap_api_url and settings.redcap_api_token:
+            matched_id = pipeline.redcap_service.find_record_id_by_demographics(
+                p.nome or "", p.cognome, p.data_nascita
+            )
+            if matched_id:
+                target_id = matched_id
+                print(f"-> Mantenuto record_id nativo di REDCap: '{matched_id}' per {p.nome} {p.cognome}")
+
+        print(
+            f"\n[{idx}/{len(pazienti)}] Elaborazione: {p.nome or ''} {p.cognome} ({p.data_nascita or 'N.D.'}) -> ID: {target_id}")
+        try:
+            res = pipeline.process_patient(
+                patient_id=target_id,
+                name=p.nome or "",
+                surname=p.cognome,
+                date_of_birth=p.data_nascita,
+                auto_upload=args.import_to_redcap and not args.dry_run
+            )
+            results.append(res)
+        except Exception as e:
+            print(f"[ERRORE] Elaborazione fallita per {target_id}: {e}", file=sys.stderr)
+
+    print("\n=== RIEPILOGO BATCH PIPELINE PAZIENTI ===")
+    for r in results:
+        print(
+            f"- Paziente {r.patient_id}: {r.successful_pdfs}/{r.total_pdfs} PDF elaborati | Form: {', '.join(r.forms_populated)} | REDCap: {r.redcap_upload_status}")
+    return
 
 
 if __name__ == "__main__":
