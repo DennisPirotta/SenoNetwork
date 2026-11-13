@@ -1,4 +1,5 @@
 import json
+from unittest.mock import MagicMock, patch
 import pytest
 from pathlib import Path
 from src.models import REDCapField, ExtractionResult
@@ -351,5 +352,88 @@ def test_api_server_delete_endpoints():
             api_url="https://mock.redcap/api/",
             api_token="TOKEN"
         )
+
+
+def test_merge_flat_records():
+    """Tests REDCapService.merge_flat_records consolidates duplicate record entries."""
+    raw_records = [
+        # Patient 1, Report 1 (Radiology)
+        {
+            "record_id": "PZ-01",
+            "date_of_mx": "2025-01-20",
+            "result_of_mx_birads": "5",
+            "radiologia_complete": "2",
+            "lesion_type___1": "1",
+            "lesion_type___2": "0",
+        },
+        # Patient 1, Report 2 (Biopsy)
+        {
+            "record_id": "PZ-01",
+            "date_of_cb": "2025-01-28",
+            "result_cb": "B5",
+            "anatomia_patologica_preoperatoria_complete": "2",
+            "lesion_type___1": "0",  # Checkbox 1 should remain '1' due to precedence
+            "lesion_type___2": "1",
+        },
+        # Patient 2 (Single record)
+        {
+            "record_id": "PZ-02",
+            "date_of_mx": "2025-02-01",
+        }
+    ]
+
+    merged = REDCapService.merge_flat_records(raw_records)
+    assert len(merged) == 2
+
+    p1 = next(r for r in merged if r["record_id"] == "PZ-01")
+    assert p1["date_of_mx"] == "2025-01-20"
+    assert p1["result_of_mx_birads"] == "5"
+    assert p1["date_of_cb"] == "2025-01-28"
+    assert p1["result_cb"] == "B5"
+    assert p1["radiologia_complete"] == "2"
+    assert p1["anatomia_patologica_preoperatoria_complete"] == "2"
+    assert p1["lesion_type___1"] == "1"
+    assert p1["lesion_type___2"] == "1"
+
+    p2 = next(r for r in merged if r["record_id"] == "PZ-02")
+    assert p2["date_of_mx"] == "2025-02-01"
+
+
+def test_import_records_to_api_merges_and_formats_errors():
+    """Tests that import_records_to_api automatically merges duplicate entries and extracts error messages."""
+    import requests
+    service = REDCapService(api_url="https://mock.redcap/api/", api_token="TOKEN")
+
+    raw_records = [
+        {"record_id": "PZ-01", "name": "Anna"},
+        {"record_id": "PZ-01", "surname": "Rossi"}
+    ]
+
+    # Test success path: payload received by requests.post must have only 1 merged record
+    mock_resp_ok = MagicMock()
+    mock_resp_ok.ok = True
+    mock_resp_ok.status_code = 200
+    mock_resp_ok.json.return_value = {"count": 1}
+
+    with patch("requests.post", return_value=mock_resp_ok) as mock_post:
+        res = service.import_records_to_api(raw_records)
+        assert res["count"] == 1
+        sent_data_str = mock_post.call_args[1]["data"]["data"]
+        sent_json = json.loads(sent_data_str)
+        assert len(sent_json) == 1
+        assert sent_json[0]["name"] == "Anna"
+        assert sent_json[0]["surname"] == "Rossi"
+
+    # Test error path: 400 with REDCap error details
+    mock_resp_err = MagicMock()
+    mock_resp_err.ok = False
+    mock_resp_err.status_code = 400
+    mock_resp_err.text = '{"error": "Field xyz does not exist"}'
+    mock_resp_err.json.return_value = {"error": "Field xyz does not exist"}
+
+    with patch("requests.post", return_value=mock_resp_err):
+        with pytest.raises(requests.exceptions.HTTPError, match="Field xyz does not exist"):
+            service.import_records_to_api(raw_records)
+
 
 

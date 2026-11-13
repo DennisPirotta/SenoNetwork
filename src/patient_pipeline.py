@@ -303,9 +303,13 @@ class PatientPipeline:
         upload_response = None
 
         if auto_upload and patient_records_to_upload:
-            logger.info(f"3. Caricamento dati estratti su REDCap per {len(patient_records_to_upload)} record/form...")
+            merged_to_upload = REDCapService.merge_flat_records(patient_records_to_upload)
+            logger.info(
+                f"3. Caricamento dati estratti su REDCap ({len(patient_records_to_upload)} record estratti "
+                f"consolidati in {len(merged_to_upload)} record paziente)..."
+            )
             try:
-                upload_response = self.redcap_service.import_records_to_api(patient_records_to_upload)
+                upload_response = self.redcap_service.import_records_to_api(merged_to_upload)
                 upload_status = "uploaded"
                 logger.info(f"-> Caricamento REDCap completato con successo: {upload_response}")
             except Exception as e:

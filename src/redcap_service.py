@@ -168,6 +168,44 @@ class REDCapService:
                 forms.append(f.form_name)
         return forms
 
+    @staticmethod
+    def merge_flat_records(records: List[Dict[str, Any]], primary_key: str = "record_id") -> List[Dict[str, Any]]:
+        """Merges multiple record dictionaries belonging to the same entity/event.
+
+        REDCap rejects imports if the same (record_id, event, repeat_instance) occurs more
+        than once in the payload with HTTP 400 'The records listed below occur more than once'.
+        This method consolidates fields across multiple reports or forms for each record.
+        """
+        merged_by_key: Dict[str, Dict[str, Any]] = {}
+        for r in records:
+            if not r or not isinstance(r, dict):
+                continue
+            key = str(r.get(primary_key, "")).strip()
+            if not key:
+                continue
+            event = str(r.get("redcap_event_name", "")).strip()
+            repeat_inst = str(r.get("redcap_repeat_instrument", "")).strip()
+            repeat_instance = str(r.get("redcap_repeat_instance", "")).strip()
+            compound_key = f"{key}||{event}||{repeat_inst}||{repeat_instance}"
+
+            if compound_key not in merged_by_key:
+                merged_by_key[compound_key] = {}
+
+            target = merged_by_key[compound_key]
+            for field, val in r.items():
+                if val is None or val == "":
+                    continue
+                # For checkbox fields ('___'), '1' takes precedence over '0'
+                if "___" in field:
+                    current_val = str(target.get(field, "")).strip()
+                    if current_val == "1":
+                        continue
+                    target[field] = str(val).strip()
+                else:
+                    target[field] = val
+
+        return list(merged_by_key.values())
+
     def import_records_to_api(self, records: List[Dict[str, Any]]) -> Dict[str, Any]:
         """Directly uploads extracted records to the REDCap project.
 
@@ -180,19 +218,38 @@ class REDCapService:
         if not self.api_url or not self.api_token:
             raise ValueError("REDCap API URL and Token are required to import records.")
 
+        if not records:
+            return {"count": 0}
+
+        cleaned_records = self.merge_flat_records(records)
+        if not cleaned_records:
+            return {"count": 0}
+
         payload = {
             "token": self.api_token,
             "content": "record",
             "format": "json",
             "type": "flat",
             "overwriteBehavior": "normal",
-            "data": json.dumps(records),
+            "data": json.dumps(cleaned_records),
             "returnContent": "count",
             "returnFormat": "json"
         }
 
         response = requests.post(self.api_url, data=payload, timeout=60)
-        response.raise_for_status()
+        if not response.ok:
+            error_detail = response.text.strip()
+            try:
+                err_json = response.json()
+                if isinstance(err_json, dict) and "error" in err_json:
+                    error_detail = err_json["error"]
+            except Exception:
+                pass
+            raise requests.exceptions.HTTPError(
+                f"Errore REDCap API {response.status_code} su importazione record: {error_detail}",
+                response=response
+            )
+
         return response.json()
 
     def export_records_from_api(
