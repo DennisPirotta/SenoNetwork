@@ -144,12 +144,20 @@ class BaseAIExtractor(ABC):
 
             result.extracted_data = filtered_dict
 
+            # Determine if at least one meaningful clinical field was extracted (excluding record_id)
+            has_clinical_data = any(
+                v not in (None, "", [], {})
+                for k, v in filtered_dict.items()
+                if k != "record_id"
+            )
+
             # Normalize to valid REDCap record format
             normalized_record = REDCapNormalizer.normalize_record(
                 extracted_data=filtered_dict,
                 fields=fields,
                 record_id=record_id,
-                form_name=form_name
+                form_name=form_name,
+                mark_form_complete=has_clinical_data
             )
             result.redcap_record = normalized_record
             result.status = "success"
@@ -199,15 +207,14 @@ class LlamaCppExtractor(BaseAIExtractor):
         report_text: str
     ) -> Tuple[str, str, Dict[str, Any]]:
         """Constructs system prompt, user prompt, and JSON Schema for llama.cpp.
-
-        Since llama.cpp natively enforces formal JSON Schema (GBNF grammars) with field
-        descriptions, enums, and types directly at the logit level, we omit redundant
-        text guidelines. On large REDCap forms (e.g. chemioterapia with 68 fields),
-        redundant text adds >11,000 characters (~3,500 tokens), causing Cloudflare HTTP 524
-        gateway timeouts (100s limit).
+        Uses compact prompt guidelines to ensure llama.cpp receives clear field definitions
+        and expected codes without causing token bloat or gateway timeouts.
         """
         json_schema = SchemaBuilder.build_json_schema(fields)
+        guidelines = SchemaBuilder.build_prompt_guidelines(fields)
         user_prompt = (
+            f"Di seguito trovi le linee guida dei campi REDCap da estrarre:\n"
+            f"{guidelines}\n\n"
             f"--- TESTO DEL REFERTO MEDICO ---\n"
             f"{report_text}\n"
             f"--- FINE REFERTO ---\n\n"

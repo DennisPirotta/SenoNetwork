@@ -82,7 +82,13 @@ class REDCapNormalizer:
                 record[field_name] = str(val).strip()
 
         # Mark form as complete in REDCap: 0=Incomplete, 1=Unverified, 2=Complete
-        if form_name and mark_form_complete:
+        # Only mark complete if explicitly requested AND at least one non-empty clinical field was extracted
+        has_clinical_values = any(
+            v not in (None, "", [], {})
+            for k, v in extracted_data.items()
+            if k not in (default_record_id_field, f"{form_name}_complete")
+        )
+        if form_name and mark_form_complete and has_clinical_values:
             record[f"{form_name}_complete"] = "2"
 
         return record

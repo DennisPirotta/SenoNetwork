@@ -238,6 +238,22 @@ class PatientPipeline:
                 )
                 logger.info(f"-> Referto '{pdf_path.name}' classificato per il form REDCap: '{classified_form}'")
 
+                # Se il documento è non senologico o da saltare, non invochiamo l'IA
+                if classified_form in ("skip", "irrelevant", "unknown"):
+                    logger.info(f"-> Salto referto '{pdf_path.name}' (classificato come '{classified_form}').")
+                    doc_results.append(
+                        DocumentProcessingResult(
+                            filename=pdf_path.name,
+                            classified_form=classified_form,
+                            fields_extracted_count=0,
+                            duration_sec=round(time.time() - t_doc_start, 2),
+                            status="skipped",
+                            extracted_record={},
+                            file_sha256=file_hash
+                        )
+                    )
+                    continue
+
                 # 2.3 Estrazione strutturata dei campi del form
                 target_fields = self.get_fields_for_form(classified_form)
                 logger.info(
@@ -253,13 +269,23 @@ class PatientPipeline:
                 )
 
                 if extraction_res.status == "success":
-                    # Ensure record_id is properly bound
                     record = extraction_res.redcap_record
                     record["record_id"] = str(patient_id)
-                    patient_records_to_upload.append(record)
-                    forms_populated.add(classified_form)
 
-                    extracted_count = len([k for k, v in record.items() if v not in ("", None, "0")])
+                    # Conta i campi clinici effettivamente estratti ed esclude record_id e _complete
+                    clinical_fields = [
+                        k for k, v in extraction_res.extracted_data.items()
+                        if k != "record_id" and v not in ("", None, "0", [], {})
+                    ]
+                    extracted_count = len(clinical_fields)
+
+                    if extracted_count > 0:
+                        patient_records_to_upload.append(record)
+                        forms_populated.add(classified_form)
+                        logger.info(f"-> Estratti {extracted_count} campi clinici per '{classified_form}'. Accodato per upload.")
+                    else:
+                        logger.info(f"-> Nessun campo clinico utile estratto da '{pdf_path.name}' per '{classified_form}'. Record vuoto non accodato.")
+
                     doc_results.append(
                         DocumentProcessingResult(
                             filename=pdf_path.name,
@@ -267,7 +293,7 @@ class PatientPipeline:
                             fields_extracted_count=extracted_count,
                             duration_sec=round(time.time() - t_doc_start, 2),
                             status="success",
-                            extracted_record=record,
+                            extracted_record=record if extracted_count > 0 else {},
                             file_sha256=file_hash
                         )
                     )

@@ -48,48 +48,86 @@ class FormClassifier:
         target_llama_url = cfg.llama_cpp_base_url.rstrip("/")
 
         lower_text = text.lower()
+        lower_hint = hint.lower() if hint else ""
 
-        # 1. Check explicit hint (e.g. from .NET API metadata or filename)
+        # 1. Early filtering: Non-senology / Irrelevant clinical documents
+        irrelevant_keywords = [
+            "ecg", "elettrocardiogramma", "torace_standard", "torace standard", "rx torace",
+            "gruppo_-_rh", "gruppo rh", "gruppo sanguigno", "immunoematologia", "chimica clinica",
+            "esami ematochimici", "emocromo", "fisiatr", "fisioterap", "ortoped",
+            "infiltraz", "tampone", "antigenico"
+        ]
+        if any(kw in lower_hint for kw in irrelevant_keywords):
+            return "skip"
+
+        if (
+            "laboratorio di immunoematologia" in lower_text
+            or "laboratorio clinico generale" in lower_text
+            or ("elettrocardiogramma" in lower_text and "mamm" not in lower_text)
+            or ("ritmo sinusale" in lower_text and "mamm" not in lower_text)
+            or ("campi polmonari indenni da lesioni" in lower_text and "mamm" not in lower_text)
+            or ("trattamento riabilitativo motorio" in lower_text and "mamm" not in lower_text)
+            or ("fisiatria" in lower_text and "mamm" not in lower_text)
+            or ("fisioterapia" in lower_text and "mamm" not in lower_text)
+        ):
+            return "skip"
+
+        # 2. Multidisciplinary consultation (MDM pre/post meeting dates -> dati_del_paziente)
+        if (
+            "multidisciplinare" in lower_hint
+            or "visita senologica multidisciplinare" in lower_text
+            or "visita multidisciplinare" in lower_text
+            or "meeting multidisciplinare" in lower_text
+            or "riunione multidisciplinare" in lower_text
+        ):
+            return "dati_del_paziente"
+
+        # 3. Check explicit hint (e.g. from .NET API metadata or filename)
         if hint:
-            lower_hint = hint.lower()
             for form_key in AVAILABLE_FORMS.keys():
                 if form_key in lower_hint:
                     return form_key
-            if "mammo" in lower_hint or "eco" in lower_hint or "rx" in lower_hint or "rmn" in lower_hint or "mri" in lower_hint:
-                return "radiologia"
-            if "biops" in lower_hint or "core" in lower_hint or "fna" in lower_hint or "agobiopt" in lower_hint:
+            if "biops" in lower_hint or "core" in lower_hint or "fna" in lower_hint or "agobiopt" in lower_hint or "agoaspirat" in lower_hint:
                 return "anatomia_patologica_preoperatoria"
-            if "istolog" in lower_hint or "definitiv" in lower_hint:
+            if "istolog" in lower_hint or "definitiv" in lower_hint or "recettore" in lower_hint or "estrogen" in lower_hint or "progesteron" in lower_hint or "sentinella" in lower_hint or "osna" in lower_hint or "bls" in lower_hint or "mastec" in lower_hint:
                 return "anatomia_patologica"
-            if "chirurg" in lower_hint or "intervent" in lower_hint or "operatori" in lower_hint:
+            if "chirurg" in lower_hint or "intervent" in lower_hint or "operatori" in lower_hint or "dimissione" in lower_hint:
                 return "struttura_della_lesione"
+            if "mammo" in lower_hint or "eco" in lower_hint or "rmn" in lower_hint or "mri" in lower_hint or "marcatura" in lower_hint:
+                return "radiologia"
+            if "visita" in lower_hint:
+                return "dati_del_paziente"
 
-        # 2. Heuristic rules based on clinical keywords
-        # Radiologia
-        if (
-            ("mammografia" in lower_text or "tomosintesi" in lower_text or "ecografia mammaria" in lower_text)
-            and ("bi-rads" in lower_text or "birads" in lower_text or "densità parenchimale" in lower_text or "radiologico" in lower_text)
-            and "frustoli" not in lower_text
-        ):
-            return "radiologia"
-
-        # Biopsia pre-operatoria
+        # 4. Heuristic rules based on clinical text keywords
+        # Biopsia / Citologia pre-operatoria
         if (
             ("frustoli" in lower_text or "agobioptici" in lower_text or "core biopsy" in lower_text or "agobiopsia" in lower_text)
-            or ("agoaspirato" in lower_text and "fna" in lower_text)
+            or ("agoaspirato" in lower_text and ("fna" in lower_text or "citologico" in lower_text or "c1" in lower_text or "c2" in lower_text or "c3" in lower_text or "c4" in lower_text or "c5" in lower_text))
+            or "esame citologico da agoaspirat" in lower_text
         ):
             return "anatomia_patologica_preoperatoria"
 
-        # Istologico definitivo post-operatorio
+        # Istologico definitivo post-operatorio e biologia molecolare / OSNA
         if (
-            ("pezzo operatorio" in lower_text or "quadrantectomia" in lower_text or "mastectomia" in lower_text or "istologico definitivo" in lower_text)
-            and ("margini" in lower_text or "pt" in lower_text or "pn" in lower_text or "linfonodo sentinella" in lower_text)
+            ("pezzo operatorio" in lower_text or "quadrantectomia" in lower_text or "mastectomia" in lower_text or "istologico definitivo" in lower_text or "diagnosi istopatologica" in lower_text)
+            and ("margini" in lower_text or "pt" in lower_text or "pn" in lower_text or "linfonodo sentinella" in lower_text or "ptis" in lower_text)
+            or "recettori degli estrogeni" in lower_text
+            or "metodica osna" in lower_text
+            or "stadiazione istopatologica" in lower_text
         ):
             return "anatomia_patologica"
 
-        # Chirurgia
-        if "verbale operatorio" in lower_text or "lettera di dimissione" in lower_text or "tempo chirurgico" in lower_text:
+        # Chirurgia / Lettera di dimissione
+        if "verbale operatorio" in lower_text or "lettera di dimissione" in lower_text or "tempo chirurgico" in lower_text or "visita chirurgica senologica" in lower_text:
             return "struttura_della_lesione"
+
+        # Radiologia
+        if (
+            ("mammografia" in lower_text or "tomosintesi" in lower_text or "ecografia mammaria" in lower_text or "marcatura" in lower_text)
+            and ("bi-rads" in lower_text or "birads" in lower_text or "densità parenchimale" in lower_text or "radiologico" in lower_text or "ecostrutturato" in lower_text)
+            and "frustoli" not in lower_text
+        ):
+            return "radiologia"
 
         # Radioterapia
         if "radioterapia" in lower_text and ("gray" in lower_text or "gy" in lower_text or "irradiazione" in lower_text):
@@ -103,28 +141,34 @@ class FormClassifier:
         if "recidiva locale" in lower_text or "ripresa di malattia" in lower_text:
             return "recidiva"
 
-        # 3. Fallback to quick local LLM classification (supports llama.cpp or Ollama configured in Settings)
+        # 5. Fallback to quick local LLM classification (supports llama.cpp or Ollama configured in Settings)
         try:
             prompt = (
                 "Classifica il seguente referto medico senologico in uno e uno solo di questi strumenti REDCap:\n"
                 "- radiologia (esami mammografici, ecografie, RM)\n"
                 "- anatomia_patologica_preoperatoria (agobiopsie, core biopsy, agoaspirati pre-intervento)\n"
                 "- anatomia_patologica (esame istologico definitivo post-operatorio su pezzo chirurgico)\n"
-                "- struttura_della_lesione (verbale di chirurgia senologica)\n"
+                "- struttura_della_lesione (verbale di chirurgia senologica, lettera di dimissione)\n"
                 "- chemioterapia (oncologia medica)\n"
                 "- radioterapia (trattamento radiante)\n"
-                "- dati_del_paziente (anamnesi, prima visita, genetica)\n\n"
+                "- dati_del_paziente (anamnesi, prima visita, riunioni multidisciplinari)\n\n"
                 f"Referto:\n{text[:1000]}\n\n"
                 "Rispondi ESCLUSIVAMENTE con il nome dello strumento (es. 'radiologia'):"
             )
 
-            # 3.1 Try llama.cpp RPC server first if configured
+            # 5.1 Try llama.cpp server first if configured
             if target_llama_url:
                 try:
+                    headers = {}
+                    if cfg.ai_cloudflared_client_id and cfg.ai_cloudflared_client_secret:
+                        headers["CF-Access-Client-Id"] = cfg.ai_cloudflared_client_id
+                        headers["CF-Access-Client-Secret"] = cfg.ai_cloudflared_client_secret
+
                     r_llama = requests.post(
                         f"{target_llama_url}/completion",
+                        headers=headers,
                         json={"prompt": prompt, "temperature": 0.0, "n_predict": 20, "stream": False},
-                        timeout=5
+                        timeout=3
                     )
                     if r_llama.status_code == 200:
                         predicted = r_llama.json().get("content", "").strip().lower()
@@ -134,7 +178,7 @@ class FormClassifier:
                 except Exception:
                     pass
 
-            # 3.2 Try Ollama fallback
+            # 5.2 Try Ollama fallback
             if target_ollama_url:
                 r = requests.post(
                     f"{target_ollama_url.rstrip('/')}/api/generate",
@@ -144,7 +188,7 @@ class FormClassifier:
                         "stream": False,
                         "options": {"temperature": 0.0, "num_predict": 20}
                     },
-                    timeout=8
+                    timeout=5
                 )
                 if r.status_code == 200:
                     predicted = r.json().get("response", "").strip().lower()
@@ -154,5 +198,9 @@ class FormClassifier:
         except Exception as e:
             logger.warning(f"Classificazione LLM non riuscita: {e}")
 
-        # Default fallback
-        return "radiologia"
+        # Default fallback: check if document contains senological terms; if not, skip
+        seno_terms = ["mamm", "senolog", "cavo ascellare", "capezzolo", "areolare", "nodulo", "bi-rads", "birads"]
+        if any(st in lower_text for st in seno_terms):
+            return "radiologia"
+
+        return "skip"

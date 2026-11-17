@@ -26,19 +26,19 @@ class SchemaBuilder:
             if not field.is_extractable:
                 continue
 
-            field_desc = field.field_label or field.field_name
-            if field.field_note:
-                field_desc += f" (Nota: {field.field_note})"
+            field_desc = (field.field_label or field.field_name).strip().replace("\n", " ")
+            if len(field_desc) > 60:
+                field_desc = field_desc[:57] + "..."
 
             # Dropdown / Radio single choice
             if field.field_type in {"dropdown", "radio"}:
                 choices = field.parse_choices()
-                choices_str = ", ".join([f"'{c}'={lbl}" for c, lbl in choices.items()])
+                choices_str = ", ".join([f"'{c}'={lbl[:20]}" for c, lbl in list(choices.items())[:10]])
                 allowed_codes = list(choices.keys())
                 properties[field.field_name] = {
                     "type": ["string", "null"],
                     "enum": allowed_codes + [None],
-                    "description": f"{field_desc}. Scegli uno tra i codici ammessi: {choices_str}"
+                    "description": f"{field_desc} [{choices_str}]"
                 }
 
             # Yes/No
@@ -46,7 +46,7 @@ class SchemaBuilder:
                 properties[field.field_name] = {
                     "type": ["string", "null"],
                     "enum": ["1", "0", None],
-                    "description": f"{field_desc}. Usa '1' per Sì/Presente, '0' per No/Assente."
+                    "description": f"{field_desc} ['1'=Sì, '0'=No]"
                 }
 
             # True/False
@@ -54,23 +54,20 @@ class SchemaBuilder:
                 properties[field.field_name] = {
                     "type": ["string", "null"],
                     "enum": ["1", "0", None],
-                    "description": f"{field_desc}. Usa '1' per Vero, '0' per Falso."
+                    "description": f"{field_desc} ['1'=Vero, '0'=Falso]"
                 }
 
             # Checkbox multiple choice
             elif field.field_type == "checkbox":
                 choices = field.parse_choices()
-                choices_str = ", ".join([f"'{c}'={lbl}" for c, lbl in choices.items()])
+                choices_str = ", ".join([f"'{c}'={lbl[:18]}" for c, lbl in list(choices.items())[:8]])
                 properties[field.field_name] = {
                     "type": ["array", "null"],
                     "items": {
                         "type": "string",
                         "enum": list(choices.keys())
                     },
-                    "description": (
-                        f"{field_desc}. Array contenente SOLO i codici delle opzioni ACCERTATE "
-                        f"nel referto tra: {choices_str}. NON includere sintomi o condizioni assenti."
-                    )
+                    "description": f"{field_desc} (array codici presenti tra: {choices_str})"
                 }
 
             # Numeric fields
@@ -79,7 +76,7 @@ class SchemaBuilder:
             }:
                 properties[field.field_name] = {
                     "type": ["number", "string", "null"],
-                    "description": f"{field_desc}. Valore numerico."
+                    "description": f"{field_desc} (numero)"
                 }
 
             # Date fields
@@ -88,7 +85,7 @@ class SchemaBuilder:
             ):
                 properties[field.field_name] = {
                     "type": ["string", "null"],
-                    "description": f"{field_desc}. Formato data standard: YYYY-MM-DD (es. 2024-03-15)."
+                    "description": f"{field_desc} (data: YYYY-MM-DD)"
                 }
 
             # Notes / Long text / Standard text
@@ -112,15 +109,18 @@ class SchemaBuilder:
 
     @staticmethod
     def build_prompt_guidelines(fields: List[REDCapField]) -> str:
-        """Constructs human/LLM-readable field guidelines in Italian for prompt context."""
+        """Constructs concise, high-density field guidelines in Italian for prompt context.
+        Optimized to fit within prompt token budgets while clearly communicating allowed codes
+        for single/multi-choice fields.
+        """
         lines = []
         lines.append("### CAMPI DA ESTRARRE SECONDO I METADATA REDCAP:")
         lines.append(
-            "ISTRUZIONI RIGOROSE:\n"
-            "- Se un dato non è presente nel referto, restituisci null.\n"
-            "- Per radio/dropdown: restituisci SOLO la stringa del codice ammesso (es. \"1\", \"2\"). Non restituire il testo.\n"
-            "- Per i campi checkbox (a scelta multipla): includi nell'array SOLO i codici delle opzioni ACCERTATE/PRESENTI nel referto. Non includere tutte le opzioni!\n"
-            "- Per record_id: se nel referto è presente un ID paziente, cartella o codice (es. SENO-2024-0891), estrailo.\n"
+            "ISTRUZIONI:\n"
+            "- Estrai SOLO i dati clinici esplicitamente menzionati nel referto (imposta a null i campi non citati).\n"
+            "- Per radio/dropdown/yesno/truefalse: usa ESCLUSIVAMENTE la stringa del CODICE indicato tra parentesi quadre (es. \"1\", \"2\"). Non restituire testo descrittivo.\n"
+            "- Per checkbox (multipli): restituisci un array JSON con i SOLI codici delle opzioni accertate nel referto.\n"
+            "- Per record_id: se nel referto è presente un ID paziente o cartella, estrailo, altrimenti null.\n"
         )
 
         current_form = None
@@ -132,23 +132,39 @@ class SchemaBuilder:
                 current_form = f.form_name
                 lines.append(f"\n[Strumento / Form: {current_form}]")
 
-            label = f.field_label.strip() if f.field_label else f.field_name
-            line = f"- `{f.field_name}` ({f.field_type}): {label}"
-
-            if f.field_note:
-                line += f" [Note: {f.field_note}]"
+            label = (f.field_label or f.field_name).strip().replace("\n", " ")
+            if len(label) > 55:
+                label = label[:52] + "..."
 
             if f.field_type in {"dropdown", "radio", "yesno", "truefalse"}:
                 choices = f.parse_choices()
-                choices_repr = " | ".join([f"{k} = {v}" for k, v in choices.items()])
-                line += f" -> Restituisci il CODICE corrispondente tra: [{choices_repr}]"
+                ch_items = []
+                for k, v in list(choices.items())[:10]:
+                    clean_v = v.split(" - ")[-1].strip() if " - " in v else v.strip()
+                    if len(clean_v) > 18:
+                        clean_v = clean_v[:16] + ".."
+                    ch_items.append(f'"{k}"={clean_v}')
+                lines.append(f"- `{f.field_name}` ({f.field_type}): {label} [{', '.join(ch_items)}]")
+
             elif f.field_type == "checkbox":
                 choices = f.parse_choices()
-                choices_repr = " | ".join([f"{k} = {v}" for k, v in choices.items()])
-                line += f" -> Restituisci un array con i CODICI delle opzioni presenti nel referto tra: [{choices_repr}]"
-            elif f.text_validation_type_or_show_slider_number:
-                line += f" -> Validazione: {f.text_validation_type_or_show_slider_number}"
+                ch_items = []
+                for k, v in list(choices.items())[:8]:
+                    clean_v = v.split(" - ")[-1].strip() if " - " in v else v.strip()
+                    if len(clean_v) > 16:
+                        clean_v = clean_v[:14] + ".."
+                    ch_items.append(f'"{k}"={clean_v}')
+                lines.append(f"- `{f.field_name}` ({f.field_type}): {label} [{', '.join(ch_items)}]")
 
-            lines.append(line)
+            elif f.field_type == "text" and f.text_validation_type_or_show_slider_number:
+                vt = f.text_validation_type_or_show_slider_number
+                if "date" in vt:
+                    lines.append(f"- `{f.field_name}` ({f.field_type}): {label} (data: YYYY-MM-DD)")
+                elif "int" in vt or "num" in vt:
+                    lines.append(f"- `{f.field_name}` ({f.field_type}): {label} (numero)")
+                else:
+                    lines.append(f"- `{f.field_name}` ({f.field_type}): {label}")
+            else:
+                lines.append(f"- `{f.field_name}` ({f.field_type}): {label}")
 
         return "\n".join(lines)

@@ -228,4 +228,70 @@ def test_priamo_concurrent_pdf_downloads(tmp_path):
                 assert mock_req.call_count == 5
 
 
+def test_form_classifier_non_senology_skip():
+    """Ensures non-breast hospital documents are flagged as 'skip'."""
+    assert FormClassifier.classify_report("qualsiasi testo", hint="20260000015257_ECG.pdf") == "skip"
+    assert FormClassifier.classify_report("qualsiasi testo", hint="20260000015641_TORACE_STANDARD.pdf") == "skip"
+    assert FormClassifier.classify_report("qualsiasi testo", hint="20260000014452_GRUPPO_-_RH.pdf") == "skip"
+    assert FormClassifier.classify_report("qualsiasi testo", hint="visita_fisiatrica.pdf") == "skip"
+
+    ecg_text = "Elettrocardiogramma: ritmo sinusale 75 bpm, conduzione atrioventricolare nella norma."
+    assert FormClassifier.classify_report(ecg_text) == "skip"
+
+    immuno_text = "Laboratorio di Immunoematologia: fenotipo Rh positivo, Coombs indiretto negativo."
+    assert FormClassifier.classify_report(immuno_text) == "skip"
+
+
+def test_form_classifier_multidisciplinare():
+    """Ensures multidisciplinary meetings are routed to dati_del_paziente."""
+    assert FormClassifier.classify_report(
+        "Referto", hint="20260000004108_VISITA_MULTIDISCIPLINARE_CENTR.pdf"
+    ) == "dati_del_paziente"
+
+    text = """
+    VISITA SENOLOGICA MULTIDISCIPLINARE
+    MEETING MULTIDISCIPLINARE DATA 17.12.2024
+    Indicazione a quadrantectomia centrale destra, BLS.
+    """
+    assert FormClassifier.classify_report(text) == "dati_del_paziente"
+
+
+def test_form_classifier_estrogen_receptors_and_sentinel():
+    """Ensures molecular receptor and sentinel lymphnode reports map to anatomia_patologica."""
+    assert FormClassifier.classify_report("Referto", hint="20260000058545_RECETTORE_DEGLI_ESTROGENI.pdf") == "anatomia_patologica"
+    assert FormClassifier.classify_report("Referto", hint="20260000031388_LINFONODO_SENTINELLA_METODICA_.pdf") == "anatomia_patologica"
+
+
+def test_normalizer_empty_extracted_data_no_complete_flag():
+    """Ensures that when zero clinical fields are extracted, the form is NOT marked complete."""
+    from src.normalizer import REDCapNormalizer
+    from src.models import REDCapField
+
+    sample_f = [
+        REDCapField(field_name="record_id", form_name="radiologia", field_type="text"),
+        REDCapField(field_name="result_of_mx_birads", form_name="radiologia", field_type="radio", select_choices_or_calculations="1, 1 | 2, 2")
+    ]
+
+    record = REDCapNormalizer.normalize_record(
+        extracted_data={},
+        fields=sample_f,
+        record_id="PZ-EMPTY",
+        form_name="radiologia",
+        mark_form_complete=True
+    )
+    # Since extracted_data has 0 non-empty fields, radiologia_complete must NOT be '2'
+    assert "radiologia_complete" not in record
+
+    # When clinical fields exist, it MUST be marked complete
+    record_with_data = REDCapNormalizer.normalize_record(
+        extracted_data={"result_of_mx_birads": "2"},
+        fields=sample_f,
+        record_id="PZ-DATA",
+        form_name="radiologia",
+        mark_form_complete=True
+    )
+    assert record_with_data.get("radiologia_complete") == "2"
+
+
+
 
