@@ -598,6 +598,19 @@ def main():
 
         result = FormClassifier.map_exams(pdf_files, settings=settings)
         display_exam_mapping(result)
+
+        exported = FormClassifier.export_mapping(result, output_path=args.output)
+        if HAS_RICH:
+            console = Console()
+            console.print("[bold green][OK] Mappa salvata nei file di output:[/bold green]")
+            for fmt, path in exported.items():
+                console.print(f"  • [bold]{fmt.upper()}:[/bold] [cyan]{path}[/cyan]")
+            console.print("")
+        else:
+            print("\n[OK] Mappa salvata nei file di output:")
+            for fmt, path in exported.items():
+                print(f"  - {fmt.upper()}: {path}")
+            print("")
         return
 
     # 2. Mode: REDCap Data Quality & Inconsistency Audit

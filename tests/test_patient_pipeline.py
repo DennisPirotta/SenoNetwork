@@ -83,6 +83,17 @@ def test_form_classifier_map_exams(tmp_path):
         assert "[VISITA_CHIRURGICA_SENOLOGICA]" in result["mappings"][0]["display"]
         assert "struttura_della_lesione" in result["mappings"][0]["display"]
 
+        # Test export_mapping
+        exported = FormClassifier.export_mapping(result, output_dir=tmp_path / "out")
+        assert "json" in exported and exported["json"].exists()
+        assert "markdown" in exported and exported["markdown"].exists()
+        assert "VISITA_CHIRURGICA_SENOLOGICA" in exported["markdown"].read_text()
+
+        # Test export_mapping with explicit custom path
+        custom_out = tmp_path / "custom_map.json"
+        exp_custom = FormClassifier.export_mapping(result, output_path=custom_out)
+        assert "json" in exp_custom and exp_custom["json"].exists()
+
 
 def test_dotnet_client_mock():
     client = DotNetApiClient()

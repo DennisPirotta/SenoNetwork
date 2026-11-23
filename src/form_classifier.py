@@ -1,3 +1,5 @@
+from datetime import datetime
+import json
 import logging
 from pathlib import Path
 import re
@@ -132,6 +134,84 @@ class FormClassifier:
             "counts": counts,
             "total": len(mappings)
         }
+
+    @staticmethod
+    def export_mapping(
+        result: Dict[str, Any],
+        output_path: Optional[Union[str, Path]] = None,
+        output_dir: Union[str, Path] = "data/output"
+    ) -> Dict[str, Path]:
+        """Exports exam-to-form mapping result to JSON and Markdown output files.
+        
+        Args:
+            result: The mapping dictionary returned by map_exams().
+            output_path: Optional specific file path for export (.json, .md, or .txt).
+            output_dir: Target directory if output_path is not specified.
+            
+        Returns:
+            Dict containing format names ('json', 'markdown') and their Path objects.
+        """
+        out_dir = Path(output_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        exported: Dict[str, Path] = {}
+
+        if output_path:
+            p = Path(output_path)
+            p.parent.mkdir(parents=True, exist_ok=True)
+            if p.suffix.lower() == ".json":
+                p.write_text(json.dumps(result, indent=2, ensure_ascii=False), encoding="utf-8")
+                exported["json"] = p
+            else:
+                lines = [
+                    "# Mappa Referti Esami -> Form REDCap",
+                    f"Data generazione: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+                    f"Totale referti analizzati: {result.get('total', 0)}\n",
+                    "## Elenco Mappature Esame -> Form REDCap",
+                ]
+                for item in result.get("mappings", []):
+                    lines.append(f"- {item.get('display', '')}")
+
+                lines.append("\n## Riepilogo Contatori per Form REDCap")
+                lines.append("| Form REDCap | Descrizione Clinica | Conteggio Referti | % sul Totale |")
+                lines.append("| :--- | :--- | :---: | :---: |")
+                total = result.get("total", 0)
+                for form_name, cnt in sorted(result.get("counts", {}).items(), key=lambda x: x[1], reverse=True):
+                    pct = (cnt / total * 100) if total > 0 else 0
+                    desc = AVAILABLE_FORMS.get(form_name, "Documento escluso / non senologico" if form_name == "skip" else "-")
+                    lines.append(f"| `{form_name}` | {desc} | **{cnt}** | {pct:.1f}% |")
+
+                p.write_text("\n".join(lines) + "\n", encoding="utf-8")
+                exported["markdown"] = p
+            return exported
+
+        # Default: export both JSON and Markdown
+        json_path = out_dir / "mappa_esami_form.json"
+        json_path.write_text(json.dumps(result, indent=2, ensure_ascii=False), encoding="utf-8")
+        exported["json"] = json_path
+
+        md_path = out_dir / "mappa_esami_form.md"
+        lines = [
+            "# Mappa Referti Esami -> Form REDCap",
+            f"Data generazione: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+            f"Totale referti analizzati: {result.get('total', 0)}\n",
+            "## Elenco Mappature Esame -> Form REDCap",
+        ]
+        for item in result.get("mappings", []):
+            lines.append(f"- {item.get('display', '')}")
+
+        lines.append("\n## Riepilogo Contatori per Form REDCap")
+        lines.append("| Form REDCap | Descrizione Clinica | Conteggio Referti | % sul Totale |")
+        lines.append("| :--- | :--- | :---: | :---: |")
+        total = result.get("total", 0)
+        for form_name, cnt in sorted(result.get("counts", {}).items(), key=lambda x: x[1], reverse=True):
+            pct = (cnt / total * 100) if total > 0 else 0
+            desc = AVAILABLE_FORMS.get(form_name, "Documento escluso / non senologico" if form_name == "skip" else "-")
+            lines.append(f"| `{form_name}` | {desc} | **{cnt}** | {pct:.1f}% |")
+
+        md_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        exported["markdown"] = md_path
+
+        return exported
 
     @staticmethod
     def classify_report(
