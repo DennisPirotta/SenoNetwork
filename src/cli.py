@@ -157,6 +157,95 @@ def display_sync_summary(report: SyncSummaryReport):
         )
 
 
+def display_exam_mapping(result: dict):
+    """Displays the detailed mapping of exams to REDCap forms with counter summary."""
+    from src.form_classifier import AVAILABLE_FORMS
+
+    mappings = result.get("mappings", [])
+    counts = result.get("counts", {})
+    total = result.get("total", len(mappings))
+
+    if HAS_RICH:
+        console = Console()
+        console.print(Panel.fit(
+            "[bold cyan]Mappa Referti Esami -> Form REDCap con Contatori[/bold cyan]\n"
+            f"[dim]Analisi e classificazione su {total} referti clinici[/dim]",
+            border_style="cyan"
+        ))
+
+        # 1. Detailed Table
+        table = Table(title="Dettaglio Associazione Esame -> Form REDCap", show_header=True)
+        table.add_column("#", justify="right", style="dim", width=4)
+        table.add_column("Nome Esame Referto", style="bold yellow")
+        table.add_column("File PDF", style="cyan")
+        table.add_column("Form REDCap Collegato", style="bold green")
+
+        for idx, item in enumerate(mappings, 1):
+            form_col = item["form"]
+            if form_col == "skip":
+                form_style = "[dim red]skip (non senologico)[/dim red]"
+            elif form_col == "struttura_della_lesione":
+                form_style = "[bold green]struttura_della_lesione[/bold green]"
+            elif form_col == "anatomia_patologica":
+                form_style = "[bold magenta]anatomia_patologica[/bold magenta]"
+            elif form_col == "anatomia_patologica_preoperatoria":
+                form_style = "[bold cyan]anatomia_patologica_preoperatoria[/bold cyan]"
+            elif form_col == "radiologia":
+                form_style = "[bold blue]radiologia[/bold blue]"
+            elif form_col == "dati_del_paziente":
+                form_style = "[bold yellow]dati_del_paziente[/bold yellow]"
+            else:
+                form_style = f"[bold white]{form_col}[/bold white]"
+
+            table.add_row(
+                str(idx),
+                f"[{item['exam_name']}]",
+                item["filename"],
+                form_style
+            )
+
+        console.print(table)
+
+        # 1.1 Direct line format listing as requested
+        console.print("\n[bold cyan]Mappatura Dettagliata Esami -> Form REDCap:[/bold cyan]")
+        for item in mappings:
+            console.print(f"  • [bold yellow][{item['exam_name']}][/bold yellow] (file: [cyan]{item['filename']}[/cyan]) -> [bold green]{item['form']}[/bold green]")
+        console.print("")
+
+        # 2. Counter Summary Table
+        cnt_table = Table(title="Riepilogo Contatori per Form REDCap", show_header=True)
+        cnt_table.add_column("Form REDCap", style="bold")
+        cnt_table.add_column("Descrizione Clinica", style="dim")
+        cnt_table.add_column("Conteggio Referti", justify="right", style="bold cyan")
+        cnt_table.add_column("% del Totale", justify="right", style="green")
+
+        sorted_counts = sorted(counts.items(), key=lambda x: x[1], reverse=True)
+        for form_name, cnt in sorted_counts:
+            pct = (cnt / total * 100) if total > 0 else 0
+            desc = AVAILABLE_FORMS.get(form_name, "Documento escluso / non senologico" if form_name == "skip" else "-")
+            name_style = "[dim red]skip[/dim red]" if form_name == "skip" else f"[bold]{form_name}[/bold]"
+            cnt_table.add_row(
+                name_style,
+                desc,
+                str(cnt),
+                f"{pct:.1f}%"
+            )
+
+        console.print(cnt_table)
+        console.print(f"\n[bold]Totale esami referti:[/bold] {total}  |  [bold green]Form attivi:[/bold green] {len([k for k in counts if k != 'skip'])}\n")
+    else:
+        print("\n=== MAPPA REFERTI ESAMI -> FORM REDCAP ===")
+        for idx, item in enumerate(mappings, 1):
+            print(f"{idx}. [{item['exam_name']}] (file: {item['filename']}) -> {item['form']}")
+
+        print("\n--- RIEPILOGO CONTATORI PER FORM ---")
+        sorted_counts = sorted(counts.items(), key=lambda x: x[1], reverse=True)
+        for form_name, cnt in sorted_counts:
+            pct = (cnt / total * 100) if total > 0 else 0
+            print(f"- {form_name}: {cnt} referti ({pct:.1f}%)")
+        print(f"Totale esami analizzati: {total}\n")
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Analizza referti medici in PDF con IA locale (Ollama) ed esporta dati strutturati per REDCap."
@@ -414,6 +503,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Nel sync, esamina tutti i pazienti presenti in REDCap e non solo quelli con form incompleti."
     )
     parser.add_argument(
+        "--map-forms", "--map-exams",
+        action="store_true",
+        dest="map_forms",
+        help="Visualizza la mappa di associazione di ogni esame clinico al form REDCap con contatore e riepilogo."
+    )
+    parser.add_argument(
         "--verbose", "-v",
         action="store_true",
         help="Abilita log dettagliati di debug."
@@ -470,6 +565,39 @@ def main():
         print(f"-> Avvio microservizio HTTP FastAPI per integrazione .NET sulla porta {args.port}...")
         from src.api_server import run_server
         run_server(port=args.port)
+        return
+
+    # 1.1 Mode: Map Exams to REDCap Forms with Counter
+    if args.map_forms:
+        from src.form_classifier import FormClassifier
+        pdf_files = []
+        if args.pdf:
+            p = Path(args.pdf)
+            if p.is_file():
+                pdf_files = [p]
+            elif p.is_dir():
+                pdf_files = sorted(p.glob("*.pdf"))
+            else:
+                pdf_files = PDFExtractor.find_pdf_files(args.pdf)
+        elif args.patient_id:
+            p_dir = settings.downloads_dir / str(args.patient_id)
+            if p_dir.exists():
+                pdf_files = sorted(p_dir.glob("*.pdf"))
+            else:
+                print(f"[WARN] Nessun referto scaricato trovato per il paziente {args.patient_id} in {p_dir}.", file=sys.stderr)
+        else:
+            cand_p1 = settings.downloads_dir / "1"
+            if cand_p1.exists() and list(cand_p1.glob("*.pdf")):
+                pdf_files = sorted(cand_p1.glob("*.pdf"))
+            elif settings.downloads_dir.exists():
+                pdf_files = sorted(settings.downloads_dir.rglob("*.pdf"))
+
+        if not pdf_files:
+            print("[ERRORE] Nessun file PDF trovato per la mappatura degli esami.", file=sys.stderr)
+            sys.exit(1)
+
+        result = FormClassifier.map_exams(pdf_files, settings=settings)
+        display_exam_mapping(result)
         return
 
     # 2. Mode: REDCap Data Quality & Inconsistency Audit

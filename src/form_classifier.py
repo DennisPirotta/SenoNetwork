@@ -1,6 +1,7 @@
 import logging
+from pathlib import Path
 import re
-from typing import Optional
+from typing import Any, Dict, List, Optional, Union
 import requests
 
 from src.config import Settings, get_settings
@@ -36,6 +37,101 @@ FORM_ALIASES = {
 
 class FormClassifier:
     """Classifies a medical PDF report to automatically route it to the appropriate REDCap form."""
+
+    @staticmethod
+    def extract_exam_name(pdf_path_or_hint: Union[str, Path], text: Optional[str] = None) -> str:
+        """Extracts and normalizes the exam/report name from filename or document content.
+        
+        Examples:
+            '20260000552052_VISITA_CHIRURGICA_SENOLOGICA_C.pdf' -> 'VISITA_CHIRURGICA_SENOLOGICA'
+            '20260000004108_VISITA_MULTIDISCIPLINARE_CENTR.pdf' -> 'VISITA_MULTIDISCIPLINARE_CENTR'
+            '20260000035792.pdf' (with text 'Lettera di Dimissione') -> 'LETTERA_DI_DIMISSIONE'
+        """
+        raw_name = Path(pdf_path_or_hint).stem if isinstance(pdf_path_or_hint, (str, Path)) else str(pdf_path_or_hint)
+        
+        # 1. Pattern: {doc_id}_{safe_exam} or evento_{event_id}_{safe_exam}
+        m = re.match(r"^(?:evento_)?\d+_(.+)$", raw_name)
+        if m:
+            exam_part = m.group(1).strip("_")
+            # Normalize trailing hospital visit suffixes (_C = Controllo, _I = Iniziale/Prima visita)
+            cleaned = re.sub(r"_[CI]$", "", exam_part)
+            return cleaned.strip("_")
+
+        # 2. Pattern: _NAME_
+        stripped = raw_name.strip("_")
+        if stripped and not stripped.isdigit():
+            return stripped
+
+        # 3. Fallback: inspect document text headers if provided
+        if text:
+            lower_text = text.lower()
+            lines = [l.strip() for l in text.split("\n") if l.strip()]
+            for l in lines[:6]:
+                lower_line = l.lower()
+                if "lettera di dimissione" in lower_line:
+                    return "LETTERA_DI_DIMISSIONE"
+                if "laboratorio di immunoematologia" in lower_line:
+                    return "LABORATORIO_IMMUNOEMATOLOGIA"
+                if "laboratorio clinico generale" in lower_line:
+                    return "LABORATORIO_ANALISI"
+                if "diagnostica per immagini" in lower_line:
+                    return "DIAGNOSTICA_PER_IMMAGINI"
+                if "anatomia patologica" in lower_line:
+                    return "ANATOMIA_PATOLOGICA"
+                if "cardiologia" in lower_line or "elettrocardiogramma" in lower_line:
+                    return "ECG"
+
+            if "lettera di dimissione" in lower_text:
+                return "LETTERA_DI_DIMISSIONE"
+            if "verbale operatorio" in lower_text:
+                return "VERBALE_OPERATORIO"
+            if "visita chirurgica senologica" in lower_text:
+                return "VISITA_CHIRURGICA_SENOLOGICA"
+
+        return stripped or "ESAME_CLINICO"
+
+    @staticmethod
+    def map_exams(
+        pdf_paths: List[Path],
+        settings: Optional[Settings] = None
+    ) -> Dict[str, Any]:
+        """Maps a collection of PDF exam reports to their target REDCap forms with counters.
+        
+        Returns:
+            Dict containing:
+                - 'mappings': list of dicts with exam_name, filename, form, display string
+                - 'counts': dict mapping form_name -> count of exams
+                - 'total': total number of exams analyzed
+        """
+        from src.pdf_extractor import PDFExtractor
+
+        mappings = []
+        counts: Dict[str, int] = {}
+
+        for pdf_path in pdf_paths:
+            try:
+                text = PDFExtractor.extract_text(pdf_path)
+            except Exception:
+                text = ""
+
+            exam_name = FormClassifier.extract_exam_name(pdf_path, text)
+            form = FormClassifier.classify_report(text=text, hint=pdf_path.name, settings=settings)
+
+            display_str = f"[{exam_name}] (file: {pdf_path.name}) -> {form}"
+            mappings.append({
+                "exam_name": exam_name,
+                "filename": pdf_path.name,
+                "path": str(pdf_path),
+                "form": form,
+                "display": display_str
+            })
+            counts[form] = counts.get(form, 0) + 1
+
+        return {
+            "mappings": mappings,
+            "counts": counts,
+            "total": len(mappings)
+        }
 
     @staticmethod
     def classify_report(
@@ -87,19 +183,9 @@ class FormClassifier:
         ):
             return "skip"
 
-        # 2. Multidisciplinary consultation (MDM pre/post meeting dates -> dati_del_paziente)
-        if (
-            "multidisciplinare" in lower_hint
-            or "visita senologica multidisciplinare" in lower_text
-            or "visita multidisciplinare" in lower_text
-            or "meeting multidisciplinare" in lower_text
-            or "riunione multidisciplinare" in lower_text
-        ):
-            return "dati_del_paziente"
-
-        # 3. Check explicit hint (e.g. from .NET API metadata or filename)
+        # 2. Check explicit hint (e.g. from .NET API metadata, exam name or filename)
         if hint:
-            # 3.1 Chirurgia Senologica -> collega SEMPRE a 'struttura_della_lesione'
+            # 2.1 Chirurgia Senologica -> collega SEMPRE a 'struttura_della_lesione'
             chirurgia_senologica_hints = [
                 "chirurgia senologica",
                 "chirurgia_senologica",
@@ -118,8 +204,12 @@ class FormClassifier:
                 "dimissione",
             ]
             if any(term in lower_hint for term in chirurgia_senologica_hints):
-                if not ("istolog" in lower_hint or "e_i_c" in lower_hint or "esame istologico" in lower_hint or "anatomia patologica" in lower_hint or "core biopsy" in lower_hint or "agobiops" in lower_hint):
+                if not any(h in lower_hint for h in ["istolog", "e_i_c", "esame istologico", "anatomia patologica", "core biopsy", "agobiops"]):
                     return "struttura_della_lesione"
+
+            # 2.2 Multidisciplinare
+            if "multidisciplinare" in lower_hint:
+                return "dati_del_paziente"
 
             for form_key in AVAILABLE_FORMS.keys():
                 if form_key in lower_hint:
@@ -129,40 +219,34 @@ class FormClassifier:
                 if alias_term in lower_hint:
                     return target_form
 
-            if "biops" in lower_hint or "core" in lower_hint or "fna" in lower_hint or "agobiopt" in lower_hint or "agoaspirat" in lower_hint:
+            if any(b in lower_hint for b in ["biops", "core", "fna", "agobiopt", "agoaspirat"]):
                 return "anatomia_patologica_preoperatoria"
-            if "istolog" in lower_hint or "definitiv" in lower_hint or "recettore" in lower_hint or "estrogen" in lower_hint or "progesteron" in lower_hint or "sentinella" in lower_hint or "osna" in lower_hint or "bls" in lower_hint or "mastec" in lower_hint:
+            if any(i in lower_hint for i in ["istolog", "definitiv", "recettore", "estrogen", "progesteron", "sentinella", "osna", "bls", "mastec", "e_i_c"]):
                 return "anatomia_patologica"
-            if "mammo" in lower_hint or "eco" in lower_hint or "rmn" in lower_hint or "mri" in lower_hint or "marcatura" in lower_hint:
+            if any(r in lower_hint for r in ["mammo", "eco", "rmn", "mri", "marcatura"]):
                 return "radiologia"
             if "visita" in lower_hint:
+                if "diagnostica per immagini" in lower_text or "mammografia" in lower_text or "eco mammaria" in lower_text:
+                    return "radiologia"
                 return "dati_del_paziente"
 
-        # 4. Heuristic rules based on clinical text keywords
-        # Biopsia / Citologia pre-operatoria
+        # 3. Heuristic rules based on clinical text keywords
+        # 3.1 Chirurgia Senologica / Verbale operatorio / Lettera di dimissione
         if (
-            ("frustoli" in lower_text or "agobioptici" in lower_text or "core biopsy" in lower_text or "agobiopsia" in lower_text)
-            or ("agoaspirato" in lower_text and ("fna" in lower_text or "citologico" in lower_text or "c1" in lower_text or "c2" in lower_text or "c3" in lower_text or "c4" in lower_text or "c5" in lower_text))
-            or "esame citologico da agoaspirat" in lower_text
-        ):
-            return "anatomia_patologica_preoperatoria"
-
-        # Chirurgia Senologica / Verbale operatorio / Lettera di dimissione
-        if (
-            "chirurgia senologica" in lower_text
+            "lettera di dimissione" in lower_text
+            or "verbale operatorio" in lower_text
+            or "chirurgia senologica" in lower_text
             or "chirurgica senologica" in lower_text
             or "senologia chirurgica" in lower_text
             or "u.o. chirurgia senologica" in lower_text
             or "reparto di chirurgia senologica" in lower_text
-            or "verbale operatorio" in lower_text
-            or "lettera di dimissione" in lower_text
             or "tempo chirurgico" in lower_text
             or "visita chirurgica senologica" in lower_text
             or "intervento chirurgico senologico" in lower_text
         ) and ("diagnosi istopatologica" not in lower_text and "frustoli" not in lower_text):
             return "struttura_della_lesione"
 
-        # Istologico definitivo post-operatorio e biologia molecolare / OSNA
+        # 3.2 Istologico definitivo post-operatorio e biologia molecolare / OSNA
         if (
             ("pezzo operatorio" in lower_text or "quadrantectomia" in lower_text or "mastectomia" in lower_text or "istologico definitivo" in lower_text or "diagnosi istopatologica" in lower_text)
             and ("margini" in lower_text or "pt" in lower_text or "pn" in lower_text or "linfonodo sentinella" in lower_text or "ptis" in lower_text)
@@ -172,13 +256,30 @@ class FormClassifier:
         ):
             return "anatomia_patologica"
 
-        # Radiologia
+        # 3.3 Biopsia / Citologia pre-operatoria
+        if (
+            ("frustoli" in lower_text or "agobioptici" in lower_text or "core biopsy" in lower_text or "agobiopsia" in lower_text)
+            or ("agoaspirato" in lower_text and ("fna" in lower_text or "citologico" in lower_text or "c1" in lower_text or "c2" in lower_text or "c3" in lower_text or "c4" in lower_text or "c5" in lower_text))
+            or "esame citologico da agoaspirat" in lower_text
+        ):
+            return "anatomia_patologica_preoperatoria"
+
+        # 3.4 Radiologia
         if (
             ("mammografia" in lower_text or "tomosintesi" in lower_text or "ecografia mammaria" in lower_text or "marcatura" in lower_text)
             and ("bi-rads" in lower_text or "birads" in lower_text or "densità parenchimale" in lower_text or "radiologico" in lower_text or "ecostrutturato" in lower_text)
             and "frustoli" not in lower_text
         ):
             return "radiologia"
+
+        # 3.5 Visita / Meeting multidisciplinare
+        if (
+            "visita senologica multidisciplinare" in lower_text
+            or "visita multidisciplinare" in lower_text
+            or "meeting multidisciplinare" in lower_text
+            or "riunione multidisciplinare" in lower_text
+        ):
+            return "dati_del_paziente"
 
         # Radioterapia
         if "radioterapia" in lower_text and ("gray" in lower_text or "gy" in lower_text or "irradiazione" in lower_text):

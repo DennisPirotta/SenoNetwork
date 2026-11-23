@@ -60,6 +60,30 @@ def test_form_classifier_chirurgia_senologica_text():
     assert FormClassifier.classify_report(text_chirurgia) == "struttura_della_lesione"
 
 
+def test_extract_exam_name():
+    assert FormClassifier.extract_exam_name("20260000552052_VISITA_CHIRURGICA_SENOLOGICA_C.pdf") == "VISITA_CHIRURGICA_SENOLOGICA"
+    assert FormClassifier.extract_exam_name("20260000045758_VISITA_CHIRURGICA_SENOLOGICA_I.pdf") == "VISITA_CHIRURGICA_SENOLOGICA"
+    assert FormClassifier.extract_exam_name("20260000004108_VISITA_MULTIDISCIPLINARE_CENTR.pdf") == "VISITA_MULTIDISCIPLINARE_CENTR"
+    assert FormClassifier.extract_exam_name("_AGOASPIRATO_DELLA_MAMMELLA_DX_.pdf") == "AGOASPIRATO_DELLA_MAMMELLA_DX"
+    assert FormClassifier.extract_exam_name("20260000035792.pdf", text="Lettera di Dimissione\nEgregio collega") == "LETTERA_DI_DIMISSIONE"
+    assert FormClassifier.extract_exam_name("20260000015761.pdf", text="LABORATORIO DI IMMUNOEMATOLOGIA\nACCARDI") == "LABORATORIO_IMMUNOEMATOLOGIA"
+
+
+def test_form_classifier_map_exams(tmp_path):
+    f1 = tmp_path / "20260000552052_VISITA_CHIRURGICA_SENOLOGICA_C.pdf"
+    f2 = tmp_path / "20260000015257_ECG.pdf"
+    f1.write_bytes(b"%PDF-dummy")
+    f2.write_bytes(b"%PDF-dummy")
+
+    with patch("src.pdf_extractor.PDFExtractor.extract_text", return_value="dummy"):
+        result = FormClassifier.map_exams([f1, f2])
+        assert result["total"] == 2
+        assert "struttura_della_lesione" in result["counts"]
+        assert "skip" in result["counts"]
+        assert "[VISITA_CHIRURGICA_SENOLOGICA]" in result["mappings"][0]["display"]
+        assert "struttura_della_lesione" in result["mappings"][0]["display"]
+
+
 def test_dotnet_client_mock():
     client = DotNetApiClient()
     # In mock mode, if not configured, reads from local directory
