@@ -79,7 +79,7 @@ class BaseAIExtractor(ABC):
         report_text: str
     ) -> Tuple[str, str, Dict[str, Any]]:
         """Constructs system prompt, user prompt, and JSON Schema."""
-        json_schema = SchemaBuilder.build_json_schema(fields)
+        json_schema = SchemaBuilder.build_json_schema(fields, enforce_all_required=True)
         guidelines = SchemaBuilder.build_prompt_guidelines(fields)
 
         user_prompt = (
