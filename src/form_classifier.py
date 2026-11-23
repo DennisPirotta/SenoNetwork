@@ -11,11 +11,26 @@ AVAILABLE_FORMS = {
     "radiologia": "Indagini radiologiche (Mammografia, Ecografia, Risonanza Magnetica, Tomosintesi, BI-RADS)",
     "anatomia_patologica_preoperatoria": "Biopsie pre-operatorie (Core Biopsy, Agobiopsia con frustoli, Agoaspirato FNA, B-classification B1-B5)",
     "anatomia_patologica": "Esame istologico definitivo post-operatorio su pezzo chirurgico (Quadrantectomia, Mastectomia, pTNM, OSNA)",
-    "struttura_della_lesione": "Verbale operatorio e chirurgia senologica (Tipo di intervento, chirurgia oncoplastica, chirurgia ascellare)",
+    "struttura_della_lesione": "Chirurgia Senologica e verbale operatorio (Tipo di intervento, chirurgia oncoplastica, chirurgia ascellare)",
     "dati_del_paziente": "Anagrafica, prima visita senologica, familiarità, indagine genetica BRCA, comorbidità",
     "chemioterapia": "Oncologia medica (Chemioterapia neoadiuvante/adiuvante, terapia ormonale, farmaci biologici)",
     "radioterapia": "Trattamento radioterapico (Dosi Gy, frazionamento, volume irradiato)",
     "recidiva": "Monitoraggio recidiva loco-regionale o a distanza"
+}
+
+# Mapping esplicito di alias e denominazioni cliniche verso i form REDCap
+FORM_ALIASES = {
+    "chirurgia senologica": "struttura_della_lesione",
+    "chirurgia_senologica": "struttura_della_lesione",
+    "chirurgica senologica": "struttura_della_lesione",
+    "chirurgica_senologica": "struttura_della_lesione",
+    "senologia chirurgica": "struttura_della_lesione",
+    "senologia_chirurgica": "struttura_della_lesione",
+    "visita chirurgica senologica": "struttura_della_lesione",
+    "visita_chirurgica_senologica": "struttura_della_lesione",
+    "verbale operatorio": "struttura_della_lesione",
+    "verbale_operatorio": "struttura_della_lesione",
+    "chirurgia": "struttura_della_lesione",
 }
 
 
@@ -84,15 +99,40 @@ class FormClassifier:
 
         # 3. Check explicit hint (e.g. from .NET API metadata or filename)
         if hint:
+            # 3.1 Chirurgia Senologica -> collega SEMPRE a 'struttura_della_lesione'
+            chirurgia_senologica_hints = [
+                "chirurgia senologica",
+                "chirurgia_senologica",
+                "chirurgica senologica",
+                "chirurgica_senologica",
+                "senologia chirurgica",
+                "senologia_chirurgica",
+                "visita chirurgica senologica",
+                "visita_chirurgica_senologica",
+                "chirurgia",
+                "chirurg",
+                "verbale operatorio",
+                "verbale_operatorio",
+                "intervent",
+                "operatori",
+                "dimissione",
+            ]
+            if any(term in lower_hint for term in chirurgia_senologica_hints):
+                if not ("istolog" in lower_hint or "e_i_c" in lower_hint or "esame istologico" in lower_hint or "anatomia patologica" in lower_hint or "core biopsy" in lower_hint or "agobiops" in lower_hint):
+                    return "struttura_della_lesione"
+
             for form_key in AVAILABLE_FORMS.keys():
                 if form_key in lower_hint:
                     return form_key
+
+            for alias_term, target_form in FORM_ALIASES.items():
+                if alias_term in lower_hint:
+                    return target_form
+
             if "biops" in lower_hint or "core" in lower_hint or "fna" in lower_hint or "agobiopt" in lower_hint or "agoaspirat" in lower_hint:
                 return "anatomia_patologica_preoperatoria"
             if "istolog" in lower_hint or "definitiv" in lower_hint or "recettore" in lower_hint or "estrogen" in lower_hint or "progesteron" in lower_hint or "sentinella" in lower_hint or "osna" in lower_hint or "bls" in lower_hint or "mastec" in lower_hint:
                 return "anatomia_patologica"
-            if "chirurg" in lower_hint or "intervent" in lower_hint or "operatori" in lower_hint or "dimissione" in lower_hint:
-                return "struttura_della_lesione"
             if "mammo" in lower_hint or "eco" in lower_hint or "rmn" in lower_hint or "mri" in lower_hint or "marcatura" in lower_hint:
                 return "radiologia"
             if "visita" in lower_hint:
@@ -107,6 +147,21 @@ class FormClassifier:
         ):
             return "anatomia_patologica_preoperatoria"
 
+        # Chirurgia Senologica / Verbale operatorio / Lettera di dimissione
+        if (
+            "chirurgia senologica" in lower_text
+            or "chirurgica senologica" in lower_text
+            or "senologia chirurgica" in lower_text
+            or "u.o. chirurgia senologica" in lower_text
+            or "reparto di chirurgia senologica" in lower_text
+            or "verbale operatorio" in lower_text
+            or "lettera di dimissione" in lower_text
+            or "tempo chirurgico" in lower_text
+            or "visita chirurgica senologica" in lower_text
+            or "intervento chirurgico senologico" in lower_text
+        ) and ("diagnosi istopatologica" not in lower_text and "frustoli" not in lower_text):
+            return "struttura_della_lesione"
+
         # Istologico definitivo post-operatorio e biologia molecolare / OSNA
         if (
             ("pezzo operatorio" in lower_text or "quadrantectomia" in lower_text or "mastectomia" in lower_text or "istologico definitivo" in lower_text or "diagnosi istopatologica" in lower_text)
@@ -116,10 +171,6 @@ class FormClassifier:
             or "stadiazione istopatologica" in lower_text
         ):
             return "anatomia_patologica"
-
-        # Chirurgia / Lettera di dimissione
-        if "verbale operatorio" in lower_text or "lettera di dimissione" in lower_text or "tempo chirurgico" in lower_text or "visita chirurgica senologica" in lower_text:
-            return "struttura_della_lesione"
 
         # Radiologia
         if (
@@ -148,7 +199,7 @@ class FormClassifier:
                 "- radiologia (esami mammografici, ecografie, RM)\n"
                 "- anatomia_patologica_preoperatoria (agobiopsie, core biopsy, agoaspirati pre-intervento)\n"
                 "- anatomia_patologica (esame istologico definitivo post-operatorio su pezzo chirurgico)\n"
-                "- struttura_della_lesione (verbale di chirurgia senologica, lettera di dimissione)\n"
+                "- struttura_della_lesione (Chirurgia Senologica, verbale operatorio, lettera di dimissione, tipo intervento chirurgico)\n"
                 "- chemioterapia (oncologia medica)\n"
                 "- radioterapia (trattamento radiante)\n"
                 "- dati_del_paziente (anamnesi, prima visita, riunioni multidisciplinari)\n\n"

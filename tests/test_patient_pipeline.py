@@ -42,6 +42,22 @@ def test_form_classifier_hint():
     assert FormClassifier.classify_report("qualsiasi testo", hint="mammografia_dx.pdf") == "radiologia"
     assert FormClassifier.classify_report("qualsiasi testo", hint="core_biopsy_sinistra.pdf") == "anatomia_patologica_preoperatoria"
     assert FormClassifier.classify_report("qualsiasi testo", hint="istologico_definitivo.pdf") == "anatomia_patologica"
+    assert FormClassifier.classify_report("qualsiasi testo", hint="chirurgia_senologica.pdf") == "struttura_della_lesione"
+    assert FormClassifier.classify_report("qualsiasi testo", hint="Chirurgia Senologica.pdf") == "struttura_della_lesione"
+    assert FormClassifier.classify_report("qualsiasi testo", hint="20260000092952_VISITA_CHIRURGICA_SENOLOGICA_C.pdf") == "struttura_della_lesione"
+    assert FormClassifier.classify_report("qualsiasi testo", hint="intervento_chirurgia_senologica_dx.pdf") == "struttura_della_lesione"
+    assert FormClassifier.classify_report("qualsiasi testo", hint="verbale_operatorio.pdf") == "struttura_della_lesione"
+
+
+def test_form_classifier_chirurgia_senologica_text():
+    text_chirurgia = """
+    PRESIDIO OSPEDALIERO VALDUCE - COMO
+    U.O. CHIRURGIA SENOLOGICA
+    VERBALE OPERATORIO
+    Intervento: Quadrantectomia QSE mammella sinistra con biopsia del linfonodo sentinella.
+    Decorso operatorio regolare.
+    """
+    assert FormClassifier.classify_report(text_chirurgia) == "struttura_della_lesione"
 
 
 def test_dotnet_client_mock():
