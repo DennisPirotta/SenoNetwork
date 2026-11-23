@@ -141,3 +141,43 @@ def test_get_ai_extractor_factory():
     settings_ollama = Settings(ai_backend="ollama")
     extractor_ollama = get_ai_extractor(settings_ollama)
     assert isinstance(extractor_ollama, OllamaExtractor)
+
+
+def test_llamacpp_extract_streaming_sse(sample_fields):
+    """Verifies that LlamaCppExtractor properly reassembles SSE streaming chunks."""
+    ext = LlamaCppExtractor(base_url="http://localhost:8080", api_mode="chat")
+
+    mock_llm_json = {
+        "record_id": "PZ-STREAM",
+        "result_of_mx_birads": "3",
+        "palpable_lesion": "1"
+    }
+    json_str = json.dumps(mock_llm_json)
+
+    # Simulate SSE lines
+    sse_lines = [
+        b'data: {"choices":[{"delta":{"content":"{\\"record_id\\": "}}]}',
+        b'data: {"choices":[{"delta":{"content":"\\"PZ-STREAM\\", "}}]}',
+        b'data: {"choices":[{"delta":{"content":"\\"result_of_mx_birads\\": \\"3\\", "}}]}',
+        b'data: {"choices":[{"delta":{"content":"\\"palpable_lesion\\": \\"1\\"}"}}]}',
+        b'data: [DONE]'
+    ]
+
+    mock_response = MagicMock()
+    mock_response.status_code = 200
+    mock_response.headers = {"content-type": "text/event-stream; charset=utf-8"}
+    mock_response.iter_lines.return_value = sse_lines
+
+    with patch("requests.post", return_value=mock_response):
+        result = ext.extract_from_text(
+            report_text="Reperto probabilmente benigno BIRADS 3.",
+            fields=sample_fields,
+            record_id="PZ-STREAM",
+            form_name="radiologia"
+        )
+
+    assert result.status == "success"
+    assert result.extracted_data["result_of_mx_birads"] == "3"
+    assert result.redcap_record["result_of_mx_birads"] == "3"
+    assert result.redcap_record["palpable_lesion"] == "1"
+

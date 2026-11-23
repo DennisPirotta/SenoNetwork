@@ -256,3 +256,39 @@ def test_search_patient_compound_permutation_fallback(mock_priamo_settings):
             assert p.codice_fiscale == "JMRLRS74P42Z611W"
             assert p.comune_nascita == "PERU'"
 
+
+def test_get_event_documents_post_csrf(mock_priamo_settings):
+    """Verifica che get_event_documents esegua una POST con IdEvento e header CSRF."""
+    client = PriamoClient(settings=mock_priamo_settings)
+    client._ces_token = "mock_csrf_token_123"
+
+    mock_resp = MagicMock()
+    mock_resp.status_code = 200
+    mock_resp.json.return_value = {
+        "documenti": [
+            {
+                "idDocumento": "20260000033482",
+                "idEvento": "26784078",
+                "stato": "FIRMATO",
+                "tipoDocumento": "LAB",
+                "versione": "1",
+                "natura": "01",
+                "repository": "S",
+            }
+        ]
+    }
+
+    with patch.object(client, "authenticate"):
+        with patch.object(client, "_request", return_value=mock_resp) as mock_req:
+            docs = client.get_event_documents("26784078")
+            assert len(docs) == 1
+            assert docs[0]["idDocumento"] == "20260000033482"
+
+            method, url = mock_req.call_args[0]
+            assert method == "POST"
+            kwargs = mock_req.call_args[1]
+            assert kwargs["data"] == {"IdEvento": "26784078"}
+            assert kwargs["headers"]["RequestVerificationToken"] == "mock_csrf_token_123"
+            assert kwargs["headers"]["Content-Type"] == "application/x-www-form-urlencoded; charset=UTF-8"
+
+

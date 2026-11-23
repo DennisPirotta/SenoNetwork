@@ -26,9 +26,7 @@ class SchemaBuilder:
             if not field.is_extractable:
                 continue
 
-            field_desc = (field.field_label or field.field_name).strip().replace("\n", " ")
-            if len(field_desc) > 60:
-                field_desc = field_desc[:57] + "..."
+            field_desc = field.field_label.strip().replace("\n", " ")
 
             # Dropdown / Radio single choice
             if field.field_type in {"dropdown", "radio"}:

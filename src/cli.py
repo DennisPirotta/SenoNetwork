@@ -659,15 +659,22 @@ def main():
         from src.patient_pipeline import PatientPipeline
         pipeline = PatientPipeline(settings=settings)
 
-        # Se non è specificato patient_id, cerca se esiste già su REDCap per mantenerne il record_id nativo
+        # Se non è specificato patient_id, cerca se esiste già su REDCap per mantenerne il record_id nativo,
+        # altrimenti genera automaticamente il prossimo record_id numerico nativo da REDCap
         p_id = args.patient_id
-        if not p_id and args.name and args.surname and settings.redcap_api_url and settings.redcap_api_token:
-            matched_id = pipeline.redcap_service.find_record_id_by_demographics(
-                args.name, args.surname, args.dob
-            )
-            if matched_id:
-                p_id = matched_id
-                print(f"-> Mantenuto record_id nativo di REDCap: [bold cyan]{p_id}[/bold cyan]")
+        if settings.redcap_api_url and settings.redcap_api_token:
+            if not p_id and args.name and args.surname:
+                matched_id = pipeline.redcap_service.find_record_id_by_demographics(
+                    args.name, args.surname, args.dob, numeric_only=True
+                )
+                if matched_id:
+                    p_id = matched_id
+                    print(f"-> Mantenuto record_id nativo di REDCap: [bold cyan]{p_id}[/bold cyan]")
+            if not p_id:
+                next_id = pipeline.redcap_service.generate_next_record_name()
+                if next_id:
+                    p_id = next_id
+                    print(f"-> Generato automaticamente record_id numerico da REDCap: [bold cyan]{p_id}[/bold cyan]")
 
         if not p_id:
             p_id = f"{args.name}-{args.surname}-{args.dob or 'unknown'}".lower().replace(" ", "-")
@@ -858,11 +865,16 @@ def main():
         target_id = p.patient_id
         if settings.redcap_api_url and settings.redcap_api_token:
             matched_id = pipeline.redcap_service.find_record_id_by_demographics(
-                p.nome or "", p.cognome, p.data_nascita
+                p.nome or "", p.cognome, p.data_nascita, numeric_only=True
             )
             if matched_id:
                 target_id = matched_id
                 print(f"-> Mantenuto record_id nativo di REDCap: '{matched_id}' per {p.nome} {p.cognome}")
+            else:
+                next_id = pipeline.redcap_service.generate_next_record_name()
+                if next_id:
+                    target_id = next_id
+                    print(f"-> Generato automaticamente record_id numerico da REDCap: '{next_id}' per {p.nome} {p.cognome}")
 
         print(
             f"\n[{idx}/{len(pazienti)}] Elaborazione: {p.nome or ''} {p.cognome} ({p.data_nascita or 'N.D.'}) -> ID: {target_id}")

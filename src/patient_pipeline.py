@@ -160,22 +160,44 @@ class PatientPipeline:
         """Executes the complete pipeline for a single patient."""
         start_time = time.time()
 
-        # Mantenimento del record_id nativo di REDCap:
-        # Se il paziente esiste già su REDCap (verificato tramite nome, cognome e data di nascita),
-        # riutilizza tassativamente il record_id di REDCap per evitare la creazione di duplicati.
+        # Mantenimento o generazione automatica del record_id numerico di REDCap:
+        # Se il paziente esiste già su REDCap con un record_id, lo mantiene per evitare duplicati.
+        # Se l'identificatore è lo slug nome-cognome-dob, genera automaticamente il prossimo record_id numerico da REDCap.
         try:
-            if name and surname and self.redcap_service.api_url and self.redcap_service.api_token:
-                matched_redcap_id = self.redcap_service.find_record_id_by_demographics(
-                    name=name, surname=surname, date_of_birth=date_of_birth
-                )
-                if matched_redcap_id and matched_redcap_id != str(patient_id):
-                    logger.info(
-                        f"-> Mantenuto record_id nativo di REDCap: '{matched_redcap_id}' "
-                        f"(invece dell'identificatore transitorio '{patient_id}')"
+            if self.redcap_service.api_url and self.redcap_service.api_token:
+                matched_redcap_id = None
+                if name and surname:
+                    matched_redcap_id = self.redcap_service.find_record_id_by_demographics(
+                        name=name, surname=surname, date_of_birth=date_of_birth
                     )
-                    patient_id = matched_redcap_id
+                if matched_redcap_id:
+                    if matched_redcap_id != str(patient_id):
+                        logger.info(
+                            f"-> Mantenuto record_id nativo di REDCap: '{matched_redcap_id}' "
+                            f"(invece dell'identificatore transitorio '{patient_id}')"
+                        )
+                        patient_id = matched_redcap_id
+                elif not patient_id:
+                    next_id = self.redcap_service.generate_next_record_name()
+                    if next_id:
+                        patient_id = next_id
+                else:
+                    # Controlla se patient_id è lo slug generato da nome-cognome-data_nascita
+                    slug_candidate = ""
+                    if name and surname:
+                        d_str = date_of_birth.strftime("%Y-%m-%d") if isinstance(date_of_birth, date) else str(date_of_birth or "")
+                        slug_candidate = re.sub(r"[^a-z0-9\-]", "", f"{name}-{surname}-{d_str}".lower().replace(" ", "-"))
+
+                    if slug_candidate and str(patient_id).lower() == slug_candidate:
+                        next_id = self.redcap_service.generate_next_record_name()
+                        if next_id:
+                            logger.info(
+                                f"-> Assegnato record_id numerico da REDCap: '{next_id}' "
+                                f"(sostituisce slug '{patient_id}')"
+                            )
+                            patient_id = next_id
         except Exception as e:
-            logger.debug(f"Verifica record_id REDCap su anagrafica non riuscita: {e}")
+            logger.debug(f"Verifica o generazione record_id REDCap non riuscita: {e}")
 
         logger.info(f"=== INIZIO PIPELINE PER PAZIENTE: {patient_id} ({name or ''} {surname or ''}) ===")
 

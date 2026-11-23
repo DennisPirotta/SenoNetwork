@@ -256,7 +256,10 @@ class LlamaCppExtractor(BaseAIExtractor):
         user_prompt: str,
         json_schema: Dict[str, Any]
     ) -> str:
-        """Communicates with llama.cpp using either /v1/chat/completions or /completion endpoint."""
+        """Communicates with llama.cpp using either /v1/chat/completions or /completion endpoint.
+        Uses HTTP streaming (stream=True) to stream tokens via SSE, bypassing Cloudflare's
+        100-second idle gateway timeout (HTTP 524) while preserving full response text.
+        """
         if self.api_mode == "completion":
             endpoint = f"{self.base_url}/completion"
             full_prompt = (
@@ -269,12 +272,34 @@ class LlamaCppExtractor(BaseAIExtractor):
                 "temperature": self.temperature,
                 "json_schema": json_schema,
                 "n_predict": 4096,
-                "stream": False
+                "stream": True
             }
-            response = requests.post(endpoint, json=payload, headers=self.headers, timeout=self.timeout_seconds)
+            response = requests.post(endpoint, json=payload, headers=self.headers, stream=True, timeout=self.timeout_seconds)
             response.raise_for_status()
-            res_json = response.json()
-            return res_json.get("content", "")
+
+            # Support both streaming SSE response and standard JSON (fallback/mock)
+            content_type = response.headers.get("content-type", "").lower()
+            if "text/event-stream" in content_type:
+                collected = []
+                for line in response.iter_lines():
+                    if not line:
+                        continue
+                    decoded = line.decode("utf-8") if isinstance(line, bytes) else line
+                    if decoded.startswith("data: "):
+                        raw_data = decoded[6:].strip()
+                        if raw_data == "[DONE]":
+                            break
+                        try:
+                            chunk = json.loads(raw_data)
+                            c = chunk.get("content", "")
+                            if c:
+                                collected.append(c)
+                        except Exception:
+                            pass
+                return "".join(collected)
+            else:
+                res_json = response.json()
+                return res_json.get("content", "")
 
         # OpenAI-compatible /v1/chat/completions
         endpoint = f"{self.base_url}/v1/chat/completions"
@@ -289,17 +314,40 @@ class LlamaCppExtractor(BaseAIExtractor):
                 "type": "json_object",
                 "schema": json_schema
             },
-            "stream": False
+            "stream": True
         }
-        response = requests.post(endpoint, json=payload, headers=self.headers, timeout=self.timeout_seconds)
+        response = requests.post(endpoint, json=payload, headers=self.headers, stream=True, timeout=self.timeout_seconds)
         if response.status_code != 200:
             # Fallback to general json_object if schema format argument unsupported
             payload["response_format"] = {"type": "json_object"}
-            response = requests.post(endpoint, json=payload, headers=self.headers, timeout=self.timeout_seconds)
+            response = requests.post(endpoint, json=payload, headers=self.headers, stream=True, timeout=self.timeout_seconds)
 
         response.raise_for_status()
-        res_json = response.json()
-        return res_json["choices"][0]["message"]["content"]
+
+        # Support both streaming SSE response and standard JSON (fallback/mock)
+        content_type = response.headers.get("content-type", "").lower()
+        if "text/event-stream" in content_type:
+            collected = []
+            for line in response.iter_lines():
+                if not line:
+                    continue
+                decoded = line.decode("utf-8") if isinstance(line, bytes) else line
+                if decoded.startswith("data: "):
+                    raw_data = decoded[6:].strip()
+                    if raw_data == "[DONE]":
+                        break
+                    try:
+                        chunk = json.loads(raw_data)
+                        delta = chunk.get("choices", [{}])[0].get("delta", {})
+                        c = delta.get("content", "")
+                        if c:
+                            collected.append(c)
+                    except Exception:
+                        pass
+            return "".join(collected)
+        else:
+            res_json = response.json()
+            return res_json["choices"][0]["message"]["content"]
 
 
 class OllamaExtractor(BaseAIExtractor):

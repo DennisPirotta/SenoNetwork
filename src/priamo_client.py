@@ -158,6 +158,7 @@ class PriamoClient:
         self.session.mount("http://", adapter)
 
         self._authenticated = False
+        self._ces_token: Optional[str] = None
 
     @property
     def is_configured(self) -> bool:
@@ -185,6 +186,9 @@ class PriamoClient:
         with self._auth_lock:
             if self._authenticated and not force:
                 return
+
+            if force:
+                self._ces_token = None
 
             if not self.is_configured:
                 raise ValueError("Credenziali Priamo incomplete in configurazione o .env")
@@ -460,10 +464,41 @@ class PriamoClient:
         res_json = response.json()
         return res_json.get("eventi", [])
 
+    def _get_ces_verification_token(self) -> Optional[str]:
+        """Retrieves and caches the Anti-Forgery RequestVerificationToken from PriamoCES."""
+        if self._ces_token:
+            return self._ces_token
+        try:
+            resp = self._request("GET", self.ces_url)
+            m = re.search(r'priamoMasterPage\.site\.requestVerificationToken\s*=\s*[\'\"]([^\'\"]+)[\'\"]', resp.text)
+            if m and m.group(1).strip():
+                self._ces_token = m.group(1).strip()
+                return self._ces_token
+            if BeautifulSoup:
+                soup = BeautifulSoup(resp.text, "html.parser")
+                inp = soup.find("input", {"name": "__RequestVerificationToken"})
+                if inp and inp.get("value"):
+                    self._ces_token = str(inp.get("value"))
+                    return self._ces_token
+        except Exception as e:
+            logger.warning(f"Impossibile estrarre RequestVerificationToken da PriamoCES: {e}")
+        return None
+
     def get_event_documents(self, event_id: str) -> List[Dict[str, Any]]:
-        """Retrieves documents linked to a specific event in Priamo."""
+        """Retrieves documents linked to a specific event in Priamo using POST and CSRF token."""
         self.authenticate()
-        response = self._request("GET", self.get_documento_url, params={"idEvento": str(event_id)})
+        token = self._get_ces_verification_token()
+        headers = {
+            "Accept": "application/json, text/javascript, */*; q=0.01",
+            "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+            "X-Requested-With": "XMLHttpRequest",
+            "Referer": f"{self.ces_url}/EventiView/Eventi",
+        }
+        if token:
+            headers["RequestVerificationToken"] = token
+
+        payload = {"IdEvento": str(event_id)}
+        response = self._request("POST", self.get_documento_url, data=payload, headers=headers)
         res_json = response.json()
         return res_json.get("documenti", [])
 
@@ -476,12 +511,13 @@ class PriamoClient:
         event_type: Optional[str] = None,
         preferred_stato: Optional[str] = None,
         versione: Union[int, str] = 0,
+        natura: Optional[str] = None,
     ) -> Path:
         """Downloads the PDF report from Priamo and saves it locally.
 
         Supports both:
         1. Digitally signed repository documents:
-           GET /PriamoCES/Documento/GetReportTextToPdfToView?stato=FIRMATO&idRepository=...&idEvento=...&repository=...&timeout=5000
+           GET /PriamoCES/Documento/GetReportTextToPdfToView?stato=FIRMATO&idRepository=...&idEvento=...&repository=...&versione=...&natura=...&timeout=5000
         2. Outpatient text-to-pdf reports:
            GET /PriamoCES/Documento/GetReportTextToPdfToView?stato=REFERTATO&idEvento=...&tipoEvento=AMB&versione=0&repository=N&timeout=5000
 
@@ -502,6 +538,8 @@ class PriamoClient:
         }
         if document_id and str(document_id).strip() and str(document_id) != str(event_id):
             params_refertato["idRepository"] = str(document_id)
+        if natura and str(natura).strip():
+            params_refertato["natura"] = str(natura)
 
         # 2. Strategy FIRMATO: Signed repository document
         params_firmato: Dict[str, Any] = {
@@ -517,6 +555,10 @@ class PriamoClient:
             params_firmato["repository"] = ""
         if event_type:
             params_firmato["tipoEvento"] = str(event_type)
+        if versione is not None and str(versione).strip():
+            params_firmato["versione"] = str(versione)
+        if natura and str(natura).strip():
+            params_firmato["natura"] = str(natura)
 
         # Determine order of attempts
         if preferred_stato == "REFERTATO" or repository_id == "N" or not document_id:
@@ -626,6 +668,9 @@ class PriamoClient:
                     doc_id = str(doc.get("idDocumento", ""))
                     repo_id = str(doc.get("repository", ""))
                     doc_stato = str(doc.get("stato", "")).strip().upper()
+                    versione = str(doc.get("versione", "0"))
+                    natura = str(doc.get("natura", ""))
+                    doc_tipo = str(doc.get("tipoDocumento", "")).strip() or event_type
                     preferred_stato = doc_stato if doc_stato in ("FIRMATO", "REFERTATO") else ("REFERTATO" if repo_id == "N" else "FIRMATO")
 
                     safe_exam = re.sub(r"[^a-zA-Z0-9_\-]", "_", exam_name)[:30]
@@ -637,9 +682,11 @@ class PriamoClient:
                         "event_id": event_id,
                         "repository_id": repo_id,
                         "destination_path": dest_file,
-                        "event_type": event_type,
+                        "event_type": doc_tipo,
                         "preferred_stato": preferred_stato,
                         "exam_name": exam_name,
+                        "versione": versione,
+                        "natura": natura,
                     })
 
             # Case B: No documents in GetDocumento, BUT event has referto='S' or pdf='S' (outpatient text report)
@@ -678,6 +725,8 @@ class PriamoClient:
                     destination_path=task["destination_path"],
                     event_type=task["event_type"],
                     preferred_stato=task["preferred_stato"],
+                    versione=task.get("versione", 0),
+                    natura=task.get("natura"),
                 )
                 return PriamoDocument(
                     document_id=task["document_id"],

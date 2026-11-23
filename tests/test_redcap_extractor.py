@@ -436,4 +436,27 @@ def test_import_records_to_api_merges_and_formats_errors():
             service.import_records_to_api(raw_records)
 
 
+def test_generate_next_record_name_api_and_session_tracking():
+    """Tests that generate_next_record_name calls REDCap API and allocates unique sequential numbers."""
+    from unittest.mock import patch, MagicMock
+
+    service = REDCapService(api_url="https://mock.redcap/api/", api_token="TOKEN")
+
+    mock_resp = MagicMock()
+    mock_resp.status_code = 200
+    mock_resp.text = "1"
+
+    with patch("requests.post", return_value=mock_resp):
+        id1 = service.generate_next_record_name()
+        assert id1 == "1"
+
+        # Successive call in same session increments to avoid collisions before upload
+        id2 = service.generate_next_record_name()
+        assert id2 == "2"
+
+        id3 = service.generate_next_record_name()
+        assert id3 == "3"
+
+
+
 

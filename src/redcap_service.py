@@ -27,6 +27,7 @@ class REDCapService:
         else:
             self.api_url = ""
         self.api_token = api_token.strip() if api_token else ""
+        self._allocated_record_ids: set[str] = set()
 
     def fetch_metadata_from_api(self, forms: Optional[List[str]] = None) -> List[REDCapField]:
         """Fetches project metadata (data dictionary) directly from REDCap API.
@@ -343,12 +344,14 @@ class REDCapService:
         self,
         name: Optional[str] = None,
         surname: Optional[str] = None,
-        date_of_birth: Optional[Union[date, str]] = None
+        date_of_birth: Optional[Union[date, str]] = None,
+        numeric_only: bool = False
     ) -> Optional[str]:
         """Searches REDCap for an existing patient by name, surname and date of birth.
 
         Returns the native REDCap 'record_id' if found, preserving the original project
         primary key and avoiding accidental creation of duplicate patient records.
+        If numeric_only is True, ignores legacy slug IDs and returns only numeric record_ids.
         """
         if not name or not surname:
             return None
@@ -378,17 +381,59 @@ class REDCapService:
                 r_name = str(r.get("name") or "").strip().lower()
                 r_surname = str(r.get("surname") or "").strip().lower()
                 r_dob = str(r.get("date_of_birth") or "").strip()
+                rid = str(r.get("record_id") or "").strip()
 
                 if r_name == clean_name and r_surname == clean_surname:
-                    if dob_str and r_dob:
-                        if r_dob == dob_str:
-                            return str(r.get("record_id"))
-                    else:
-                        return str(r.get("record_id"))
+                    if not dob_str or not r_dob or r_dob == dob_str:
+                        if numeric_only and not rid.isdigit():
+                            continue
+                        return rid
         except Exception as e:
             logger.warning(f"Errore ricerca record_id su REDCap tramite anagrafica: {e}")
 
         return None
+
+    def generate_next_record_name(self) -> str:
+        """Generates the next available numeric record ID using REDCap's native API.
+
+        Uses REDCap's 'generateNextRecordName' API method with session tracking
+        to ensure distinct sequential IDs even in dry-run or batch scenarios.
+        """
+        candidate_num = None
+        if self.api_url and self.api_token:
+            try:
+                payload = {
+                    "token": self.api_token,
+                    "content": "generateNextRecordName",
+                    "format": "json"
+                }
+                resp = requests.post(self.api_url, data=payload, timeout=15)
+                if resp.status_code == 200:
+                    raw_val = resp.text.strip().strip('"').strip("'")
+                    if raw_val and raw_val.isdigit():
+                        candidate_num = int(raw_val)
+            except Exception as e:
+                logger.warning(f"Chiamata REDCap generateNextRecordName fallita: {e}")
+
+        # Se non ottenuto da API, calcola il massimo degli ID numerici esistenti + 1
+        if candidate_num is None:
+            try:
+                existing_ids = self.get_all_patient_ids()
+                numeric_ids = []
+                for rid in existing_ids:
+                    if rid and str(rid).isdigit():
+                        numeric_ids.append(int(rid))
+                candidate_num = max(numeric_ids) + 1 if numeric_ids else 1
+            except Exception:
+                candidate_num = 1
+
+        # Assicura che l'ID non collida con ID già allocati in questa sessione
+        while str(candidate_num) in self._allocated_record_ids:
+            candidate_num += 1
+
+        result_str = str(candidate_num)
+        self._allocated_record_ids.add(result_str)
+        return result_str
 
     def list_all_records(
         self,
