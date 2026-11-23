@@ -382,3 +382,58 @@ def test_cli_main_cup_extract(tmp_path):
     assert df_out.iloc[0]["PAZ_NOME"] == "Maria"
     assert str(df_out.iloc[0]["PAZ_DATA_NASCITA"]) == "1975-06-15"
 
+
+def test_priamo_cup_cloudflare_and_url_sync():
+    """Verifica che PriamoCupClient sincronizzi gli URL da priamo_api_url e applichi gli header Cloudflare."""
+    from src.config import Settings
+    settings = Settings(
+        priamo_api_url="https://priamo.dennispirotta.com",
+        priamo_cloudflared_client_id="test_cf_id",
+        priamo_cloudflared_client_secret="test_cf_secret",
+        priamo_username="90092",
+        priamo_password="password123"
+    )
+
+    client = PriamoCupClient(settings=settings)
+    assert client.home_url == "https://priamo.dennispirotta.com/PriamoHOME"
+    assert client.cup_url == "https://priamo.dennispirotta.com/PriamoCUP"
+    assert client.session.headers.get("CF-Access-Client-Id") == "test_cf_id"
+    assert client.session.headers.get("CF-Access-Client-Secret") == "test_cf_secret"
+
+
+def test_priamo_cup_authenticate_domain_mismatch_cookie_handling():
+    """Verifica che authenticate estragga correttamente .PRIAMOAUTH da Set-Cookie con dominio valduce.it."""
+    from src.config import Settings
+    settings = Settings(
+        priamo_api_url="https://priamo.dennispirotta.com",
+        priamo_username="90092",
+        priamo_password="password123"
+    )
+    client = PriamoCupClient(settings=settings)
+
+    mock_resp_get = MagicMock()
+    mock_resp_get.ok = True
+    mock_resp_get.status_code = 200
+    mock_resp_get.text = '<html><input name="__RequestVerificationToken" value="TOKEN123" /></html>'
+
+    mock_resp_post = MagicMock()
+    mock_resp_post.ok = True
+    mock_resp_post.status_code = 302
+    mock_resp_post.url = "https://priamo.dennispirotta.com/PriamoHOME/Dashboard/Dashboard"
+    mock_resp_post.history = []
+    mock_resp_post.headers = {
+        "Set-Cookie": ".PRIAMOAUTH=SECRET_COOKIE_VAL; domain=.valduce.it; path=/"
+    }
+    mock_resp_post.raw = MagicMock()
+    mock_resp_post.raw.headers = MagicMock()
+    mock_resp_post.raw.headers.getlist.return_value = [
+        ".PRIAMOAUTH=SECRET_COOKIE_VAL; domain=.valduce.it; path=/"
+    ]
+
+    with patch.object(client.session, "get", return_value=mock_resp_get), \
+         patch.object(client.session, "post", return_value=mock_resp_post):
+        client.authenticate()
+        assert client._is_authenticated is True
+        assert client.session.cookies.get(".PRIAMOAUTH") == "SECRET_COOKIE_VAL"
+
+

@@ -772,14 +772,18 @@ def main():
     using_cup = True
     input_file = None
 
-    if args.excel and str(args.excel).strip().lower() != "cup":
-        target_path = Path(args.excel)
+    target_excel = args.excel
+    if not target_excel and settings.patients_excel_path and settings.patients_excel_path.exists():
+        target_excel = str(settings.patients_excel_path)
+
+    if target_excel and str(target_excel).strip().lower() != "cup":
+        target_path = Path(target_excel)
         if not target_path.exists():
             print(f"[ERRORE] File specificato non trovato: {target_path}", file=sys.stderr)
             sys.exit(1)
         input_file = target_path
         using_cup = False
-        print(f"-> Caricamento coorte pazienti dal registro Excel locale: [bold cyan]{input_file}[/bold cyan]")
+        print(f"-> Caricamento coorte pazienti dal registro Excel: [bold cyan]{input_file}[/bold cyan]")
     else:
         # Download live da PriamoCUP - scarica ogni volta il file aggiornato
         if not settings.priamo_username or not settings.priamo_password:

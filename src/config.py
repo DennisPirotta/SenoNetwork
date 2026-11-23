@@ -1,6 +1,7 @@
+import re
 from typing import List, Optional
 from pathlib import Path
-from pydantic import Field, AliasChoices
+from pydantic import Field, AliasChoices, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -231,6 +232,18 @@ class Settings(BaseSettings):
         default=None,
         description="Cartella locale contenente file o PDF esportati da PriamoScraper"
     )
+
+    @model_validator(mode="after")
+    def sync_priamo_urls(self) -> "Settings":
+        """Se priamo_api_url è specificato (es. tunnel Cloudflare), sincronizza i default interni di home e cup."""
+        if self.priamo_api_url:
+            clean = self.priamo_api_url.rstrip("/")
+            base = re.sub(r"/(PriamoHOME|PriamoCES|PriamoCUP)$", "", clean, flags=re.IGNORECASE)
+            if self.priamo_home_url == "https://priamo-home.valduce.it:8062/PriamoHOME":
+                self.priamo_home_url = f"{base}/PriamoHOME"
+            if self.priamo_cup_url == "http://srv-priamo-fe1.valduce.it:8082/PriamoCUP":
+                self.priamo_cup_url = f"{base}/PriamoCUP"
+        return self
 
     @property
     def cloudflared_client_id(self) -> str:

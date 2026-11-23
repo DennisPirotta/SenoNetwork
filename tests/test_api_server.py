@@ -15,6 +15,7 @@ Covers:
 
 from pathlib import Path
 from unittest.mock import MagicMock, patch
+import pandas as pd
 import pytest
 from fastapi.testclient import TestClient
 
@@ -22,6 +23,34 @@ from src.api_server import app, main as api_main
 from src.config import Settings, get_settings
 from src.patient_pipeline import PatientPipelineResult
 from src.routers.redcap import get_redcap_service
+
+
+@pytest.fixture(autouse=True)
+def ensure_cup_sample_file():
+    """Assicura la presenza di un file Excel di test in data/cup per gli endpoint di test."""
+    cup_dir = Path("data/cup")
+    cup_dir.mkdir(parents=True, exist_ok=True)
+    sample_file = cup_dir / "test_sample_cup.xlsx"
+    created = False
+    if not list(cup_dir.glob("*.xlsx")) and not list(cup_dir.glob("*.xls")):
+        df = pd.DataFrame([{
+            "PAZ_COGNOME": "ROSSI",
+            "PAZ_NOME": "MARIA",
+            "PAZ_DATA_NASCITA": "1975-06-15",
+            "PAZ_CODICE_FISCALE": "RSSMRA75H55C933A",
+            "PAZ_SESSO": "F",
+            "PAZ_COMUNE_NASCITA": "COMO",
+            "PAZ_PROGRESSIVO_PAZ1": "123456",
+            "EROG_CODICE": "3004",
+            "SLOT_DATA": "2026-11-12",
+            "SLOT_ORA": "1130",
+            "PREST_DESCRIZIONE": "Medicazione",
+        }])
+        df.to_excel(sample_file, index=False)
+        created = True
+    yield
+    if created and sample_file.exists():
+        sample_file.unlink()
 
 
 @pytest.fixture

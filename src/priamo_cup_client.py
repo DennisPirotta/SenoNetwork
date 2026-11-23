@@ -11,9 +11,11 @@ dei fogli di lavoro ambulatoriali (worksheets) in formato Excel (.xlsx) per:
 import calendar
 from datetime import date, datetime, timedelta
 import logging
+import os
 from pathlib import Path
 import re
 from typing import Any, Dict, List, Optional, Tuple, Union
+from urllib.parse import urlparse
 import urllib3
 from bs4 import BeautifulSoup
 import requests
@@ -87,11 +89,51 @@ class PriamoCupClient:
         self.settings = settings or get_settings()
         self.username = username or self.settings.priamo_username
         self.password = password or self.settings.priamo_password
-        self.cup_url = (cup_url or getattr(self.settings, "priamo_cup_url", "") or "http://srv-priamo-fe1.valduce.it:8082/PriamoCUP").rstrip("/")
-        self.home_url = (home_url or getattr(self.settings, "priamo_home_url", "") or "https://priamo-home.valduce.it:8062/PriamoHOME").rstrip("/")
+
+        # Risoluzione URL con supporto tunnel / reverse proxy (es. priamo.dennispirotta.com)
+        base_api = (self.settings.priamo_api_url or os.getenv("PRIAMO_API_URL", "")).rstrip("/")
+        if base_api:
+            clean_base = re.sub(r"/(PriamoHOME|PriamoCES|PriamoCUP)$", "", base_api, flags=re.IGNORECASE)
+            fallback_home = f"{clean_base}/PriamoHOME"
+            fallback_cup = f"{clean_base}/PriamoCUP"
+        else:
+            fallback_home = "https://priamo-home.valduce.it:8062/PriamoHOME"
+            fallback_cup = "http://srv-priamo-fe1.valduce.it:8082/PriamoCUP"
+
+        cfg_home = getattr(self.settings, "priamo_home_url", "")
+        if not home_url and (not cfg_home or ("valduce.it" in cfg_home and base_api and "valduce.it" not in base_api)):
+            self.home_url = fallback_home
+        else:
+            self.home_url = (home_url or cfg_home or fallback_home).rstrip("/")
+
+        cfg_cup = getattr(self.settings, "priamo_cup_url", "")
+        if not cup_url and (not cfg_cup or ("valduce.it" in cfg_cup and base_api and "valduce.it" not in base_api)):
+            self.cup_url = fallback_cup
+        else:
+            self.cup_url = (cup_url or cfg_cup or fallback_cup).rstrip("/")
+
         self.verify_ssl = verify_ssl
 
+        # Supporto Cloudflare Access Client Headers
+        self.cf_client_id = (
+            getattr(self.settings, "priamo_cloudflared_client_id", None)
+            or getattr(self.settings, "cf_client_id", None)
+            or os.getenv("PRIAMO_CLOUDFLARED_CLIENT_ID", "")
+            or os.getenv("CLOUDFLARED_CLIENT_ID", "")
+        )
+        self.cf_client_secret = (
+            getattr(self.settings, "priamo_cloudflared_client_secret", None)
+            or getattr(self.settings, "cf_client_secret", None)
+            or os.getenv("PRIAMO_CLOUDFLARED_CLIENT_SECRET", "")
+            or os.getenv("CLOUDFLARED_CLIENT_SECRET", "")
+        )
+
         self.session = Session()
+        if self.cf_client_id and self.cf_client_secret:
+            self.session.headers.update({
+                "CF-Access-Client-Id": self.cf_client_id,
+                "CF-Access-Client-Secret": self.cf_client_secret,
+            })
         self._is_authenticated = False
 
     def authenticate(self, force: bool = False) -> None:
@@ -136,6 +178,28 @@ class PriamoCupClient:
             resp_post.raise_for_status()
         except RequestException as e:
             raise PriamoCupAuthError(f"Errore durante l'invio delle credenziali di login: {e}") from e
+
+        # Estrazione manuale del cookie .PRIAMOAUTH da Set-Cookie per gestire mismatch di dominio
+        # attraverso tunnel Cloudflare o reverse proxy (es. backend invia dominio .valduce.it)
+        all_responses = list(resp_post.history) + [resp_post]
+        for resp in all_responses:
+            raw_headers = getattr(resp.raw, "headers", None)
+            set_cookies = []
+            if raw_headers and hasattr(raw_headers, "getlist"):
+                set_cookies = raw_headers.getlist("Set-Cookie")
+            elif raw_headers and hasattr(raw_headers, "get_all"):
+                set_cookies = raw_headers.get_all("Set-Cookie")
+            elif "Set-Cookie" in resp.headers:
+                set_cookies = [resp.headers["Set-Cookie"]]
+
+            for sc in set_cookies:
+                match = re.search(r"(?i)\.PRIAMOAUTH=([^;]+)", sc)
+                if match:
+                    priamo_auth_val = match.group(1).strip()
+                    target_host = urlparse(self.home_url).hostname
+                    if target_host:
+                        self.session.cookies.set(".PRIAMOAUTH", priamo_auth_val, domain=target_host, path="/")
+                    break
 
         # Verifica cookie .PRIAMOAUTH
         cookies = self.session.cookies.get_dict()
