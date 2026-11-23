@@ -219,6 +219,11 @@ class PatientPipeline:
         logger.info(f"-> Trovati {total_pdfs} PDF di referti per il paziente {patient_id}.")
         if total_pdfs == 0:
             logger.warning(f"-> Nessun PDF di referto associato al paziente {patient_id}. Salto l'estrazione clinica IA.")
+        else:
+            # Ordinamento cronologico dei referti (dal più datato al più recente)
+            # Garantisce che documenti più recenti aggiornino i valori precedenti
+            pdfs_to_process = PDFExtractor.sort_pdfs_by_date(pdfs_to_process)
+            logger.info(f"-> Referti ordinati cronologicamente per preservare aggiornamenti clinici.")
 
         # Step 2: Elaborazione IA
         doc_results: List[DocumentProcessingResult] = []
@@ -293,6 +298,8 @@ class PatientPipeline:
                 if extraction_res.status == "success":
                     record = extraction_res.redcap_record
                     record["record_id"] = str(patient_id)
+                    doc_date = PDFExtractor.extract_document_date(pdf_path, report_text)
+                    record["_document_date"] = doc_date
 
                     # Conta i campi clinici effettivamente estratti ed esclude record_id e _complete
                     clinical_fields = [

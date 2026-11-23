@@ -173,12 +173,23 @@ class REDCapService:
     def merge_flat_records(records: List[Dict[str, Any]], primary_key: str = "record_id") -> List[Dict[str, Any]]:
         """Merges multiple record dictionaries belonging to the same entity/event.
 
-        REDCap rejects imports if the same (record_id, event, repeat_instance) occurs more
-        than once in the payload with HTTP 400 'The records listed below occur more than once'.
-        This method consolidates fields across multiple reports or forms for each record.
+        Clinical Merging Rule:
+        - Records are processed in chronological order (or sorted by '_document_date').
+        - If a field has a valid, non-empty value in a more recent record, it updates/overwrites
+          the previous value (as newer medical documents represent updates of clinical status).
+        - If a newer record has an empty/null value for a field, the previous established clinical
+          value is preserved and not erased.
+        - For checkbox fields, confirmed findings ('1') are maintained.
+        - Completed form flags ('2') are preserved.
         """
+        # Sort chronologically if document date metadata is available
+        sorted_records = sorted(
+            records,
+            key=lambda r: str(r.get("_document_date") or r.get("date_of_follow_up_update") or r.get("data_visita") or "1970-01-01") if isinstance(r, dict) else "1970-01-01"
+        )
+
         merged_by_key: Dict[str, Dict[str, Any]] = {}
-        for r in records:
+        for r in sorted_records:
             if not r or not isinstance(r, dict):
                 continue
             key = str(r.get(primary_key, "")).strip()
@@ -194,18 +205,40 @@ class REDCapService:
 
             target = merged_by_key[compound_key]
             for field, val in r.items():
-                if val is None or val == "":
+                if field.startswith("_"):
+                    # Internal metadata like _document_date: track latest
+                    target[field] = val
                     continue
+
+                if val is None or val == "":
+                    # Empty value from newer document does NOT erase previous valid data
+                    continue
+
+                # Form completion status: '2' (complete) is preserved
+                if field.endswith("_complete"):
+                    current_status = str(target.get(field, "")).strip()
+                    if current_status == "2":
+                        continue
+                    target[field] = str(val).strip()
+                    continue
+
                 # For checkbox fields ('___'), '1' takes precedence over '0'
                 if "___" in field:
                     current_val = str(target.get(field, "")).strip()
-                    if current_val == "1":
+                    if current_val == "1" and str(val).strip() != "1":
                         continue
                     target[field] = str(val).strip()
                 else:
+                    # Valid value from more recent document updates older value
                     target[field] = val
 
-        return list(merged_by_key.values())
+        # Strip internal temporary metadata keys before returning
+        result = []
+        for rec in merged_by_key.values():
+            clean_rec = {k: v for k, v in rec.items() if not k.startswith("_")}
+            result.append(clean_rec)
+
+        return result
 
     def import_records_to_api(self, records: List[Dict[str, Any]]) -> Dict[str, Any]:
         """Directly uploads extracted records to the REDCap project.

@@ -95,6 +95,83 @@ def test_form_classifier_map_exams(tmp_path):
         assert "json" in exp_custom and exp_custom["json"].exists()
 
 
+def test_extract_document_date_and_sort_pdfs(tmp_path):
+    from src.pdf_extractor import PDFExtractor
+
+    f_old = tmp_path / "20250000815391_VISITA.pdf"
+    f_mid = tmp_path / "20260000035792_DIMISSIONE.pdf"
+    f_new = tmp_path / "20260000552052_CONTROLLO.pdf"
+
+    f_old.write_bytes(b"%PDF-old")
+    f_mid.write_bytes(b"%PDF-mid")
+    f_new.write_bytes(b"%PDF-new")
+
+    def mock_extract(p):
+        name = Path(p).name
+        if "815391" in name:
+            return "Referto di visita senologica del 02/12/2025."
+        elif "035792" in name:
+            return "Lettera di Dimissione in data 17/01/2026."
+        else:
+            return "Visita di Controllo Ambulatoriale Como, li 30/01/2026."
+
+    with patch("src.pdf_extractor.PDFExtractor.extract_text", side_effect=mock_extract):
+        d_old = PDFExtractor.extract_document_date(f_old)
+        d_mid = PDFExtractor.extract_document_date(f_mid)
+        d_new = PDFExtractor.extract_document_date(f_new)
+
+        assert d_old == "2025-12-02"
+        assert d_mid == "2026-01-17"
+        assert d_new == "2026-01-30"
+
+        # Pass in unordered sequence -> must be sorted chronologically
+        sorted_files = PDFExtractor.sort_pdfs_by_date([f_new, f_old, f_mid])
+        assert [p.name for p in sorted_files] == [f_old.name, f_mid.name, f_new.name]
+
+
+def test_merge_flat_records_recent_document_updates():
+    from src.redcap_service import REDCapService
+
+    # Document 1 (Older - baseline, 2025-12-02): tumor present, illness status 1
+    rec1 = {
+        "record_id": "1",
+        "_document_date": "2025-12-02",
+        "tumor_size_mm": "12",
+        "illness_status": "1",
+        "side_of_lesion": "R",
+        "dati_del_paziente_complete": "2"
+    }
+
+    # Document 2 (Newer - follow-up, 2026-01-30): tumor excised, illness status updated to 2
+    # Note: side_of_lesion is NOT mentioned (empty/None) in this follow-up note
+    rec2 = {
+        "record_id": "1",
+        "_document_date": "2026-01-30",
+        "illness_status": "2",  # Updated by more recent exam!
+        "side_of_lesion": "",   # Empty -> must NOT erase older 'R' value!
+        "date_of_follow_up_update": "2026-01-30"
+    }
+
+    merged = REDCapService.merge_flat_records([rec1, rec2])
+    assert len(merged) == 1
+    m = merged[0]
+
+    # 1. More recent valid value updated the older value
+    assert m["illness_status"] == "2"
+    assert m["date_of_follow_up_update"] == "2026-01-30"
+
+    # 2. Older established value was preserved and not erased by newer empty string
+    assert m["tumor_size_mm"] == "12"
+    assert m["side_of_lesion"] == "R"
+
+    # 3. Form completion flag preserved
+    assert m["dati_del_paziente_complete"] == "2"
+
+    # 4. Internal metadata keys (_document_date) stripped
+    assert "_document_date" not in m
+
+
+
 def test_dotnet_client_mock():
     client = DotNetApiClient()
     # In mock mode, if not configured, reads from local directory

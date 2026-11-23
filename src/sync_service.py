@@ -306,6 +306,10 @@ class RedCapSyncService:
         # Pre-load metadata
         self.load_metadata()
 
+        # Sort available reports in chronological order
+        if available_pdfs:
+            available_pdfs = PDFExtractor.sort_pdfs_by_date(available_pdfs)
+
         for pdf_path in available_pdfs:
             pdf_path = Path(pdf_path)
             if not pdf_path.exists():
@@ -422,19 +426,22 @@ class RedCapSyncService:
                         )
                         updates_payload[k] = new_v
                         form_has_updates = True
-                    elif old_str != new_str and mode == "overwrite":
-                        # Overwrite existing
-                        field_updates.append(
-                            FieldUpdateDetail(
-                                field_name=k,
-                                form_name=classified_form,
-                                old_value=old_v,
-                                new_value=new_v,
-                                update_type="overwrite"
+                    elif old_str != new_str:
+                        # Value already exists, but new valid value comes from a medical report.
+                        # Per clinical merging logic: if a value is valid and comes from a more recent report,
+                        # it is an update of an older value.
+                        if mode == "overwrite" or mode == "fill_missing":
+                            field_updates.append(
+                                FieldUpdateDetail(
+                                    field_name=k,
+                                    form_name=classified_form,
+                                    old_value=old_v,
+                                    new_value=new_v,
+                                    update_type="update_recent" if mode != "overwrite" else "overwrite"
+                                )
                             )
-                        )
-                        updates_payload[k] = new_v
-                        form_has_updates = True
+                            updates_payload[k] = new_v
+                            form_has_updates = True
 
                 if form_has_updates:
                     forms_updated.add(classified_form)
