@@ -246,6 +246,71 @@ def display_exam_mapping(result: dict):
         print(f"Totale esami analizzati: {total}\n")
 
 
+def display_clinical_guidelines(mgr, filter_form: Optional[str] = None):
+    """Displays clinical extraction guidelines organized by REDCap form."""
+    forms_dict = mgr.get_forms()
+    target_forms = [filter_form] if filter_form and filter_form in forms_dict else list(forms_dict.keys())
+
+    if filter_form and filter_form not in forms_dict:
+        print(f"[WARN] Nessuna linea guida trovata per il form '{filter_form}'. Form disponibili: {', '.join(forms_dict.keys())}")
+        return
+
+    if HAS_RICH:
+        console = Console()
+        console.print(Panel.fit(
+            "[bold cyan]Linee Guida Cliniche di Estrazione per REDCap[/bold cyan]\n"
+            f"[dim]Regole semantiche e interpretative per guidare l'IA nell'estrazione dei dati (file: {mgr.config_path})[/dim]",
+            border_style="cyan"
+        ))
+
+        for form_name in target_forms:
+            title = mgr.get_form_title(form_name)
+            desc = mgr.get_form_description(form_name)
+            gen_rules = mgr.get_form_general_guidelines(form_name)
+            field_rules = mgr.get_field_guidelines(form_name)
+
+            console.print(f"\n[bold magenta]Form:[/bold magenta] [bold yellow]{form_name}[/bold yellow] - [italic]{title}[/italic]")
+            if desc:
+                console.print(f"[dim]{desc}[/dim]")
+
+            if gen_rules:
+                console.print("[bold cyan]Regole Generali:[/bold cyan]")
+                for r in gen_rules:
+                    console.print(f"  • {r}")
+
+            if field_rules:
+                table = Table(title=f"Linee Guida Campi - {form_name}", show_header=True)
+                table.add_column("Campo REDCap", style="bold green", width=28)
+                table.add_column("Istruzione / Linea Guida Clinica", style="white")
+                for field_name, rule_text in field_rules.items():
+                    table.add_row(field_name, rule_text)
+                console.print(table)
+            else:
+                console.print("[dim]Nessuna linea guida specifica di campo definita per questo form.[/dim]")
+        console.print("")
+    else:
+        print("\n=== LINEE GUIDA CLINICHE DI ESTRAZIONE REDCAP ===")
+        print(f"File configurazione: {mgr.config_path}\n")
+        for form_name in target_forms:
+            title = mgr.get_form_title(form_name)
+            desc = mgr.get_form_description(form_name)
+            gen_rules = mgr.get_form_general_guidelines(form_name)
+            field_rules = mgr.get_field_guidelines(form_name)
+
+            print(f"--- Form: {form_name} ({title}) ---")
+            if desc:
+                print(f"Descrizione: {desc}")
+            if gen_rules:
+                print("Regole Generali:")
+                for r in gen_rules:
+                    print(f"  * {r}")
+            if field_rules:
+                print("Linee Guida Campi:")
+                for field_name, rule_text in field_rules.items():
+                    print(f"  - {field_name}: {rule_text}")
+            print("")
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Analizza referti medici in PDF con IA locale (Ollama) ed esporta dati strutturati per REDCap."
@@ -509,6 +574,20 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Visualizza la mappa di associazione di ogni esame clinico al form REDCap con contatore e riepilogo."
     )
     parser.add_argument(
+        "--show-guidelines", "--guidelines",
+        nargs="?",
+        const="all",
+        default=None,
+        dest="show_guidelines",
+        help="Visualizza le linee guida cliniche per l'interpretazione dei dati da parte dell'IA. Opzionalmente specifica il nome del form (es. --show-guidelines anatomia_patologica_preoperatoria)."
+    )
+    parser.add_argument(
+        "--add-guideline",
+        nargs=3,
+        metavar=("FORM", "FIELD", "GUIDELINE"),
+        help="Aggiunge o aggiorna una linea guida clinica per un campo: --add-guideline <form_name> <field_name> <testo_guida>"
+    )
+    parser.add_argument(
         "--verbose", "-v",
         action="store_true",
         help="Abilita log dettagliati di debug."
@@ -565,6 +644,25 @@ def main():
         print(f"-> Avvio microservizio HTTP FastAPI per integrazione .NET sulla porta {args.port}...")
         from src.api_server import run_server
         run_server(port=args.port)
+        return
+
+    # 1.0 Mode: Clinical Guidelines Management
+    if args.add_guideline:
+        from src.clinical_guidelines import ClinicalGuidelinesManager
+        mgr = ClinicalGuidelinesManager.get_instance(settings.clinical_guidelines_file)
+        form_name, field_name, guide_text = args.add_guideline
+        mgr.set_field_guideline(form_name, field_name, guide_text)
+        if HAS_RICH:
+            Console().print(f"[bold green][OK][/bold green] Linea guida salvata con successo per form '[cyan]{form_name}[/cyan]', campo '[cyan]{field_name}[/cyan]' in [yellow]{settings.clinical_guidelines_file}[/yellow].")
+        else:
+            print(f"[OK] Linea guida salvata con successo per form '{form_name}', campo '{field_name}' in {settings.clinical_guidelines_file}.")
+        return
+
+    if args.show_guidelines is not None:
+        from src.clinical_guidelines import ClinicalGuidelinesManager
+        mgr = ClinicalGuidelinesManager.get_instance(settings.clinical_guidelines_file)
+        filter_form = None if args.show_guidelines == "all" else args.show_guidelines
+        display_clinical_guidelines(mgr, filter_form=filter_form)
         return
 
     # 1.1 Mode: Map Exams to REDCap Forms with Counter

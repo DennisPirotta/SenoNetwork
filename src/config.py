@@ -224,6 +224,10 @@ class Settings(BaseSettings):
         default=Path("./data/redcap_metadata_live.json"),
         description="Percorso della copia cache del Data Dictionary REDCap"
     )
+    clinical_guidelines_file: Path = Field(
+        default=Path("./config/clinical_guidelines.json"),
+        description="Percorso del file JSON contenente le linee guida cliniche personalizzabili per form e campo"
+    )
     patients_excel_path: Optional[Path] = Field(
         default=None,
         description="Percorso al file Excel degli interventi (es. interventi.xls)"

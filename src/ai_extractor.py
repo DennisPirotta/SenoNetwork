@@ -76,11 +76,12 @@ class BaseAIExtractor(ABC):
     def build_prompts(
         self,
         fields: List[REDCapField],
-        report_text: str
+        report_text: str,
+        form_name: Optional[str] = None
     ) -> Tuple[str, str, Dict[str, Any]]:
-        """Constructs system prompt, user prompt, and JSON Schema."""
-        json_schema = SchemaBuilder.build_json_schema(fields, enforce_all_required=True)
-        guidelines = SchemaBuilder.build_prompt_guidelines(fields)
+        """Constructs system prompt, user prompt, and JSON Schema with clinical guidelines."""
+        json_schema = SchemaBuilder.build_json_schema(fields, enforce_all_required=True, form_name=form_name)
+        guidelines = SchemaBuilder.build_prompt_guidelines(fields, form_name=form_name)
 
         user_prompt = (
             f"Di seguito trovi le linee guida dei campi REDCap da estrarre:\n"
@@ -134,7 +135,7 @@ class BaseAIExtractor(ABC):
             return result
 
         try:
-            system_prompt, user_prompt, json_schema = self.build_prompts(fields, report_text)
+            system_prompt, user_prompt, json_schema = self.build_prompts(fields, report_text, form_name=form_name)
             extracted_dict = self._call_llm_with_retry(system_prompt, user_prompt, json_schema)
 
             # C-11: Validate and filter keys to only recognized extractable fields
@@ -200,27 +201,6 @@ class LlamaCppExtractor(BaseAIExtractor):
         if self.cf_client_id and self.cf_client_secret:
             self.headers["CF-Access-Client-Id"] = self.cf_client_id
             self.headers["CF-Access-Client-Secret"] = self.cf_client_secret
-
-    def build_prompts(
-        self,
-        fields: List[REDCapField],
-        report_text: str
-    ) -> Tuple[str, str, Dict[str, Any]]:
-        """Constructs system prompt, user prompt, and JSON Schema for llama.cpp.
-        Uses compact prompt guidelines to ensure llama.cpp receives clear field definitions
-        and expected codes without causing token bloat or gateway timeouts.
-        """
-        json_schema = SchemaBuilder.build_json_schema(fields)
-        guidelines = SchemaBuilder.build_prompt_guidelines(fields)
-        user_prompt = (
-            f"Di seguito trovi le linee guida dei campi REDCap da estrarre:\n"
-            f"{guidelines}\n\n"
-            f"--- TESTO DEL REFERTO MEDICO ---\n"
-            f"{report_text}\n"
-            f"--- FINE REFERTO ---\n\n"
-            f"Estrai tutti i dati clinici presenti nel referto secondo i campi richiesti e restituisci il JSON:"
-        )
-        return self.SYSTEM_PROMPT, user_prompt, json_schema
 
     def is_available(self) -> bool:
         """Checks if the llama.cpp server is active and reachable."""

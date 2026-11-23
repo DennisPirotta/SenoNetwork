@@ -1,12 +1,17 @@
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 from src.models import REDCapField
 
 
 class SchemaBuilder:
-    """Builds JSON Schema and prompt documentation from REDCap fields."""
+    """Builds JSON Schema and prompt documentation from REDCap fields with integrated clinical guidelines."""
 
     @staticmethod
-    def build_json_schema(fields: List[REDCapField], enforce_all_required: bool = True) -> Dict[str, Any]:
+    def build_json_schema(
+        fields: List[REDCapField],
+        enforce_all_required: bool = True,
+        form_name: Optional[str] = None,
+        guidelines_mgr: Optional[Any] = None
+    ) -> Dict[str, Any]:
         """Generates a JSON Schema compatible with Ollama and llama.cpp structured outputs (`format`/`json_schema`).
 
         Args:
@@ -14,10 +19,19 @@ class SchemaBuilder:
             enforce_all_required: If True (default), marks every extractable field as required in the schema.
                 Since each field property allows null (e.g. `['string', 'null']`), this ensures grammar-constrained
                 decoding (GBNF) forces the LLM to output all variables rather than short-circuiting to `{}`.
+            form_name: Optional name of the active REDCap form.
+            guidelines_mgr: Optional ClinicalGuidelinesManager instance.
 
         Returns:
             Dictionary representing a JSON Schema object.
         """
+        if guidelines_mgr is None:
+            try:
+                from src.clinical_guidelines import ClinicalGuidelinesManager
+                guidelines_mgr = ClinicalGuidelinesManager.get_instance()
+            except Exception:
+                guidelines_mgr = None
+
         properties: Dict[str, Any] = {}
         required: List[str] = []
 
@@ -29,6 +43,11 @@ class SchemaBuilder:
             if field.branching_logic:
                 clean_dep = field.branching_logic.strip().replace("\r\n", " ").replace("\n", " ")
                 field_desc = f"{field_desc} [DIPENDENZA: visibile solo se {clean_dep}. Se non soddisfatta, DEVE essere null]"
+
+            if guidelines_mgr:
+                fg = guidelines_mgr.get_field_guideline(field.field_name, form_name or field.form_name)
+                if fg:
+                    field_desc = f"{field_desc} [GUIDA CLINICA: {fg}]"
 
             # Dropdown / Radio single choice
             if field.field_type in {"dropdown", "radio"}:
@@ -114,11 +133,22 @@ class SchemaBuilder:
         return schema
 
     @staticmethod
-    def build_prompt_guidelines(fields: List[REDCapField]) -> str:
+    def build_prompt_guidelines(
+        fields: List[REDCapField],
+        form_name: Optional[str] = None,
+        guidelines_mgr: Optional[Any] = None
+    ) -> str:
         """Constructs concise, high-density field guidelines in Italian for prompt context.
         Optimized to fit within prompt token budgets while clearly communicating allowed codes
-        for single/multi-choice fields.
+        for single/multi-choice fields, visibility rules, and domain clinical guidelines.
         """
+        if guidelines_mgr is None:
+            try:
+                from src.clinical_guidelines import ClinicalGuidelinesManager
+                guidelines_mgr = ClinicalGuidelinesManager.get_instance()
+            except Exception:
+                guidelines_mgr = None
+
         lines = []
         lines.append("### CAMPI DA ESTRARRE SECONDO I METADATA REDCAP:")
         lines.append(
@@ -129,6 +159,29 @@ class SchemaBuilder:
             "- Per record_id: se nel referto è presente un ID paziente o cartella, estrailo, altrimenti null.\n"
             "- REGOLE DI DIPENDENZA E VISIBILITÀ (BRANCHING LOGIC): Se un campo indica [DIPENDE DA: ...], può avere un valore SOLO SE la condizione sul campo padre è pienamente verificata nel referto. Se la condizione non è verificata o il campo padre ha un valore diverso, il campo dipendente DEVE RIGOROSAMENTE ESSERE null (non inserire valori dummy come '0' o '9', altrimenti REDCap solleverà errori bloccanti di campo nascosto con valore).\n"
         )
+
+        # Inject general form clinical guidelines if available
+        active_forms = set()
+        if form_name:
+            active_forms.add(form_name)
+        for f in fields:
+            if f.form_name:
+                active_forms.add(f.form_name)
+
+        if guidelines_mgr and active_forms:
+            has_any_general = False
+            general_lines = ["### LINEE GUIDA CLINICHE SPECIFICHE:"]
+            for fn in sorted(list(active_forms)):
+                rules = guidelines_mgr.get_form_general_guidelines(fn)
+                if rules:
+                    has_any_general = True
+                    title = guidelines_mgr.get_form_title(fn)
+                    general_lines.append(f"• {title} ({fn}):")
+                    for r in rules:
+                        general_lines.append(f"  - {r}")
+            if has_any_general:
+                lines.extend(general_lines)
+                lines.append("")
 
         current_form = None
         for f in fields:
@@ -147,6 +200,10 @@ class SchemaBuilder:
                 clean_dep = f.branching_logic.strip().replace("\r\n", " ").replace("\n", " ")
                 label = f"{label} [DIPENDE DA: {clean_dep}]"
 
+            field_guide = None
+            if guidelines_mgr:
+                field_guide = guidelines_mgr.get_field_guideline(f.field_name, form_name or f.form_name)
+
             if f.field_type in {"dropdown", "radio", "yesno", "truefalse"}:
                 choices = f.parse_choices()
                 ch_items = []
@@ -155,7 +212,7 @@ class SchemaBuilder:
                     if len(clean_v) > 18:
                         clean_v = clean_v[:16] + ".."
                     ch_items.append(f'"{k}"={clean_v}')
-                lines.append(f"- `{f.field_name}` ({f.field_type}): {label} [{', '.join(ch_items)}]")
+                line = f"- `{f.field_name}` ({f.field_type}): {label} [{', '.join(ch_items)}]"
 
             elif f.field_type == "checkbox":
                 choices = f.parse_choices()
@@ -165,17 +222,21 @@ class SchemaBuilder:
                     if len(clean_v) > 16:
                         clean_v = clean_v[:14] + ".."
                     ch_items.append(f'"{k}"={clean_v}')
-                lines.append(f"- `{f.field_name}` ({f.field_type}): {label} [{', '.join(ch_items)}]")
+                line = f"- `{f.field_name}` ({f.field_type}): {label} [{', '.join(ch_items)}]"
 
             elif f.field_type == "text" and f.text_validation_type_or_show_slider_number:
                 vt = f.text_validation_type_or_show_slider_number
                 if "date" in vt:
-                    lines.append(f"- `{f.field_name}` ({f.field_type}): {label} (data: YYYY-MM-DD)")
+                    line = f"- `{f.field_name}` ({f.field_type}): {label} (data: YYYY-MM-DD)"
                 elif "int" in vt or "num" in vt:
-                    lines.append(f"- `{f.field_name}` ({f.field_type}): {label} (numero)")
+                    line = f"- `{f.field_name}` ({f.field_type}): {label} (numero)"
                 else:
-                    lines.append(f"- `{f.field_name}` ({f.field_type}): {label}")
+                    line = f"- `{f.field_name}` ({f.field_type}): {label}"
             else:
-                lines.append(f"- `{f.field_name}` ({f.field_type}): {label}")
+                line = f"- `{f.field_name}` ({f.field_type}): {label}"
+
+            if field_guide:
+                line = f"{line}\n  -> [GUIDA CLINICA: {field_guide}]"
+            lines.append(line)
 
         return "\n".join(lines)
