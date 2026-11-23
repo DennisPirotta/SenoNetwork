@@ -478,12 +478,17 @@ def test_schema_builder_branching_logic():
     ]
 
     schema = SchemaBuilder.build_json_schema(fields, enforce_all_required=True)
-    # genetic_assessment is independent -> must be in required
+    # Both fields must be in required to force GBNF grammar to inspect every field (preventing data loss)
     assert "genetic_assessment" in schema.get("required", [])
-    # brca1 has branching_logic -> must NOT be forced into required
-    assert "brca1" not in schema.get("required", [])
+    assert "brca1" in schema.get("required", [])
+    # brca1 explicitly allows null in schema so the LLM can output null when hidden
+    assert None in schema["properties"]["brca1"]["enum"]
     # Dependency is documented in property description
     assert "DIPENDENZA" in schema["properties"]["brca1"]["description"]
+
+    # When enforce_all_required=False, only fields marked required_field='y' are in required
+    schema_optional = SchemaBuilder.build_json_schema(fields, enforce_all_required=False)
+    assert schema_optional.get("required") is None or "brca1" not in schema_optional.get("required", [])
 
     # Guidelines include branching logic instruction and tag
     guidelines = SchemaBuilder.build_prompt_guidelines(fields)

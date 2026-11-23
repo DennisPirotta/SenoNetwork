@@ -95,17 +95,15 @@ class SchemaBuilder:
                     "description": field_desc
                 }
 
-            # Handling required fields considering branching logic (visibility / dependencies):
-            # Fields with branching_logic are conditionally visible. Enforcing them as required
-            # in grammar-constrained decoding (GBNF) forces the LLM to output a token/choice for them
-            # even when hidden, causing REDCap 'ERASE THE VALUE OF THE FIELD' conflict alerts.
-            if field.branching_logic:
-                if field.required_field and field.required_field.strip().lower() == "y":
-                    required.append(field.field_name)
-            else:
-                # Top-level / independent fields: enforce required if requested to prevent empty {} output
-                if enforce_all_required or (field.required_field and field.required_field.strip().lower() == "y"):
-                    required.append(field.field_name)
+            # Mark as required when enforce_all_required is True (default) or if required in REDCap dictionary.
+            # Crucial: Enforcing all extractable fields in the schema ensures GBNF grammar forces the LLM
+            # to evaluate every field (preventing lazy short-circuiting or omission of dependent fields like
+            # surgery details, pTNM, margins).
+            # Because every property allows null (e.g. ["string", "null"]), fields whose branching condition
+            # is not met or not mentioned in the text can be legally emitted as null by the LLM,
+            # and any residual values for hidden fields are deterministically sanitized by REDCapNormalizer.
+            if enforce_all_required or (field.required_field and field.required_field.strip().lower() == "y"):
+                required.append(field.field_name)
 
         schema: Dict[str, Any] = {
             "type": "object",
