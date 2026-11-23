@@ -79,7 +79,7 @@ def test_load_patients_from_excel():
 
 
 def test_priamo_fetch_reports_no_nested_directory(tmp_path):
-    """Ensures fetch_all_patient_reports does not create a redundant subfolder with the same slug."""
+    """Ensures fetch_all_patient_reports does not create a redundant subfolder with slug."""
     client = PriamoClient(base_url="http://mock-priamo", username="user", password="pwd")
     patient = PriamoPatient(
         patient_id="12345",
@@ -88,8 +88,8 @@ def test_priamo_fetch_reports_no_nested_directory(tmp_path):
         date_of_birth=date(1967, 8, 13)
     )
 
-    # Case 1: When destination_dir already targets the patient's slug folder
-    target_dir = tmp_path / patient.slug
+    # Case 1: When destination_dir targets a patient's numeric ID folder (e.g. data/downloads/1)
+    target_dir = tmp_path / "downloads" / "1"
     target_dir.mkdir(parents=True, exist_ok=True)
 
     with patch.object(client, "get_patient_events", return_value=[]):
@@ -106,9 +106,9 @@ def test_priamo_fetch_reports_no_nested_directory(tmp_path):
     with patch.object(client, "get_patient_events", return_value=[]):
         client.fetch_all_patient_reports(patient, destination_dir=parent_dir)
 
-    # Must create parent_dir / patient.slug, and NOT parent_dir / patient.slug / patient.slug
-    assert (parent_dir / patient.slug).exists()
-    assert not (parent_dir / patient.slug / patient.slug).exists()
+    # Must create parent_dir / patient.patient_id and NOT parent_dir / patient.slug
+    assert (parent_dir / patient.patient_id).exists()
+    assert not (parent_dir / patient.slug).exists()
 
 
 def test_priamo_download_pdf_refertato_and_fallback(tmp_path):

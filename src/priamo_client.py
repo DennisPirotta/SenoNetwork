@@ -608,10 +608,14 @@ class PriamoClient:
         events = self.get_patient_events(patient.patient_id)
         logger.info(f"Trovati {len(events)} eventi per il paziente {patient.name} {patient.surname} (ID: {patient.patient_id})")
 
-        if destination_dir.name in (patient.slug, patient.patient_id):
-            patient_dir = destination_dir
+        # Se destination_dir è la cartella generica genitore dei download (es. 'downloads' o 'data'),
+        # usa l'ID del paziente (patient.patient_id) e non lo slug nome-cognome-dob.
+        # In tutti gli altri casi (destination_dir specifica per il paziente, es. data/downloads/1),
+        # salva direttamente in destination_dir senza creare sottocartelle con lo slug.
+        if destination_dir.name.lower() in ("downloads", "download"):
+            patient_dir = destination_dir / (patient.patient_id or "unknown")
         else:
-            patient_dir = destination_dir / patient.slug
+            patient_dir = destination_dir
         patient_dir.mkdir(parents=True, exist_ok=True)
 
         if not events:
