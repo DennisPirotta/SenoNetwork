@@ -26,6 +26,9 @@ class SchemaBuilder:
                 continue
 
             field_desc = field.field_label.strip().replace("\n", " ")
+            if field.branching_logic:
+                clean_dep = field.branching_logic.strip().replace("\r\n", " ").replace("\n", " ")
+                field_desc = f"{field_desc} [DIPENDENZA: visibile solo se {clean_dep}. Se non soddisfatta, DEVE essere null]"
 
             # Dropdown / Radio single choice
             if field.field_type in {"dropdown", "radio"}:
@@ -92,9 +95,17 @@ class SchemaBuilder:
                     "description": field_desc
                 }
 
-            # Only mark as required if explicitly enforced or flagged required in REDCap dictionary
-            if enforce_all_required or (field.required_field and field.required_field.strip().lower() == "y"):
-                required.append(field.field_name)
+            # Handling required fields considering branching logic (visibility / dependencies):
+            # Fields with branching_logic are conditionally visible. Enforcing them as required
+            # in grammar-constrained decoding (GBNF) forces the LLM to output a token/choice for them
+            # even when hidden, causing REDCap 'ERASE THE VALUE OF THE FIELD' conflict alerts.
+            if field.branching_logic:
+                if field.required_field and field.required_field.strip().lower() == "y":
+                    required.append(field.field_name)
+            else:
+                # Top-level / independent fields: enforce required if requested to prevent empty {} output
+                if enforce_all_required or (field.required_field and field.required_field.strip().lower() == "y"):
+                    required.append(field.field_name)
 
         schema: Dict[str, Any] = {
             "type": "object",
@@ -118,6 +129,7 @@ class SchemaBuilder:
             "- Per radio/dropdown/yesno/truefalse: usa ESCLUSIVAMENTE la stringa del CODICE indicato tra parentesi quadre (es. \"1\", \"2\"). Non restituire testo descrittivo.\n"
             "- Per checkbox (multipli): restituisci un array JSON con i SOLI codici delle opzioni accertate nel referto.\n"
             "- Per record_id: se nel referto è presente un ID paziente o cartella, estrailo, altrimenti null.\n"
+            "- REGOLE DI DIPENDENZA E VISIBILITÀ (BRANCHING LOGIC): Se un campo indica [DIPENDE DA: ...], può avere un valore SOLO SE la condizione sul campo padre è pienamente verificata nel referto. Se la condizione non è verificata o il campo padre ha un valore diverso, il campo dipendente DEVE RIGOROSAMENTE ESSERE null (non inserire valori dummy come '0' o '9', altrimenti REDCap solleverà errori bloccanti di campo nascosto con valore).\n"
         )
 
         current_form = None
@@ -132,6 +144,10 @@ class SchemaBuilder:
             label = (f.field_label or f.field_name).strip().replace("\n", " ")
             if len(label) > 55:
                 label = label[:52] + "..."
+
+            if f.branching_logic:
+                clean_dep = f.branching_logic.strip().replace("\r\n", " ").replace("\n", " ")
+                label = f"{label} [DIPENDE DA: {clean_dep}]"
 
             if f.field_type in {"dropdown", "radio", "yesno", "truefalse"}:
                 choices = f.parse_choices()

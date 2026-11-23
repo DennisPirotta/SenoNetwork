@@ -458,5 +458,115 @@ def test_generate_next_record_name_api_and_session_tracking():
         assert id3 == "3"
 
 
+def test_schema_builder_branching_logic():
+    fields = [
+        REDCapField(
+            field_name="genetic_assessment",
+            form_name="dati_del_paziente",
+            field_type="radio",
+            field_label="Valutazione genetica",
+            select_choices_or_calculations="1, Eseguita | 2, In corso | 9, Non eseguita"
+        ),
+        REDCapField(
+            field_name="brca1",
+            form_name="dati_del_paziente",
+            field_type="radio",
+            field_label="BRCA 1",
+            select_choices_or_calculations="1, Mutato | 2, Wild type | 9, Non disponibile",
+            branching_logic="[genetic_assessment] = '1'"
+        )
+    ]
+
+    schema = SchemaBuilder.build_json_schema(fields, enforce_all_required=True)
+    # genetic_assessment is independent -> must be in required
+    assert "genetic_assessment" in schema.get("required", [])
+    # brca1 has branching_logic -> must NOT be forced into required
+    assert "brca1" not in schema.get("required", [])
+    # Dependency is documented in property description
+    assert "DIPENDENZA" in schema["properties"]["brca1"]["description"]
+
+    # Guidelines include branching logic instruction and tag
+    guidelines = SchemaBuilder.build_prompt_guidelines(fields)
+    assert "BRANCHING LOGIC" in guidelines
+    assert "[DIPENDE DA: [genetic_assessment] = '1']" in guidelines
+
+
+def test_normalizer_branching_logic_erases_hidden_values():
+    fields = [
+        REDCapField(
+            field_name="genetic_assessment",
+            field_type="radio",
+            select_choices_or_calculations="1, Eseguita | 9, Non eseguita"
+        ),
+        REDCapField(
+            field_name="brca1",
+            field_type="radio",
+            select_choices_or_calculations="1, Mutato | 2, Wild type | 9, Non disponibile",
+            branching_logic="[genetic_assessment] = '1'"
+        ),
+        REDCapField(
+            field_name="presence_of_distant_metastases",
+            field_type="radio",
+            select_choices_or_calculations="1, Si | 0, No"
+        ),
+        REDCapField(
+            field_name="bone_metastases",
+            field_type="radio",
+            select_choices_or_calculations="1, Si | 0, No",
+            branching_logic="[presence_of_distant_metastases] = '1'"
+        ),
+        REDCapField(
+            field_name="histopathological_diagnosis",
+            field_type="radio",
+            select_choices_or_calculations="0, Benigno | 2, Invasivo"
+        ),
+        REDCapField(
+            field_name="benign_type",
+            field_type="text",
+            branching_logic="[histopathological_diagnosis] = '0'"
+        )
+    ]
+
+    # Case 1: Extracted data contains values for fields whose parent conditions are FALSE
+    raw_extracted = {
+        "record_id": "100",
+        "genetic_assessment": "9",
+        "brca1": "9",  # Should be erased because genetic_assessment != '1'
+        "presence_of_distant_metastases": "0",
+        "bone_metastases": "0",  # Should be erased because presence_of_distant_metastases != '1'
+        "histopathological_diagnosis": "2",
+        "benign_type": "Fibroadenoma"  # Should be erased because diagnosis != '0'
+    }
+
+    norm = REDCapNormalizer.normalize_record(raw_extracted, fields, record_id="100")
+
+    assert norm["genetic_assessment"] == "9"
+    assert norm["brca1"] == "", "brca1 must be blanked because genetic_assessment is 9"
+    assert norm["presence_of_distant_metastases"] == "0"
+    assert norm["bone_metastases"] == "", "bone_metastases must be blanked because presence_of_distant_metastases is 0"
+    assert norm["histopathological_diagnosis"] == "2"
+    assert norm["benign_type"] == "", "benign_type must be blanked because diagnosis is 2"
+
+    # Case 2: Parent conditions are TRUE -> values must be preserved
+    raw_valid = {
+        "record_id": "101",
+        "genetic_assessment": "1",
+        "brca1": "1",
+        "presence_of_distant_metastases": "1",
+        "bone_metastases": "1",
+        "histopathological_diagnosis": "0",
+        "benign_type": "Fibroadenoma"
+    }
+
+    norm_valid = REDCapNormalizer.normalize_record(raw_valid, fields, record_id="101")
+    assert norm_valid["genetic_assessment"] == "1"
+    assert norm_valid["brca1"] == "1"
+    assert norm_valid["presence_of_distant_metastases"] == "1"
+    assert norm_valid["bone_metastases"] == "1"
+    assert norm_valid["histopathological_diagnosis"] == "0"
+    assert norm_valid["benign_type"] == "Fibroadenoma"
+
+
+
 
 

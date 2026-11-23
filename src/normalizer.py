@@ -81,17 +81,93 @@ class REDCapNormalizer:
             else:
                 record[field_name] = str(val).strip()
 
+        # Enforce REDCap branching logic (field visibility and dependency rules):
+        # If a field has branching_logic and that condition evaluates to False,
+        # the field is hidden in REDCap. Any value must be cleared back to blank ("")
+        # to prevent REDCap from showing:
+        # "ERASE THE VALUE OF THE FIELD ... requires that field ... be hidden from view"
+        # Multi-pass sweep (up to 3 passes) resolves cascading dependencies
+        for _ in range(3):
+            changed = False
+            for f in fields:
+                if not f.is_extractable or not f.branching_logic:
+                    continue
+
+                field_name = f.field_name
+                is_visible = REDCapNormalizer.evaluate_branching_logic(f.branching_logic, record)
+                if not is_visible:
+                    if f.field_type == "checkbox":
+                        choices = f.parse_choices()
+                        for code in choices.keys():
+                            chk_key = f"{field_name}___{code}"
+                            if record.get(chk_key) not in (None, "", "0"):
+                                record[chk_key] = "0"
+                                changed = True
+                    else:
+                        if record.get(field_name) not in (None, ""):
+                            record[field_name] = ""
+                            changed = True
+            if not changed:
+                break
+
         # Mark form as complete in REDCap: 0=Incomplete, 1=Unverified, 2=Complete
         # Only mark complete if explicitly requested AND at least one non-empty clinical field was extracted
         has_clinical_values = any(
-            v not in (None, "", [], {})
-            for k, v in extracted_data.items()
-            if k not in (default_record_id_field, f"{form_name}_complete")
+            v not in (None, "", [], {}, "0") or (k.endswith("___1"))
+            for k, v in record.items()
+            if k not in (default_record_id_field, f"{form_name}_complete") and not (k.endswith("___0") and v == "0")
         )
         if form_name and mark_form_complete and has_clinical_values:
             record[f"{form_name}_complete"] = "2"
 
         return record
+
+    @staticmethod
+    def evaluate_branching_logic(branching_logic: Optional[str], record_data: Dict[str, Any]) -> bool:
+        """Evaluates a REDCap branching logic rule against current record values.
+
+        Returns:
+            True if the field should be visible (condition met or no branching logic),
+            False if the field should be hidden from view.
+        """
+        if not branching_logic or not branching_logic.strip():
+            return True
+
+        expr = branching_logic.strip().replace("\r\n", " ").replace("\n", " ")
+
+        # 1. Handle checkbox fields: [field_name(choice_code)]
+        def replace_checkbox(match):
+            field = match.group(1)
+            code = match.group(2)
+            chk_val = str(record_data.get(f"{field}___{code}", record_data.get(field, ""))).strip()
+            return repr(chk_val)
+
+        expr = re.sub(r"\[([a-zA-Z0-9_]+)\(([a-zA-Z0-9_\-]+)\)\]", replace_checkbox, expr)
+
+        # 2. Handle standard fields: [field_name]
+        def replace_field(match):
+            field = match.group(1)
+            val = str(record_data.get(field, "")).strip()
+            return repr(val)
+
+        expr = re.sub(r"\[([a-zA-Z0-9_]+)\]", replace_field, expr)
+
+        # 3. Translate REDCap SQL-like operators to Python
+        expr = re.sub(r"<>", r"!=", expr)
+        expr = re.sub(r"(?<![!<>=])=(?!=)", r"==", expr)
+
+        expr = re.sub(r"\bAND\b", "and", expr, flags=re.IGNORECASE)
+        expr = re.sub(r"\bOR\b", "or", expr, flags=re.IGNORECASE)
+        expr = re.sub(r"\bNOT\b", "not", expr, flags=re.IGNORECASE)
+
+        # Convert unquoted integer comparisons (e.g. == 1 -> == '1')
+        expr = re.sub(r"([=!<>]=?\s*)(\d+)(?!\w|\'|\")", r'\1"\2"', expr)
+
+        try:
+            res = eval(expr, {"__builtins__": {}}, {})
+            return bool(res)
+        except Exception:
+            return True
 
     @staticmethod
     def _normalize_choice(val: Any, choices: Dict[str, str]) -> str:
