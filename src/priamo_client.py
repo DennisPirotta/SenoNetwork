@@ -1,12 +1,15 @@
+import contextlib
 import logging
 import os
 import re
 import threading
+import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 from urllib.parse import urlparse
+import urllib3
 try:
     from bs4 import BeautifulSoup
 except ImportError:
@@ -18,7 +21,14 @@ from requests.exceptions import RequestException
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 
 from src.config import Settings, get_settings
-from src.utils import mask_phi, normalize_person_name, parse_flexible_date
+from src.utils import (
+    atomic_write_bytes,
+    build_patient_slug,
+    mask_phi,
+    normalize_person_name,
+    parse_flexible_date,
+    sanitize_identifier,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -86,9 +96,7 @@ class PriamoPatient(BaseModel):
 
     @property
     def slug(self) -> str:
-        dob_str = self.date_of_birth.isoformat() if self.date_of_birth else "unknown"
-        raw = f"{self.name}-{self.surname}-{dob_str}".lower().replace(" ", "-")
-        return re.sub(r"[^a-z0-9\-]", "", raw)
+        return build_patient_slug(self.name, self.surname, self.date_of_birth)
 
 
 
@@ -161,24 +169,39 @@ class PriamoClient:
         self._authenticated = False
         self._auth_generation = 0
         self._ces_token: Optional[str] = None
+        self._ces_token_lock = threading.Lock()
         self.verify_ssl = getattr(cfg, "priamo_verify_ssl", True)
+
+    @staticmethod
+    def _is_login_redirect(response: Response) -> bool:
+        resp_url = getattr(response, "url", None)
+        return isinstance(resp_url, str) and "/Account/Login" in resp_url
 
     @property
     def is_configured(self) -> bool:
         return bool(self.base_url and self.username and self.password)
+
+    def _raw_session_call(self, fn, *args, **kwargs):
+        if self.verify_ssl:
+            return fn(*args, **kwargs)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", urllib3.exceptions.InsecureRequestWarning)
+            return fn(*args, **kwargs)
 
     @RETRYABLE
     def _request(self, method: str, url: str, **kwargs) -> Response:
         kwargs.setdefault("timeout", 15)
         kwargs.setdefault("verify", self.verify_ssl)
         gen_before = self._auth_generation
-        response = self.session.request(method, url, **kwargs)
+        response = self._raw_session_call(self.session.request, method, url, **kwargs)
 
-        # Handle session expiry and re-authenticate (avoid recursive calls if failing on login page)
-        if response.status_code in (401, 403) and url != self.login_page_url:
+        # Handle session expiry (HTTP 401/403 or ASP.NET 302 -> 200 redirect to /Account/Login)
+        if url != self.login_page_url and (
+            response.status_code in (401, 403) or self._is_login_redirect(response)
+        ):
             logger.warning("Sessione Priamo scaduta o non autorizzata, ri-autenticazione in corso...")
             self.authenticate(force=True, expected_generation=gen_before)
-            response = self.session.request(method, url, **kwargs)
+            response = self._raw_session_call(self.session.request, method, url, **kwargs)
 
         response.raise_for_status()
         return response
@@ -224,16 +247,21 @@ class PriamoClient:
                 "__RequestVerificationToken": token,
             }
 
-            login_response = self.session.post(
+            login_response = self._raw_session_call(
+                self.session.post,
                 self.login_page_url,
                 data=payload,
                 timeout=15,
                 allow_redirects=True,
+                verify=self.verify_ssl,
             )
             login_response.raise_for_status()
 
             # Extract .PRIAMOAUTH from Set-Cookie across redirect history or final response
             # (vital when accessed over Cloudflare Tunnel or reverse-proxy with domain mismatch)
+            parsed_base = urlparse(self.base_url)
+            target_host = parsed_base.hostname
+            is_https = parsed_base.scheme == "https"
             all_responses = list(login_response.history) + [login_response]
             for resp in all_responses:
                 raw_headers = getattr(resp.raw, "headers", None)
@@ -249,9 +277,15 @@ class PriamoClient:
                     match = re.search(r"(?i)\.PRIAMOAUTH=([^;]+)", sc)
                     if match:
                         priamo_auth_val = match.group(1).strip()
-                        target_host = urlparse(self.base_url).hostname
                         if target_host:
-                            self.session.cookies.set(".PRIAMOAUTH", priamo_auth_val, domain=target_host, path="/")
+                            self.session.cookies.set(
+                                ".PRIAMOAUTH",
+                                priamo_auth_val,
+                                domain=target_host,
+                                path="/",
+                                secure=is_https,
+                                rest={"HttpOnly": True},
+                            )
                         break
 
             if ".PRIAMOAUTH" not in self.session.cookies.get_dict():
@@ -520,41 +554,56 @@ class PriamoClient:
         res_json = response.json()
         return res_json.get("eventi", [])
 
-    def _get_ces_verification_token(self) -> Optional[str]:
+    def _get_ces_verification_token(self, force: bool = False) -> Optional[str]:
         """Retrieves and caches the Anti-Forgery RequestVerificationToken from PriamoCES."""
-        if self._ces_token:
-            return self._ces_token
-        try:
-            resp = self._request("GET", self.ces_url)
-            m = re.search(r'priamoMasterPage\.site\.requestVerificationToken\s*=\s*[\'\"]([^\'\"]+)[\'\"]', resp.text)
-            if m and m.group(1).strip():
-                self._ces_token = m.group(1).strip()
+        with self._ces_token_lock:
+            if not force and self._ces_token:
                 return self._ces_token
-            if BeautifulSoup:
-                soup = BeautifulSoup(resp.text, "html.parser")
-                inp = soup.find("input", {"name": "__RequestVerificationToken"})
-                if inp and inp.get("value"):
-                    self._ces_token = str(inp.get("value"))
+            if force:
+                self._ces_token = None
+            try:
+                resp = self._request("GET", self.ces_url)
+                m = re.search(r'priamoMasterPage\.site\.requestVerificationToken\s*=\s*[\'\"]([^\'\"]+)[\'\"]', resp.text)
+                if m and m.group(1).strip():
+                    self._ces_token = m.group(1).strip()
                     return self._ces_token
-        except Exception as e:
-            logger.warning(f"Impossibile estrarre RequestVerificationToken da PriamoCES: {e}")
-        return None
+                if BeautifulSoup:
+                    soup = BeautifulSoup(resp.text, "html.parser")
+                    inp = soup.find("input", {"name": "__RequestVerificationToken"})
+                    if inp and inp.get("value"):
+                        self._ces_token = str(inp.get("value"))
+                        return self._ces_token
+            except Exception as e:
+                logger.warning(f"Impossibile estrarre RequestVerificationToken da PriamoCES: {e}")
+            return None
 
     def get_event_documents(self, event_id: str) -> List[Dict[str, Any]]:
         """Retrieves documents linked to a specific event in Priamo using POST and CSRF token."""
         self.authenticate()
-        token = self._get_ces_verification_token()
-        headers = {
-            "Accept": "application/json, text/javascript, */*; q=0.01",
-            "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-            "X-Requested-With": "XMLHttpRequest",
-            "Referer": f"{self.ces_url}/EventiView/Eventi",
-        }
-        if token:
-            headers["RequestVerificationToken"] = token
 
-        payload = {"IdEvento": str(event_id)}
-        response = self._request("POST", self.get_documento_url, data=payload, headers=headers)
+        def _post_docs(csrf_token: Optional[str]) -> Response:
+            headers = {
+                "Accept": "application/json, text/javascript, */*; q=0.01",
+                "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+                "X-Requested-With": "XMLHttpRequest",
+                "Referer": f"{self.ces_url}/EventiView/Eventi",
+            }
+            if csrf_token:
+                headers["RequestVerificationToken"] = csrf_token
+            return self._request("POST", self.get_documento_url, data={"IdEvento": str(event_id)}, headers=headers)
+
+        token = self._get_ces_verification_token()
+        try:
+            response = _post_docs(token)
+        except RequestException as exc:
+            status = getattr(getattr(exc, "response", None), "status_code", None)
+            if status not in (400, 401, 403, 500):
+                raise
+            fresh_token = self._get_ces_verification_token(force=True)
+            if not fresh_token or fresh_token == token:
+                raise
+            response = _post_docs(fresh_token)
+
         res_json = response.json()
         return res_json.get("documenti", [])
 
@@ -626,13 +675,14 @@ class PriamoClient:
         for stato_label, params in strategies:
             try:
                 logger.debug(f"Tentativo download PDF evento {event_id} (stato={stato_label}, params={params})")
-                response = self._request("GET", self.pdf_url, params=params, stream=True)
-                content = response.content
+                with contextlib.closing(
+                    self._request("GET", self.pdf_url, params=params, stream=True)
+                ) as response:
+                    content = response.content
 
                 if content and content.startswith(b"%PDF"):
                     destination_path.parent.mkdir(parents=True, exist_ok=True)
-                    with open(destination_path, "wb") as f:
-                        f.write(content)
+                    atomic_write_bytes(destination_path, content)
                     logger.info(f"PDF {destination_path.name} scaricato con successo con stato={stato_label}")
                     return destination_path
                 else:
@@ -733,8 +783,9 @@ class PriamoClient:
                     doc_tipo = str(doc.get("tipoDocumento", "")).strip() or event_type
                     preferred_stato = doc_stato if doc_stato in ("FIRMATO", "REFERTATO") else ("REFERTATO" if repo_id == "N" else "FIRMATO")
 
+                    safe_doc_id = sanitize_identifier(doc_id or event_id or "doc", max_len=64)
                     safe_exam = re.sub(r"[^a-zA-Z0-9_\-]", "_", exam_name)[:30]
-                    filename = f"{doc_id}_{safe_exam}.pdf" if safe_exam else f"{doc_id}.pdf"
+                    filename = f"{safe_doc_id}_{safe_exam}.pdf" if safe_exam else f"{safe_doc_id}.pdf"
                     dest_file = patient_dir / filename
 
                     download_tasks.append({
@@ -751,8 +802,9 @@ class PriamoClient:
 
             # Case B: No documents in GetDocumento, BUT event has referto='S' or pdf='S' (outpatient text report)
             elif referto == "S" or pdf == "S":
+                safe_ev_id = sanitize_identifier(event_id or "event", max_len=64)
                 safe_exam = re.sub(r"[^a-zA-Z0-9_\-]", "_", exam_name)[:30]
-                filename = f"evento_{event_id}_{safe_exam}.pdf" if safe_exam else f"evento_{event_id}.pdf"
+                filename = f"evento_{safe_ev_id}_{safe_exam}.pdf" if safe_exam else f"evento_{safe_ev_id}.pdf"
                 dest_file = patient_dir / filename
 
                 download_tasks.append({

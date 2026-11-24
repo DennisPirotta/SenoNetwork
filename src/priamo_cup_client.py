@@ -15,6 +15,7 @@ import logging
 import os
 from pathlib import Path
 import re
+import threading
 from typing import Any, List, Optional, Tuple, Union
 from urllib.parse import urlparse
 import warnings
@@ -23,7 +24,7 @@ from bs4 import BeautifulSoup
 from requests import Session, RequestException
 
 from src.config import Settings, get_settings
-from src.utils import mask_phi
+from src.utils import atomic_write_bytes, mask_phi
 
 logger = logging.getLogger("PriamoCupClient")
 
@@ -135,8 +136,22 @@ class PriamoCupClient:
                 "CF-Access-Client-Secret": self.cf_client_secret,
             })
         self._is_authenticated = False
+        self._auth_lock = threading.RLock()
+        self._auth_generation = 0
 
-    def authenticate(self, force: bool = False) -> None:
+    def _raw_session_call(self, fn, *args, **kwargs):
+        if self.verify_ssl:
+            return fn(*args, **kwargs)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", urllib3.exceptions.InsecureRequestWarning)
+            return fn(*args, **kwargs)
+
+    @staticmethod
+    def _is_login_redirect(resp: Any) -> bool:
+        resp_url = getattr(resp, "url", None)
+        return isinstance(resp_url, str) and "/Account/Login" in resp_url
+
+    def authenticate(self, force: bool = False, expected_generation: Optional[int] = None) -> None:
         """Esegue il login su PriamoHOME acquisendo il cookie di sessione .PRIAMOAUTH.
 
         Il cookie è valido per l'intero dominio .valduce.it e garantisce l'accesso a PriamoCUP.
@@ -144,95 +159,105 @@ class PriamoCupClient:
         if self._is_authenticated and not force:
             return
 
-        if not self.username or not self.password:
-            raise PriamoCupAuthError("Credenziali Priamo mancanti (PRIAMO_USERNAME / PRIAMO_PASSWORD).")
+        with self._auth_lock:
+            if expected_generation is not None and self._auth_generation != expected_generation:
+                return
+            if self._is_authenticated and not force:
+                return
 
-        login_url = f"{self.home_url}/Account/Login"
-        logger.info(f"Autenticazione su PriamoHOME ({login_url}) come utente '{mask_phi(self.username)}'...")
+            if not self.username or not self.password:
+                raise PriamoCupAuthError("Credenziali Priamo mancanti (PRIAMO_USERNAME / PRIAMO_PASSWORD).")
 
-        def _do_request(fn, *a, **kw):
-            if self.verify_ssl:
-                return fn(*a, **kw)
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore", urllib3.exceptions.InsecureRequestWarning)
-                return fn(*a, **kw)
+            login_url = f"{self.home_url}/Account/Login"
+            logger.info(f"Autenticazione su PriamoHOME ({login_url}) come utente '{mask_phi(self.username)}'...")
 
-        try:
-            resp_get = _do_request(self.session.get, login_url, timeout=(5, 30), verify=self.verify_ssl)
-            resp_get.raise_for_status()
-        except RequestException as e:
-            raise PriamoCupAuthError(f"Impossibile raggiungere l'endpoint di login PriamoHOME ({login_url}): {e}") from e
+            try:
+                resp_get = self._raw_session_call(self.session.get, login_url, timeout=(5, 30), verify=self.verify_ssl)
+                resp_get.raise_for_status()
+            except RequestException as e:
+                raise PriamoCupAuthError(f"Impossibile raggiungere l'endpoint di login PriamoHOME ({login_url}): {e}") from e
 
-        soup = BeautifulSoup(resp_get.text, "html.parser")
-        token_input = soup.find("input", {"name": "__RequestVerificationToken"})
-        if token_input is None:
-            raise PriamoCupAuthError(f"Token di verifica non trovato nel form di login su {login_url}")
+            soup = BeautifulSoup(resp_get.text, "html.parser")
+            token_input = soup.find("input", {"name": "__RequestVerificationToken"})
+            if token_input is None:
+                raise PriamoCupAuthError(f"Token di verifica non trovato nel form di login su {login_url}")
 
-        payload = {
-            "UserName": self.username,
-            "Password": self.password,
-            "__RequestVerificationToken": str(token_input.get("value", "")),
-        }
+            payload = {
+                "UserName": self.username,
+                "Password": self.password,
+                "__RequestVerificationToken": str(token_input.get("value", "")),
+            }
 
-        try:
-            resp_post = _do_request(
-                self.session.post,
-                login_url,
-                data=payload,
-                allow_redirects=True,
-                timeout=(5, 30),
-                verify=self.verify_ssl,
-            )
-            resp_post.raise_for_status()
-        except RequestException as e:
-            raise PriamoCupAuthError(f"Errore durante l'invio delle credenziali di login: {e}") from e
+            try:
+                resp_post = self._raw_session_call(
+                    self.session.post,
+                    login_url,
+                    data=payload,
+                    allow_redirects=True,
+                    timeout=(5, 30),
+                    verify=self.verify_ssl,
+                )
+                resp_post.raise_for_status()
+            except RequestException as e:
+                raise PriamoCupAuthError(f"Errore durante l'invio delle credenziali di login: {e}") from e
 
-        # Estrazione manuale del cookie .PRIAMOAUTH da Set-Cookie per gestire mismatch di dominio
-        all_responses = list(resp_post.history) + [resp_post]
-        for resp in all_responses:
-            raw_headers = getattr(resp.raw, "headers", None)
-            set_cookies = []
-            if raw_headers and hasattr(raw_headers, "getlist"):
-                set_cookies = raw_headers.getlist("Set-Cookie")
-            elif raw_headers and hasattr(raw_headers, "get_all"):
-                set_cookies = raw_headers.get_all("Set-Cookie")
-            elif "Set-Cookie" in resp.headers:
-                set_cookies = [resp.headers["Set-Cookie"]]
+            # Estrazione manuale del cookie .PRIAMOAUTH da Set-Cookie per gestire mismatch di dominio
+            home_parsed = urlparse(self.home_url)
+            cup_parsed = urlparse(self.cup_url)
+            host_https = {}
+            for parsed in (home_parsed, cup_parsed):
+                if parsed.hostname:
+                    host_https[parsed.hostname] = host_https.get(parsed.hostname, False) or (parsed.scheme == "https")
 
-            for sc in set_cookies:
-                match = re.search(r"(?i)\.PRIAMOAUTH=([^;]+)", sc)
-                if match:
-                    priamo_auth_val = match.group(1).strip()
-                    home_host = urlparse(self.home_url).hostname
-                    cup_host = urlparse(self.cup_url).hostname
-                    for h in {x for x in (home_host, cup_host) if x}:
-                        self.session.cookies.set(".PRIAMOAUTH", priamo_auth_val, domain=h, path="/")
-                    break
+            all_responses = list(resp_post.history) + [resp_post]
+            for resp in all_responses:
+                raw_headers = getattr(resp.raw, "headers", None)
+                set_cookies = []
+                if raw_headers and hasattr(raw_headers, "getlist"):
+                    set_cookies = raw_headers.getlist("Set-Cookie")
+                elif raw_headers and hasattr(raw_headers, "get_all"):
+                    set_cookies = raw_headers.get_all("Set-Cookie")
+                elif "Set-Cookie" in resp.headers:
+                    set_cookies = [resp.headers["Set-Cookie"]]
 
-        # Verifica cookie .PRIAMOAUTH
-        cookies = self.session.cookies.get_dict()
-        if ".PRIAMOAUTH" not in cookies:
-            # Verifica se siamo rimasti sul form di login
-            if "/Account/Login" in resp_post.url:
-                raise PriamoCupAuthError(f"Login fallito su Priamo: credenziali non valide o sessione non autorizzata ({resp_post.url}).")
-            raise PriamoCupAuthError(f"Login fallito: cookie '.PRIAMOAUTH' non acquisito dopo la chiamata a {resp_post.url}.")
+                for sc in set_cookies:
+                    match = re.search(r"(?i)\.PRIAMOAUTH=([^;]+)", sc)
+                    if match:
+                        priamo_auth_val = match.group(1).strip()
+                        for h, is_https in host_https.items():
+                            self.session.cookies.set(
+                                ".PRIAMOAUTH",
+                                priamo_auth_val,
+                                domain=h,
+                                path="/",
+                                secure=is_https,
+                                rest={"HttpOnly": True},
+                            )
+                        break
 
-        self._is_authenticated = True
-        logger.info("Autenticazione su PriamoHOME avvenuta con successo (.PRIAMOAUTH acquisito).")
+            # Verifica cookie .PRIAMOAUTH
+            cookies = self.session.cookies.get_dict()
+            if ".PRIAMOAUTH" not in cookies:
+                # Verifica se siamo rimasti sul form di login
+                if self._is_login_redirect(resp_post):
+                    raise PriamoCupAuthError(f"Login fallito su Priamo: credenziali non valide o sessione non autorizzata ({resp_post.url}).")
+                raise PriamoCupAuthError(f"Login fallito: cookie '.PRIAMOAUTH' non acquisito dopo la chiamata a {resp_post.url}.")
+
+            self._is_authenticated = True
+            self._auth_generation += 1
+            logger.info("Autenticazione su PriamoHOME avvenuta con successo (.PRIAMOAUTH acquisito).")
 
     def get_csrf_token(self) -> str:
         """Recupera il token CSRF (requestVerificationToken) per le chiamate API di PriamoCUP."""
         self.authenticate()
         token_page_url = f"{self.cup_url}/Riepilogo/FoglioLavoro"
+        gen_before = self._auth_generation
 
         try:
-            with warnings.catch_warnings():
-                if not self.verify_ssl:
-                    warnings.simplefilter("ignore", urllib3.exceptions.InsecureRequestWarning)
-                resp = self.session.get(token_page_url, timeout=(5, 30), verify=self.verify_ssl)
-                if resp.status_code in (401, 403):
-                    self.authenticate(force=True)
-                    resp = self.session.get(token_page_url, timeout=(5, 30), verify=self.verify_ssl)
+            resp = self._raw_session_call(self.session.get, token_page_url, timeout=(5, 30), verify=self.verify_ssl)
+            if resp.status_code in (401, 403) or self._is_login_redirect(resp):
+                self.authenticate(force=True, expected_generation=gen_before)
+                resp = self._raw_session_call(self.session.get, token_page_url, timeout=(5, 30), verify=self.verify_ssl)
             resp.raise_for_status()
         except RequestException as e:
             raise PriamoCupAuthError(f"Impossibile accedere alla pagina Riepilogo FoglioLavoro ({token_page_url}): {e}") from e
@@ -369,10 +394,26 @@ class PriamoCupClient:
 
         esporta_url = f"{self.cup_url}/api/RiepilogoFoglioLavoro/Esporta"
         try:
-            with warnings.catch_warnings():
-                if not self.verify_ssl:
-                    warnings.simplefilter("ignore", urllib3.exceptions.InsecureRequestWarning)
-                resp_export = self.session.post(esporta_url, headers=headers, data=payload, timeout=(10, 60), verify=self.verify_ssl)
+            gen_before = self._auth_generation
+            resp_export = self._raw_session_call(
+                self.session.post,
+                esporta_url,
+                headers=headers,
+                data=payload,
+                timeout=(10, 60),
+                verify=self.verify_ssl,
+            )
+            if resp_export.status_code in (401, 403) or self._is_login_redirect(resp_export):
+                self.authenticate(force=True, expected_generation=gen_before)
+                headers["RequestVerificationToken"] = self.get_csrf_token()
+                resp_export = self._raw_session_call(
+                    self.session.post,
+                    esporta_url,
+                    headers=headers,
+                    data=payload,
+                    timeout=(10, 60),
+                    verify=self.verify_ssl,
+                )
             resp_export.raise_for_status()
         except RequestException as e:
             raise RuntimeError(f"Errore durante la richiesta di generazione report PriamoCUP: {e}") from e
@@ -397,25 +438,30 @@ class PriamoCupClient:
         dest_path = out_dir / local_name
 
         try:
-            with warnings.catch_warnings():
-                if not self.verify_ssl:
-                    warnings.simplefilter("ignore", urllib3.exceptions.InsecureRequestWarning)
-                with contextlib.closing(
-                    self.session.get(
-                        preleva_url,
-                        params={"fileName": remote_filename},
-                        stream=True,
-                        timeout=(10, 60),
-                        verify=self.verify_ssl,
-                    )
-                ) as resp_down:
-                    resp_down.raise_for_status()
-                    chunks = list(resp_down.iter_content(chunk_size=8192))
-            raw_bytes = b"".join(chunks)
-            if not raw_bytes.startswith(b"PK"):
-                raise RuntimeError("Il file scaricato da PriamoCUP non è un archivio Excel (.xlsx) valido.")
-            with open(dest_path, "wb") as f:
-                f.write(raw_bytes)
+            with contextlib.closing(
+                self._raw_session_call(
+                    self.session.get,
+                    preleva_url,
+                    params={"fileName": remote_filename},
+                    stream=True,
+                    timeout=(10, 60),
+                    verify=self.verify_ssl,
+                )
+            ) as resp_down:
+                resp_down.raise_for_status()
+                header_checked = False
+                buf = bytearray()
+                for chunk in resp_down.iter_content(chunk_size=8192):
+                    if not chunk:
+                        continue
+                    buf.extend(chunk)
+                    if not header_checked and len(buf) >= 2:
+                        header_checked = True
+                        if bytes(buf[:2]) != b"PK":
+                            raise RuntimeError("Il file scaricato da PriamoCUP non è un archivio Excel (.xlsx) valido.")
+                if len(buf) < 2 or bytes(buf[:2]) != b"PK":
+                    raise RuntimeError("Il file scaricato da PriamoCUP non è un archivio Excel (.xlsx) valido.")
+                atomic_write_bytes(dest_path, bytes(buf))
         except RequestException as e:
             raise RuntimeError(f"Errore durante il prelievo del file esportato da PriamoCUP ({remote_filename}): {e}") from e
 
@@ -627,14 +673,19 @@ class PriamoCupClient:
 
         if month is not None:
             month_str = str(month).strip()
-            if "-" in month_str:
-                parts = month_str.split("-")
-                target_year = int(parts[0])
-                target_month = int(parts[1])
-            else:
+            m_ym = re.fullmatch(r"(\d{4})-(\d{1,2})", month_str)
+            m_m = re.fullmatch(r"(\d{1,2})", month_str)
+            if m_ym:
+                target_year = int(m_ym.group(1))
+                target_month = int(m_ym.group(2))
+            elif m_m:
                 base_year = (ref_date.year if isinstance(ref_date, date) else date.today().year)
                 target_year = base_year
-                target_month = int(month_str)
+                target_month = int(m_m.group(1))
+            else:
+                raise ValueError(f"Formato mese non valido: {month!r} (atteso 'MM' o 'YYYY-MM')")
+            if not (1 <= target_month <= 12):
+                raise ValueError(f"Numero mese non valido: {target_month} (atteso 1..12)")
 
             logger.info(f"Download fogli lavoro PriamoCUP per il mese {target_month:02d}/{target_year}...")
             return self.export_month(
@@ -655,19 +706,8 @@ class PriamoCupClient:
                 output_dir=output_dir,
             )
 
-        if start_date is not None:
-            eff_end = end_date if end_date is not None else start_date
-            logger.info(f"Download fogli lavoro PriamoCUP dal {start_date} al {eff_end}...")
-            return self.export_worksheets(
-                start_date=start_date,
-                end_date=eff_end,
-                codice_unita=codice_unita,
-                agende=agendas,
-                output_dir=output_dir,
-            )
-
         if weeks is not None:
-            base_ref = ref_date or start_date or date.today()
+            base_ref = start_date if start_date is not None else (ref_date or date.today())
             logger.info(f"Download fogli lavoro PriamoCUP per {weeks} settimana/e da {base_ref}...")
             if weeks > 1:
                 files = self.export_weeks(
@@ -680,6 +720,17 @@ class PriamoCupClient:
                 return files[0]
             return self.export_week(
                 ref_date=base_ref,
+                codice_unita=codice_unita,
+                agende=agendas,
+                output_dir=output_dir,
+            )
+
+        if start_date is not None:
+            eff_end = end_date if end_date is not None else start_date
+            logger.info(f"Download fogli lavoro PriamoCUP dal {start_date} al {eff_end}...")
+            return self.export_worksheets(
+                start_date=start_date,
+                end_date=eff_end,
                 codice_unita=codice_unita,
                 agende=agendas,
                 output_dir=output_dir,

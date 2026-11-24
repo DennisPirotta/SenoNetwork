@@ -15,6 +15,7 @@ Esempi di utilizzo:
 
 import argparse
 import csv
+import io
 import json
 import logging
 from pathlib import Path
@@ -24,8 +25,10 @@ from dotenv import load_dotenv
 # Add project root to sys.path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from src.config import Settings
-from src.redcap_service import REDCapService, list_redcap_records
+from src.config import get_settings
+from src.form_classifier import AVAILABLE_FORMS
+from src.redcap_service import REDCapService
+from src.utils import atomic_write_text, sanitize_csv_cell
 
 load_dotenv()
 
@@ -122,16 +125,9 @@ def display_rich_table(records: list):
             return "[red]○[/red]"
         return "[dim]-[/dim]"
 
-    forms_keys = [
-        "dati_del_paziente_complete",
-        "radiologia_complete",
-        "anatomia_patologica_preoperatoria_complete",
-        "struttura_della_lesione_complete",
-        "anatomia_patologica_complete",
-        "chemioterapia_complete",
-        "radioterapia_complete",
-        "recidiva_complete"
-    ]
+    forms_list = list(AVAILABLE_FORMS.keys())
+    forms_keys = [f"{fn}_complete" for fn in forms_list]
+    total_forms = len(forms_keys) or 1
 
     for r in records:
         pid = str(r.get("record_id", ""))
@@ -140,7 +136,7 @@ def display_rich_table(records: list):
         fullname = f"{name} {surname}".strip() or "[dim]N/D[/dim]"
         dob = str(r.get("date_of_birth", "")).strip() or "-"
 
-        badges = [_badge(r.get(k)) for k in forms_keys]
+        badges = [_badge(r.get(k)) for k in forms_keys[:8]]
         completed_count = sum(1 for k in forms_keys if str(r.get(k) or "").strip() == "2")
 
         table.add_row(
@@ -148,7 +144,7 @@ def display_rich_table(records: list):
             fullname,
             dob,
             *badges,
-            f"{completed_count}/8"
+            f"{completed_count}/{total_forms}"
         )
 
     console.print(table)
@@ -157,6 +153,7 @@ def display_rich_table(records: list):
 
 def display_plain_table(records: list):
     """Plain text fallback."""
+    total_forms = len(AVAILABLE_FORMS) or 8
     print("=" * 80)
     print(f" RECORD REDCAP ({len(records)} TOTALI) ")
     print("=" * 80)
@@ -168,14 +165,14 @@ def display_plain_table(records: list):
         surname = str(r.get("surname", "")).strip()
         fullname = f"{name} {surname}".strip() or "N/D"
         dob = str(r.get("date_of_birth", "")).strip() or "-"
-        comp = sum(1 for k in r if k.endswith("_complete") and str(r.get(k) or "").strip() == "2")
-        print(f"{pid:<25} | {fullname:<30} | {dob:<12} | {comp}/8")
+        comp = sum(1 for fn in AVAILABLE_FORMS if str(r.get(f"{fn}_complete") or "").strip() == "2")
+        print(f"{pid:<25} | {fullname:<30} | {dob:<12} | {comp}/{total_forms}")
     print("-" * 80)
 
 
 def main():
     args = parse_args()
-    settings = Settings()
+    settings = get_settings()
 
     if not settings.redcap_api_url or not settings.redcap_api_token:
         print("[ERRORE] REDCAP_API_URL o REDCAP_API_TOKEN non impostati in .env!", file=sys.stderr)
@@ -204,7 +201,7 @@ def main():
         if args.output:
             out_path = Path(args.output)
             out_path.parent.mkdir(parents=True, exist_ok=True)
-            out_path.write_text(out_content, encoding="utf-8")
+            atomic_write_text(out_path, out_content)
             print(f"[OK] Esportati {len(records)} record in JSON: {out_path}")
         else:
             print(out_content)
@@ -223,11 +220,13 @@ def main():
 
         out_dest = Path(args.output) if args.output else Path("data/output/redcap_records_list.csv")
         out_dest.parent.mkdir(parents=True, exist_ok=True)
-        with open(out_dest, "w", newline="", encoding="utf-8-sig") as f:
-            writer = csv.DictWriter(f, fieldnames=all_keys)
-            writer.writeheader()
-            for r in records:
-                writer.writerow(r)
+        buf = io.StringIO()
+        writer = csv.DictWriter(buf, fieldnames=all_keys)
+        writer.writeheader()
+        for r in records:
+            safe_row = {k: sanitize_csv_cell(r.get(k, "")) for k in all_keys}
+            writer.writerow(safe_row)
+        atomic_write_text(out_dest, "\ufeff" + buf.getvalue())
         print(f"[OK] Esportati {len(records)} record in CSV: {out_dest}")
         return
 
@@ -240,8 +239,7 @@ def main():
     if args.output:
         out_path = Path(args.output)
         out_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(out_path, "w", encoding="utf-8") as f:
-            json.dump(records, f, indent=2, ensure_ascii=False)
+        atomic_write_text(out_path, json.dumps(records, indent=2, ensure_ascii=False))
         print(f"[OK] Copia JSON salvata in: {out_path}")
 
 

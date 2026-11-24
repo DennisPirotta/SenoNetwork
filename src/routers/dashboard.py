@@ -1,15 +1,17 @@
 """Dashboard Overview & KPI endpoint."""
 
-from concurrent.futures import ThreadPoolExecutor
+import logging
 from pathlib import Path
 from typing import Any, Dict
 from fastapi import APIRouter, Depends
+from src.ai_extractor import probe_ai_health
 from src.config import Settings, get_settings
-from src.ai_extractor import LlamaCppExtractor, OllamaExtractor
 from src.dotnet_client import DotNetApiClient
+from src.form_classifier import AVAILABLE_FORMS
 from src.redcap_service import REDCapService
 from src.routers.security import verify_api_key
 
+logger = logging.getLogger(__name__)
 router = APIRouter(tags=["Dashboard"])
 
 
@@ -18,27 +20,14 @@ def get_dashboard_overview(
     settings: Settings = Depends(get_settings)
 ) -> Dict[str, Any]:
     """Provides high-level KPI metrics, health checks, and recent activity for the web dashboard."""
-
-    # 1. Health check of external services (concurrently probed)
-    ollama = OllamaExtractor(base_url=settings.ollama_base_url)
-    llamacpp = LlamaCppExtractor(
-        base_url=settings.llama_cpp_base_url,
-        cf_client_id=settings.ai_cloudflared_client_id,
-        cf_client_secret=settings.ai_cloudflared_client_secret
-    )
+    ai_status = probe_ai_health(settings)
     dotnet = DotNetApiClient(settings=settings)
-
-    with ThreadPoolExecutor(max_workers=2) as pool:
-        fut_llama = pool.submit(llamacpp.is_available)
-        fut_ollama = pool.submit(ollama.is_available)
-        llama_ok = fut_llama.result()
-        ollama_ok = fut_ollama.result()
 
     health = {
         "status": "online",
         "ai_backend_configured": settings.ai_backend,
-        "llama_cpp_rpc_available": llama_ok,
-        "ollama_available": ollama_ok,
+        "llama_cpp_rpc_available": ai_status["llama_cpp_rpc_available"],
+        "ollama_available": ai_status["ollama_available"],
         "ollama_model": settings.ollama_model,
         "redcap_configured": bool(settings.redcap_api_url and settings.redcap_api_token),
         "priamo_dotnet_configured": dotnet.is_priamo_configured,
@@ -64,18 +53,28 @@ def get_dashboard_overview(
             }
 
     # 3. REDCap records summary KPI
-    redcap_summary = {"records_count": 0, "status": "unconfigured"}
+    total_forms = len(AVAILABLE_FORMS)
+    redcap_summary: Dict[str, Any] = {"records_count": 0, "total_forms": total_forms, "status": "unconfigured"}
     if settings.redcap_api_url and settings.redcap_api_token:
         try:
             redcap_svc = REDCapService(api_url=settings.redcap_api_url, api_token=settings.redcap_api_token)
             summary_data = redcap_svc.get_records_summary()
             redcap_summary = {
                 "records_count": len(summary_data),
-                "fully_completed_records": sum(1 for s in summary_data if s.get("forms_completed_count", 0) >= 8),
+                "fully_completed_records": sum(
+                    1 for s in summary_data if s.get("forms_completed_count", 0) >= total_forms
+                ),
+                "total_forms": total_forms,
                 "status": "connected"
             }
         except Exception as e:
-            redcap_summary = {"records_count": 0, "status": "error", "error": str(e)}
+            logger.warning("Errore recupero riepilogo REDCap per dashboard: %s", e)
+            redcap_summary = {
+                "records_count": 0,
+                "total_forms": total_forms,
+                "status": "error",
+                "error": "Connessione REDCap non riuscita."
+            }
 
     # 4. Local files count
     downloads_dir = Path(settings.downloads_dir)

@@ -129,7 +129,10 @@ class RedCapDataAuditor:
     def build_completion_matrix(self, records: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
         """Builds per-form completion statistics and per-patient status matrix from REDCap records."""
         if records is None:
-            records = self.redcap_service.export_records_from_api()
+            summary_fields = ["record_id", "name", "surname"] + [
+                f"{form_name}_complete" for form_name in AVAILABLE_FORMS.keys()
+            ]
+            records = self.redcap_service.export_records_from_api(fields=summary_fields)
 
         form_stats: Dict[str, Dict[str, int]] = {
             form_name: {"complete": 0, "unverified": 0, "incomplete": 0, "not_started": 0}
@@ -326,9 +329,9 @@ class RedCapDataAuditor:
             if grade and grade.lower() != "none":
                 profile.grade_distribution[grade] = profile.grade_distribution.get(grade, 0) + 1
 
-            # First breast operation
+            # First breast operation (ignore explicit '0' = No/None)
             op = str(r.get("first_breast_operation") or "").strip()
-            if op and op.lower() != "none":
+            if op and op.lower() not in ("0", "none", "nan"):
                 profile.surgery_types[op] = profile.surgery_types.get(op, 0) + 1
 
             # Laterality
@@ -411,7 +414,7 @@ class RedCapDataAuditor:
                     if not k.endswith("_complete")
                     and k != "record_id"
                     and (form_name == "dati_del_paziente" or k not in demographic_keys)
-                    and v not in (None, "", "0", "None", "nan")
+                    and (v == "1" if "___" in k else v not in (None, "", "None", "nan"))
                     and not k.startswith("text_")
                 ]
                 is_empty_form = len(form_keys_with_data) == 0

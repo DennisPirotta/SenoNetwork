@@ -1,6 +1,7 @@
 import argparse
 from datetime import datetime
 import logging
+import re
 import sys
 from pathlib import Path
 from typing import List, Optional
@@ -16,6 +17,12 @@ from src.pdf_extractor import PDFExtractor
 from src.pipeline import ExtractionPipeline
 from src.redcap_service import REDCapService
 from src.sync_service import RedCapSyncService, SyncSummaryReport
+from src.utils import (
+    atomic_write_text,
+    build_patient_slug,
+    sanitize_csv_cell,
+    sanitize_identifier,
+)
 
 load_dotenv()
 
@@ -28,6 +35,14 @@ try:
     HAS_RICH = True
 except ImportError:
     HAS_RICH = False
+
+
+def _cli_print(msg: str) -> None:
+    """Prints a console message rendering Rich markup if available, or stripping tags."""
+    if HAS_RICH:
+        Console().print(msg)
+    else:
+        print(re.sub(r"\[/?[^\]]+\]", "", msg))
 
 
 def setup_logger(verbose: bool = False):
@@ -431,6 +446,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Avvia il server HTTP REST (FastAPI) per integrazione diretta con l'applicazione .NET."
     )
     parser.add_argument(
+        "--host",
+        default=None,
+        help="Host di ascolto per il server HTTP (default: da .env o 127.0.0.1)."
+    )
+    parser.add_argument(
         "--port",
         type=int,
         default=8000,
@@ -639,9 +659,9 @@ def main():
 
     # 1. Mode: Serve FastAPI
     if args.serve:
-        print(f"-> Avvio microservizio HTTP FastAPI per integrazione .NET sulla porta {args.port}...")
+        print(f"-> Avvio microservizio HTTP FastAPI per integrazione .NET su {args.host or settings.api_host}:{args.port}...")
         from src.api_server import run_server
-        run_server(port=args.port)
+        run_server(host=args.host, port=args.port)
         return
 
     # 1.0 Mode: Clinical Guidelines Management
@@ -676,11 +696,12 @@ def main():
             else:
                 pdf_files = PDFExtractor.find_pdf_files(args.pdf)
         elif args.patient_id:
-            p_dir = settings.downloads_dir / str(args.patient_id)
+            safe_pid = sanitize_identifier(str(args.patient_id))
+            p_dir = settings.downloads_dir / safe_pid
             if p_dir.exists():
                 pdf_files = sorted(p_dir.glob("*.pdf"))
             else:
-                print(f"[WARN] Nessun referto scaricato trovato per il paziente {args.patient_id} in {p_dir}.", file=sys.stderr)
+                print(f"[WARN] Nessun referto scaricato trovato per il paziente {safe_pid} in {p_dir}.", file=sys.stderr)
         else:
             cand_p1 = settings.downloads_dir / "1"
             if cand_p1.exists() and list(cand_p1.glob("*.pdf")):
@@ -788,16 +809,35 @@ def main():
         from scripts.verify_patients_in_priamo import display_results_dashboard
 
         dotnet = DotNetApiClient(settings=settings)
-        if args.patient_id or (args.name and args.surname):
-            p_name = args.name or ""
-            p_surname = args.surname or ""
+        if args.name and args.surname:
+            p_name = args.name
+            p_surname = args.surname
             p_dob = args.dob or ""
             print(f"-> Verifica esistenza paziente singolo su Priamo: {p_name} {p_surname} ({p_dob})...")
             res = dotnet.verify_patient_in_priamo(name=p_name, surname=p_surname, date_of_birth=p_dob)
             if res:
                 print(f"[OK] Paziente TROVATO su Priamo: ID={res.patient_id}, CF={res.codice_fiscale or 'N.D.'}")
             else:
-                print(f"[WARN] Paziente non trovato su Priamo.")
+                print("[WARN] Paziente non trovato su Priamo.")
+            return
+
+        if args.patient_id:
+            safe_pid = sanitize_identifier(str(args.patient_id))
+            print(f"-> Risoluzione e verifica paziente su Priamo per identificativo '{safe_pid}'...")
+            res = dotnet._resolve_patient(
+                safe_pid,
+                priamo_id=safe_pid if safe_pid.isdigit() else None,
+            )
+            if res:
+                print(
+                    f"[OK] Paziente TROVATO/RISOLTO su Priamo: {res.name} {res.surname} "
+                    f"(ID={res.patient_id}, CF={res.codice_fiscale or 'N.D.'})"
+                )
+            else:
+                print(
+                    f"[WARN] Impossibile risolvere '{safe_pid}' su Priamo. "
+                    "Specifica --name, --surname e --dob per una ricerca anagrafica esatta."
+                )
             return
 
         target_excel = args.excel or settings.patients_excel_path
@@ -849,12 +889,16 @@ def main():
                 interval_seconds=interval_sec,
                 target_forms=target_forms,
                 auto_upload=not args.dry_run,
-                dry_run=args.dry_run
+                dry_run=args.dry_run,
+                force_reprocess=args.force_reprocess,
+                limit=args.limit,
+                only_incomplete=not args.all_patients,
+                overwrite_mode=args.overwrite_mode or "fill_missing",
             )
             return
 
         if args.patient_id:
-            print(f"-> Esecuzione controllo e aggiornamento referti per paziente: [bold cyan]{args.patient_id}[/bold cyan]")
+            _cli_print(f"-> Esecuzione controllo e aggiornamento referti per paziente: [bold cyan]{args.patient_id}[/bold cyan]")
             res = sync_svc.check_and_update_patient(
                 patient_id=args.patient_id,
                 name=args.name,
@@ -864,7 +908,7 @@ def main():
                 auto_upload=not args.dry_run,
                 dry_run=args.dry_run,
                 force_reprocess=args.force_reprocess,
-                overwrite_mode=args.overwrite_mode
+                overwrite_mode=args.overwrite_mode or "fill_missing",
             )
             report = SyncSummaryReport(
                 timestamp=datetime.now().isoformat(),
@@ -886,7 +930,8 @@ def main():
             dry_run=args.dry_run,
             force_reprocess=args.force_reprocess,
             limit=args.limit,
-            only_incomplete=not args.all_patients
+            only_incomplete=not args.all_patients,
+            overwrite_mode=args.overwrite_mode or "fill_missing",
         )
         display_sync_summary(report)
         return
@@ -897,8 +942,9 @@ def main():
         pipeline = PatientPipeline(settings=settings)
 
         # Se non è specificato patient_id, cerca se esiste già su REDCap per mantenerne il record_id nativo,
-        # altrimenti genera automaticamente il prossimo record_id numerico nativo da REDCap
+        # altrimenti genera automaticamente il prossimo record_id numerico nativo da REDCap (solo in upload live)
         p_id = args.patient_id
+        should_upload = args.import_to_redcap and not args.dry_run
         if settings.redcap_api_url and settings.redcap_api_token:
             if not p_id and args.name and args.surname:
                 matched_id = pipeline.redcap_service.find_record_id_by_demographics(
@@ -906,17 +952,17 @@ def main():
                 )
                 if matched_id:
                     p_id = matched_id
-                    print(f"-> Mantenuto record_id nativo di REDCap: [bold cyan]{p_id}[/bold cyan]")
-            if not p_id:
+                    _cli_print(f"-> Mantenuto record_id nativo di REDCap: [bold cyan]{p_id}[/bold cyan]")
+            if not p_id and should_upload:
                 next_id = pipeline.redcap_service.generate_next_record_name()
                 if next_id:
                     p_id = next_id
-                    print(f"-> Generato automaticamente record_id numerico da REDCap: [bold cyan]{p_id}[/bold cyan]")
+                    _cli_print(f"-> Generato automaticamente record_id numerico da REDCap: [bold cyan]{p_id}[/bold cyan]")
 
         if not p_id:
-            p_id = f"{args.name}-{args.surname}-{args.dob or 'unknown'}".lower().replace(" ", "-")
+            p_id = build_patient_slug(args.name or "", args.surname or "", args.dob)
 
-        print(f"-> Avvio pipeline end-to-end per paziente: [bold cyan]{p_id}[/bold cyan]")
+        _cli_print(f"-> Avvio pipeline end-to-end per paziente: [bold cyan]{p_id}[/bold cyan]")
         # Check if local PDF was also specified
         pdf_paths = None
         if args.pdf:
@@ -1020,7 +1066,7 @@ def main():
             sys.exit(1)
         input_file = target_path
         using_cup = False
-        print(f"-> Caricamento coorte pazienti dal registro Excel: [bold cyan]{input_file}[/bold cyan]")
+        _cli_print(f"-> Caricamento coorte pazienti dal registro Excel: [bold cyan]{input_file}[/bold cyan]")
     else:
         # Download live da PriamoCUP - scarica ogni volta il file aggiornato
         if not settings.priamo_username or not settings.priamo_password:
@@ -1042,9 +1088,9 @@ def main():
             weeks=args.weeks,
             codice_unita=unit,
             agende=agendas_list,
-            output_dir="data/cup",
+            output_dir=str(settings.cup_dir),
         )
-        print(f"[OK] Foglio di lavoro aggiornato scaricato con successo: [bold green]{input_file}[/bold green]")
+        _cli_print(f"[OK] Foglio di lavoro aggiornato scaricato con successo: [bold green]{input_file}[/bold green]")
 
     # Estrazione anagrafica univoca dei pazienti (PAZ_COGNOME, PAZ_NOME, PAZ_DATA_NASCITA)
     pazienti = estrai_pazienti_univoci(
@@ -1080,12 +1126,14 @@ def main():
         rows = [p.to_export_dict() for p in pazienti]
         df_out = pd.DataFrame(rows)
         if out_path.suffix.lower() == ".json":
-            df_out.to_json(out_path, orient="records", indent=2, force_ascii=False)
+            atomic_write_text(out_path, df_out.to_json(orient="records", indent=2, force_ascii=False))
         elif out_path.suffix.lower() == ".xlsx":
-            df_out.to_excel(out_path, index=False)
+            df_safe = df_out.map(lambda v: sanitize_csv_cell(v) if isinstance(v, str) else v)
+            df_safe.to_excel(out_path, index=False, engine="openpyxl")
         else:
-            df_out.to_csv(out_path, index=False, encoding="utf-8")
-        print(f"[OK] Anagrafica univoca estratta e salvata in: [bold cyan]{out_path}[/bold cyan]")
+            df_safe = df_out.map(lambda v: sanitize_csv_cell(v) if isinstance(v, str) else v)
+            atomic_write_text(out_path, df_safe.to_csv(index=False))
+        _cli_print(f"[OK] Anagrafica univoca estratta e salvata in: [bold cyan]{out_path}[/bold cyan]")
 
     # Pipeline execution check: avvia l'elaborazione se esplicitamente richiesta via --process, --import-to-redcap o --excel
     should_run_pipeline = args.run_pipeline or args.import_to_redcap or (args.excel and not args.extract_only)
@@ -1099,15 +1147,14 @@ def main():
     # Avvio PatientPipeline
     from src.patient_pipeline import PatientPipeline
     pipeline = PatientPipeline(settings=settings)
+    should_upload = args.import_to_redcap and not args.dry_run
     print(f"\n-> Avvio pipeline clinica IA su {len(pazienti)} pazienti...")
 
     # Pre-carica anagrafica REDCap una volta sola prima del loop batch per evitare query O(N^2)
     redcap_records_cache = None
     if settings.redcap_api_url and settings.redcap_api_token:
         try:
-            redcap_records_cache = pipeline.redcap_service.export_records_from_api(
-                fields=["record_id", "name", "surname", "date_of_birth"]
-            )
+            redcap_records_cache = pipeline.redcap_service._export_demographic_records()
         except Exception:
             redcap_records_cache = None
 
@@ -1126,7 +1173,7 @@ def main():
             if matched_id:
                 target_id = matched_id
                 print(f"-> Mantenuto record_id nativo di REDCap: '{matched_id}' per {p.nome} {p.cognome}")
-            else:
+            elif should_upload:
                 next_id = pipeline.redcap_service.generate_next_record_name()
                 if next_id:
                     target_id = next_id
@@ -1136,6 +1183,7 @@ def main():
                             "name": p.nome or "",
                             "surname": p.cognome,
                             "date_of_birth": p.data_nascita.isoformat() if p.data_nascita else "",
+                            "codice_fiscale": p.codice_fiscale or "",
                         })
                     print(f"-> Generato automaticamente record_id numerico da REDCap: '{next_id}' per {p.nome} {p.cognome}")
 
@@ -1147,7 +1195,8 @@ def main():
                 name=p.nome or "",
                 surname=p.cognome,
                 date_of_birth=p.data_nascita,
-                auto_upload=args.import_to_redcap and not args.dry_run
+                codice_fiscale=p.codice_fiscale,
+                auto_upload=should_upload,
             )
             results.append(res)
         except Exception as e:

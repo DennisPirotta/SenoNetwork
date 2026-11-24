@@ -7,6 +7,7 @@ from pathlib import Path
 import threading
 from typing import Any, Dict, List, Optional, Union
 import requests
+from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 
 from src.models import REDCapField
 from src.utils import normalize_person_name, parse_flexible_date, sanitize_identifier
@@ -15,6 +16,15 @@ logger = logging.getLogger(__name__)
 
 _ALLOCATED_IDS_LOCK = threading.Lock()
 _ALLOCATED_IDS_BY_PROJECT: Dict[str, set[str]] = {}
+_PROJECT_CF_LOCK = threading.Lock()
+_PROJECT_SUPPORTS_CF: Dict[str, bool] = {}
+
+_REDCAP_RETRY = retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=0.5, min=0.5, max=4),
+    retry=retry_if_exception_type((requests.ConnectionError, requests.Timeout)),
+    reraise=True,
+)
 
 
 class REDCapService:
@@ -33,6 +43,17 @@ class REDCapService:
             self.api_url = ""
         self.api_token = api_token.strip() if api_token else ""
         self._allocated_record_ids: set[str] = set()
+
+    @_REDCAP_RETRY
+    def _post_redcap(self, data: Dict[str, Any], timeout: int = 60) -> requests.Response:
+        """Executes a REDCap API HTTP POST with automatic retries on transient connection/timeout failures."""
+        return requests.post(self.api_url, data=data, timeout=timeout)
+
+    @staticmethod
+    def _default_form_names() -> List[str]:
+        """Returns the canonical REDCap instrument names from FormClassifier."""
+        from src.form_classifier import AVAILABLE_FORMS
+        return list(AVAILABLE_FORMS.keys())
 
     def fetch_metadata_from_api(self, forms: Optional[List[str]] = None) -> List[REDCapField]:
         """Fetches project metadata (data dictionary) directly from REDCap API.
@@ -56,7 +77,7 @@ class REDCapService:
             for idx, form in enumerate(forms):
                 payload[f"forms[{idx}]"] = form
 
-        response = requests.post(self.api_url, data=payload, timeout=30)
+        response = self._post_redcap(payload, timeout=30)
         response.raise_for_status()
 
         data = response.json()
@@ -187,10 +208,17 @@ class REDCapService:
         - For checkbox fields, confirmed findings ('1') are maintained.
         - Completed form flags ('2') are preserved.
         """
-        # Sort chronologically if document date metadata is available
+        # Sort chronologically parsing ISO/Italian dates properly
         sorted_records = sorted(
             records,
-            key=lambda r: str(r.get("_document_date") or r.get("date_of_follow_up_update") or r.get("data_visita") or "1970-01-01") if isinstance(r, dict) else "1970-01-01"
+            key=lambda r: (
+                parse_flexible_date(
+                    r.get("_document_date") or r.get("date_of_follow_up_update") or r.get("data_visita")
+                )
+                or date(1970, 1, 1)
+            )
+            if isinstance(r, dict)
+            else date(1970, 1, 1),
         )
 
         merged_by_key: Dict[str, Dict[str, Any]] = {}
@@ -318,7 +346,7 @@ class REDCapService:
             "returnFormat": "json"
         }
 
-        response = requests.post(self.api_url, data=payload, timeout=60)
+        response = self._post_redcap(payload, timeout=60)
         if not response.ok:
             error_detail = response.text.strip()
             try:
@@ -388,7 +416,7 @@ class REDCapService:
         if filter_logic:
             payload["filterLogic"] = filter_logic
 
-        response = requests.post(self.api_url, data=payload, timeout=60)
+        response = self._post_redcap(payload, timeout=60)
         response.raise_for_status()
         data = response.json()
         if not isinstance(data, list):
@@ -421,6 +449,30 @@ class REDCapService:
                 ids.append(rec_id)
         return ids
 
+    def _export_demographic_records(self, extra_fields: Optional[List[str]] = None) -> List[Dict[str, Any]]:
+        """Exports demographic lookup records, including `codice_fiscale` when supported by the REDCap schema."""
+        base_fields = ["record_id", "name", "surname", "date_of_birth"]
+        for ef in extra_fields or []:
+            if ef not in base_fields:
+                base_fields.append(ef)
+
+        proj_key = self._project_alloc_key()
+        with _PROJECT_CF_LOCK:
+            cf_supported = _PROJECT_SUPPORTS_CF.get(proj_key, True)
+
+        if cf_supported and "codice_fiscale" not in base_fields:
+            try:
+                return self.export_records_from_api(fields=base_fields + ["codice_fiscale"])
+            except requests.exceptions.HTTPError as e:
+                status_code = getattr(getattr(e, "response", None), "status_code", None)
+                body_lower = str(getattr(getattr(e, "response", None), "text", "") or e).lower()
+                if status_code == 400 and "codice_fiscale" in body_lower:
+                    with _PROJECT_CF_LOCK:
+                        _PROJECT_SUPPORTS_CF[proj_key] = False
+                    return self.export_records_from_api(fields=base_fields)
+                raise
+        return self.export_records_from_api(fields=base_fields)
+
     def find_record_id_by_demographics(
         self,
         name: Optional[str] = None,
@@ -447,9 +499,7 @@ class REDCapService:
         try:
             records = records_cache
             if records is None:
-                records = self.export_records_from_api(
-                    fields=["record_id", "name", "surname", "date_of_birth"]
-                )
+                records = self._export_demographic_records()
 
             cf_matches: List[str] = []
             demo_matches: List[str] = []
@@ -512,7 +562,7 @@ class REDCapService:
                         "content": "generateNextRecordName",
                         "format": "json"
                     }
-                    resp = requests.post(self.api_url, data=payload, timeout=15)
+                    resp = self._post_redcap(payload, timeout=15)
                     if resp.status_code == 200:
                         raw_val = resp.text.strip().strip('"').strip("'")
                         if raw_val and raw_val.isdigit():
@@ -566,20 +616,22 @@ class REDCapService:
                 if f not in target_fields:
                     target_fields.append(f)
 
+        form_names = self._default_form_names()
         if include_completion_status:
-            for frm in [
-                "dati_del_paziente",
-                "radiologia",
-                "anatomia_patologica_preoperatoria",
-                "struttura_della_lesione",
-                "anatomia_patologica",
-                "chemioterapia",
-                "radioterapia",
-                "recidiva",
-            ]:
+            for frm in form_names:
                 flag_key = f"{frm}_complete"
                 if flag_key not in target_fields:
                     target_fields.append(flag_key)
+
+        if not fields and include_demographics and not forms:
+            extra = [f for f in target_fields if f not in {"record_id", "name", "surname", "date_of_birth"}]
+            if filter_logic:
+                return self.export_records_from_api(
+                    fields=target_fields,
+                    forms=forms,
+                    filter_logic=filter_logic
+                )
+            return self._export_demographic_records(extra_fields=extra)
 
         query_fields = target_fields if (fields or include_completion_status or (include_demographics and not forms)) else None
 
@@ -592,20 +644,12 @@ class REDCapService:
     def get_records_summary(self) -> List[Dict[str, Any]]:
         """Returns a high-level summary list of all records with demographics and form status flags."""
         records = self.list_all_records(include_demographics=True, include_completion_status=True)
+        form_names = self._default_form_names()
         summary = []
         for r in records:
             forms_status = {}
             completed_count = 0
-            for frm in [
-                "dati_del_paziente",
-                "radiologia",
-                "anatomia_patologica_preoperatoria",
-                "struttura_della_lesione",
-                "anatomia_patologica",
-                "chemioterapia",
-                "radioterapia",
-                "recidiva",
-            ]:
+            for frm in form_names:
                 st = str(r.get(f"{frm}_complete") or "").strip()
                 label = "Completato" if st == "2" else ("Non verificato" if st == "1" else ("Incompleto" if st == "0" else "Non iniziato"))
                 forms_status[frm] = label
@@ -617,6 +661,7 @@ class REDCapService:
                 "name": r.get("name", ""),
                 "surname": r.get("surname", ""),
                 "date_of_birth": r.get("date_of_birth", ""),
+                "codice_fiscale": r.get("codice_fiscale", ""),
                 "forms_completed_count": completed_count,
                 "forms_status": forms_status,
                 "raw_record": r
@@ -665,7 +710,7 @@ class REDCapService:
             for idx, rid in enumerate(chunk):
                 payload[f"records[{idx}]"] = str(rid)
 
-            response = requests.post(self.api_url, data=payload, timeout=60)
+            response = self._post_redcap(payload, timeout=60)
             if response.status_code == 403:
                 raw_text = response.text.strip()
                 # Estrae il messaggio di errore da XML/JSON se presente

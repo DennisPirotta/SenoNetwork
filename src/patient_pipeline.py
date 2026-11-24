@@ -7,8 +7,9 @@ import logging
 from pathlib import Path
 import re
 import socket
+import threading
 import time
-from typing import Any, Callable, Dict, List, Optional, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 import urllib.parse
 from pydantic import BaseModel, Field
 import requests
@@ -25,9 +26,12 @@ from src.form_classifier import FormClassifier
 from src.models import REDCapField
 from src.pdf_extractor import PDFExtractor
 from src.redcap_service import REDCapService
-from src.utils import atomic_write_text, mask_phi, normalize_person_name, sanitize_identifier
+from src.utils import atomic_write_text, build_patient_slug, llm_slot, mask_phi, normalize_person_name, sanitize_identifier
 
 logger = logging.getLogger(__name__)
+
+_ID_RESOLUTION_LOCK = threading.Lock()
+_PENDING_IDS_BY_PATIENT: Dict[Tuple[str, str], str] = {}
 
 
 def is_safe_webhook_url(
@@ -39,6 +43,8 @@ def is_safe_webhook_url(
     try:
         parsed = urllib.parse.urlparse(url)
         if parsed.scheme not in ("http", "https"):
+            return False
+        if parsed.scheme != "https" and not allow_local:
             return False
 
         hostname = parsed.hostname
@@ -185,11 +191,7 @@ class PatientPipeline:
         if len(norm_surname) < 3 or not report_text:
             return None
 
-        norm_text = normalize_person_name(report_text)
-        if norm_surname in norm_text:
-            return None
-
-        # Only fail when an explicit patient header line identifies a different person
+        # Check explicit patient header line first (even if signer/doctor in body shares a surname)
         header_sample = report_text[:1000]
         match = re.search(
             r"(?:paziente|nominativo|assistit[oa]|cognome(?:\s+e\s+nome)?)\s*[:\-]\s*([A-Za-zÀ-ÿ'`\-\s]{3,60})",
@@ -203,6 +205,13 @@ class PatientPipeline:
                     f"Possibile mismatch anagrafico nel referto PDF: intestazione non corrispondente "
                     f"al paziente {mask_phi(surname)} {mask_phi(name)}."
                 )
+            if header_identity and norm_surname in header_identity:
+                return None
+
+        norm_text = normalize_person_name(report_text)
+        if norm_surname in norm_text:
+            return None
+
         return None
 
     def load_all_metadata(self):
@@ -240,6 +249,7 @@ class PatientPipeline:
         webhook_url: Optional[str] = None,
         progress_callback: Optional[Callable[[str, int, Optional[Dict[str, Any]]], None]] = None,
         overwrite: bool = False,
+        codice_fiscale: Optional[str] = None,
     ) -> PatientPipelineResult:
         """Executes the complete pipeline for a single patient."""
         start_time = time.time()
@@ -248,54 +258,100 @@ class PatientPipeline:
 
         # Sanitizzazione rigorosa di patient_id per prevenire Path Traversal
         patient_id = sanitize_identifier(patient_id)
+        pending_key: Optional[Tuple[str, str]] = None
 
-        # Mantenimento o generazione automatica del record_id numerico di REDCap:
-        # Se il paziente esiste già su REDCap con un record_id, lo mantiene per evitare duplicati.
-        # Se l'identificatore è lo slug nome-cognome-dob, genera automaticamente il prossimo record_id numerico da REDCap.
+        # Mantenimento o generazione atomica del record_id numerico di REDCap
         if self.redcap_service.api_url and self.redcap_service.api_token:
-            matched_redcap_id = None
-            try:
-                if name and surname:
-                    matched_redcap_id = self.redcap_service.find_record_id_by_demographics(
-                        name=name, surname=surname, date_of_birth=date_of_birth
-                    )
-            except Exception as e:
-                logger.warning(f"Verifica anagrafica su REDCap non riuscita per {patient_id}: {e}")
+            slug_candidate = (
+                build_patient_slug(name, surname, date_of_birth, default="")
+                if (name and surname)
+                else ""
+            )
+            proj_key = str(self.redcap_service.api_url or "").strip()
+            cf_norm = str(codice_fiscale or "").strip().upper()
+            identity_key = cf_norm or slug_candidate or str(patient_id).lower()
 
-            slug_candidate = ""
-            if name and surname:
-                d_str = (
-                    date_of_birth.strftime("%Y-%m-%d")
-                    if isinstance(date_of_birth, date)
-                    else str(date_of_birth or "")
-                )
-                slug_candidate = re.sub(r"[^a-z0-9\-]", "", f"{name}-{surname}-{d_str}".lower().replace(" ", "-"))
-
-            if matched_redcap_id:
-                if matched_redcap_id != str(patient_id):
-                    logger.info(
-                        f"-> Mantenuto record_id nativo di REDCap: '{matched_redcap_id}' "
-                        f"(invece dell'identificatore transitorio '{patient_id}')"
-                    )
-                    patient_id = matched_redcap_id
-            elif not patient_id or (slug_candidate and str(patient_id).lower() == slug_candidate):
+            with _ID_RESOLUTION_LOCK:
+                matched_redcap_id = None
                 try:
-                    next_id = self.redcap_service.generate_next_record_name()
-                    if isinstance(next_id, str) and next_id.strip():
-                        if slug_candidate and str(patient_id).lower() == slug_candidate:
-                            logger.info(
-                                f"-> Assegnato record_id numerico da REDCap: '{next_id}' "
-                                f"(sostituisce slug '{patient_id}')"
-                            )
-                        patient_id = next_id.strip()
-                    elif auto_upload:
-                        raise RuntimeError("Impossibile ottenere il prossimo record_id numerico da REDCap.")
+                    if cf_norm or (name and surname):
+                        matched_redcap_id = self.redcap_service.find_record_id_by_demographics(
+                            name=name,
+                            surname=surname,
+                            date_of_birth=date_of_birth,
+                            codice_fiscale=codice_fiscale,
+                        )
                 except Exception as e:
-                    if auto_upload:
-                        logger.error(f"Generazione record_id REDCap fallita ({patient_id}): {e}")
-                        raise
-                    logger.warning(f"Generazione record_id REDCap saltata in dry-run per {patient_id}: {e}")
+                    logger.warning(f"Verifica anagrafica su REDCap non riuscita per {patient_id}: {e}")
 
+                if matched_redcap_id:
+                    _PENDING_IDS_BY_PATIENT.pop((proj_key, identity_key), None)
+                    if matched_redcap_id != str(patient_id):
+                        logger.info(
+                            f"-> Mantenuto record_id nativo di REDCap: '{matched_redcap_id}' "
+                            f"(invece dell'identificatore transitorio '{patient_id}')"
+                        )
+                        patient_id = matched_redcap_id
+                elif auto_upload and (
+                    not patient_id or (slug_candidate and str(patient_id).lower() == slug_candidate)
+                ):
+                    pending_key = (proj_key, identity_key)
+                    if pending_key in _PENDING_IDS_BY_PATIENT:
+                        patient_id = _PENDING_IDS_BY_PATIENT[pending_key]
+                    else:
+                        try:
+                            next_id = self.redcap_service.generate_next_record_name()
+                            if isinstance(next_id, str) and next_id.strip():
+                                resolved_next = next_id.strip()
+                                if slug_candidate and str(patient_id).lower() == slug_candidate:
+                                    logger.info(
+                                        f"-> Assegnato record_id numerico da REDCap: '{resolved_next}' "
+                                        f"(sostituisce slug '{patient_id}')"
+                                    )
+                                patient_id = resolved_next
+                                _PENDING_IDS_BY_PATIENT[pending_key] = resolved_next
+                            else:
+                                raise RuntimeError("Impossibile ottenere il prossimo record_id numerico da REDCap.")
+                        except Exception as e:
+                            logger.error(f"Generazione record_id REDCap fallita ({patient_id}): {e}")
+                            raise
+
+        try:
+            return self._execute_patient_workflow(
+                patient_id=patient_id,
+                name=name,
+                surname=surname,
+                date_of_birth=date_of_birth,
+                pdf_paths=pdf_paths,
+                auto_upload=auto_upload,
+                output_dir=output_dir,
+                webhook_url=webhook_url,
+                progress_callback=progress_callback,
+                overwrite=overwrite,
+                codice_fiscale=codice_fiscale,
+                start_time=start_time,
+            )
+        finally:
+            if pending_key is not None:
+                with _ID_RESOLUTION_LOCK:
+                    _PENDING_IDS_BY_PATIENT.pop(pending_key, None)
+
+    def _execute_patient_workflow(
+        self,
+        patient_id: str,
+        name: Optional[str],
+        surname: Optional[str],
+        date_of_birth: Optional[Union[date, str]],
+        pdf_paths: Optional[List[Union[str, Path]]],
+        auto_upload: bool,
+        output_dir: Optional[Path],
+        webhook_url: Optional[str],
+        progress_callback: Optional[Callable[[str, int, Optional[Dict[str, Any]]], None]],
+        overwrite: bool,
+        codice_fiscale: Optional[str],
+        start_time: float,
+    ) -> PatientPipelineResult:
+        """Internal execution body after record_id resolution."""
         logger.info(
             f"=== INIZIO PIPELINE PER PAZIENTE: {patient_id} ({mask_phi(name)} {mask_phi(surname)}) ==="
         )
@@ -315,20 +371,29 @@ class PatientPipeline:
                 destination_dir=download_dir,
                 name=name,
                 surname=surname,
-                date_of_birth=date_of_birth
+                date_of_birth=date_of_birth,
+                codice_fiscale=codice_fiscale,
             )
 
         total_pdfs = len(pdfs_to_process)
         logger.info(f"-> Trovati {total_pdfs} PDF di referti per il paziente {patient_id}.")
         if progress_callback:
             progress_callback(f"Trovati {total_pdfs} referti PDF per {patient_id}.", 20, None)
+
+        pdf_text_cache: Dict[Path, str] = {}
+        doc_date_cache: Dict[Path, str] = {}
         if total_pdfs == 0:
             logger.warning(f"-> Nessun PDF di referto associato al paziente {patient_id}. Salto l'estrazione clinica IA.")
         else:
-            # Ordinamento cronologico dei referti (dal più datato al più recente)
-            # Garantisce che documenti più recenti aggiornino i valori precedenti
-            pdfs_to_process = PDFExtractor.sort_pdfs_by_date(pdfs_to_process)
-            logger.info(f"-> Referti ordinati cronologicamente per preservare aggiornamenti clinici.")
+            # Ordinamento cronologico singolo-pass (evita doppia lettura integrale di ogni PDF)
+            sorted_entries = PDFExtractor.sort_pdfs_with_text(pdfs_to_process)
+            pdfs_to_process = []
+            for p_item, txt_item, dt_item in sorted_entries:
+                pdfs_to_process.append(p_item)
+                if txt_item:
+                    pdf_text_cache[p_item] = txt_item
+                doc_date_cache[p_item] = dt_item
+            logger.info("-> Referti ordinati cronologicamente per preservare aggiornamenti clinici.")
 
         # Step 2: Elaborazione IA
         doc_results: List[DocumentProcessingResult] = []
@@ -362,8 +427,8 @@ class PatientPipeline:
                 pass
 
             try:
-                # 2.1 Estrazione testo
-                report_text = PDFExtractor.extract_text(pdf_path)
+                # 2.1 Estrazione testo (riusa testo già estratto durante l'ordinamento)
+                report_text = pdf_text_cache.get(pdf_path) or PDFExtractor.extract_text(pdf_path)
 
                 # 2.1b Verifica identità paziente se il referto espone un'intestazione esplicita
                 identity_error = self._verify_pdf_patient_identity(report_text, name, surname)
@@ -411,7 +476,7 @@ class PatientPipeline:
                 doc_total_clinical_count = 0
                 doc_status = "success"
                 doc_error = None
-                doc_date = PDFExtractor.extract_document_date(pdf_path, report_text)
+                doc_date = doc_date_cache.get(pdf_path) or PDFExtractor.extract_document_date(pdf_path, report_text)
 
                 valid_target_forms = [f for f in target_forms if f not in ("skip", "irrelevant", "unknown")]
                 extract_sig_params = set()
@@ -440,7 +505,8 @@ class PatientPipeline:
                     if "include_unchecked_checkboxes" in extract_sig_params:
                         extract_kwargs["include_unchecked_checkboxes"] = bool(overwrite)
 
-                    extraction_res = self.ai_extractor.extract_from_text(**extract_kwargs)
+                    with llm_slot(getattr(self.settings, "ai_max_concurrent_requests", 1)):
+                        extraction_res = self.ai_extractor.extract_from_text(**extract_kwargs)
 
                     if extraction_res.status == "success":
                         record = extraction_res.redcap_record
@@ -520,7 +586,7 @@ class PatientPipeline:
                 progress_callback(f"Consolidamento e caricamento dati su REDCap per {patient_id}...", 90, None)
             merged_to_upload = REDCapService.merge_flat_records(patient_records_to_upload)
 
-            if not overwrite and self.redcap_service.api_url and self.redcap_service.api_token:
+            if self.redcap_service.api_url and self.redcap_service.api_token:
                 existing_record: Optional[Dict[str, Any]] = None
                 try:
                     existing_record = self.redcap_service.get_record(str(patient_id))
@@ -528,16 +594,22 @@ class PatientPipeline:
                     logger.debug(f"Recupero record esistente REDCap per safe-diff fallito ({patient_id}): {e}")
 
                 if isinstance(existing_record, dict) and existing_record:
-                    safe_records: List[Dict[str, Any]] = []
-                    for rec in merged_to_upload:
-                        safe_rec = REDCapService.merge_with_existing_record(
-                            existing=existing_record,
-                            updates=rec,
-                            overwrite=False,
-                        )
-                        if any(k != "record_id" for k in safe_rec.keys()):
-                            safe_records.append(safe_rec)
-                    merged_to_upload = safe_records
+                    if not overwrite:
+                        safe_records: List[Dict[str, Any]] = []
+                        for rec in merged_to_upload:
+                            safe_rec = REDCapService.merge_with_existing_record(
+                                existing=existing_record,
+                                updates=rec,
+                                overwrite=False,
+                            )
+                            if any(k != "record_id" for k in safe_rec.keys()):
+                                safe_records.append(safe_rec)
+                        merged_to_upload = safe_records
+                    elif str(existing_record.get("dati_del_paziente_complete") or "").strip() == "2":
+                        # Never downgrade an already verified demographics form status
+                        for rec in merged_to_upload:
+                            if "dati_del_paziente_complete" in rec:
+                                rec["dati_del_paziente_complete"] = "2"
 
             if not merged_to_upload:
                 upload_status = "skipped"
@@ -586,10 +658,17 @@ class PatientPipeline:
         try:
             self.settings.state_dir.mkdir(parents=True, exist_ok=True)
             state_file = self.settings.state_dir / f"{patient_id}_state.json"
+            clean_docs_count = len([d for d in doc_results if d.status in ("success", "skipped")])
+            if upload_status == "error":
+                state_status = "error"
+            elif total_pdfs > 0 and clean_docs_count == total_pdfs:
+                state_status = "completed"
+            else:
+                state_status = "partial"
             state_payload = {
                 "patient_id": patient_id,
                 "last_run": datetime.now().isoformat(),
-                "status": "completed" if result.successful_pdfs == result.total_pdfs and result.total_pdfs > 0 else "partial",
+                "status": state_status,
                 "total_pdfs": total_pdfs,
                 "successful_pdfs": result.successful_pdfs,
                 "forms_populated": result.forms_populated,
@@ -624,6 +703,7 @@ class PatientPipeline:
                 try:
                     cb_payload = json.loads(result.model_dump_json())
                     cb_resp = requests.post(target_webhook, json=cb_payload, timeout=30, allow_redirects=False)
+                    cb_resp.raise_for_status()
                     logger.info(f"-> Risultati inviati all'API con esito: HTTP {cb_resp.status_code}")
                 except Exception as e:
                     logger.error(f"-> Errore durante l'invio dei risultati all'API esterna ({target_webhook}): {e}")

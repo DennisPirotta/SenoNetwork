@@ -7,6 +7,7 @@ from typing import Any, Dict, List, Optional, Union
 import requests
 
 from src.config import Settings, get_settings
+from src.utils import atomic_write_text, llm_slot
 
 logger = logging.getLogger(__name__)
 
@@ -136,6 +137,28 @@ class FormClassifier:
         }
 
     @staticmethod
+    def _build_mapping_markdown(result: Dict[str, Any]) -> str:
+        """Builds Markdown report content for exam-to-form mapping results."""
+        lines = [
+            "# Mappa Referti Esami -> Form REDCap",
+            f"Data generazione: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+            f"Totale referti analizzati: {result.get('total', 0)}\n",
+            "## Elenco Mappature Esame -> Form REDCap",
+        ]
+        for item in result.get("mappings", []):
+            lines.append(f"- {item.get('display', '')}")
+
+        lines.append("\n## Riepilogo Contatori per Form REDCap")
+        lines.append("| Form REDCap | Descrizione Clinica | Conteggio Referti | % sul Totale |")
+        lines.append("| :--- | :--- | :---: | :---: |")
+        total = result.get("total", 0)
+        for form_name, cnt in sorted(result.get("counts", {}).items(), key=lambda x: x[1], reverse=True):
+            pct = (cnt / total * 100) if total > 0 else 0
+            desc = AVAILABLE_FORMS.get(form_name, "Documento escluso / non senologico" if form_name == "skip" else "-")
+            lines.append(f"| `{form_name}` | {desc} | **{cnt}** | {pct:.1f}% |")
+        return "\n".join(lines) + "\n"
+
+    @staticmethod
     def export_mapping(
         result: Dict[str, Any],
         output_path: Optional[Union[str, Path]] = None,
@@ -157,61 +180,48 @@ class FormClassifier:
 
         if output_path:
             p = Path(output_path)
-            p.parent.mkdir(parents=True, exist_ok=True)
             if p.suffix.lower() == ".json":
-                p.write_text(json.dumps(result, indent=2, ensure_ascii=False), encoding="utf-8")
+                atomic_write_text(p, json.dumps(result, indent=2, ensure_ascii=False))
                 exported["json"] = p
             else:
-                lines = [
-                    "# Mappa Referti Esami -> Form REDCap",
-                    f"Data generazione: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
-                    f"Totale referti analizzati: {result.get('total', 0)}\n",
-                    "## Elenco Mappature Esame -> Form REDCap",
-                ]
-                for item in result.get("mappings", []):
-                    lines.append(f"- {item.get('display', '')}")
-
-                lines.append("\n## Riepilogo Contatori per Form REDCap")
-                lines.append("| Form REDCap | Descrizione Clinica | Conteggio Referti | % sul Totale |")
-                lines.append("| :--- | :--- | :---: | :---: |")
-                total = result.get("total", 0)
-                for form_name, cnt in sorted(result.get("counts", {}).items(), key=lambda x: x[1], reverse=True):
-                    pct = (cnt / total * 100) if total > 0 else 0
-                    desc = AVAILABLE_FORMS.get(form_name, "Documento escluso / non senologico" if form_name == "skip" else "-")
-                    lines.append(f"| `{form_name}` | {desc} | **{cnt}** | {pct:.1f}% |")
-
-                p.write_text("\n".join(lines) + "\n", encoding="utf-8")
+                atomic_write_text(p, FormClassifier._build_mapping_markdown(result))
                 exported["markdown"] = p
             return exported
 
-        # Default: export both JSON and Markdown
+        # Default: export both JSON and Markdown atomically
         json_path = out_dir / "mappa_esami_form.json"
-        json_path.write_text(json.dumps(result, indent=2, ensure_ascii=False), encoding="utf-8")
+        atomic_write_text(json_path, json.dumps(result, indent=2, ensure_ascii=False))
         exported["json"] = json_path
 
         md_path = out_dir / "mappa_esami_form.md"
-        lines = [
-            "# Mappa Referti Esami -> Form REDCap",
-            f"Data generazione: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
-            f"Totale referti analizzati: {result.get('total', 0)}\n",
-            "## Elenco Mappature Esame -> Form REDCap",
-        ]
-        for item in result.get("mappings", []):
-            lines.append(f"- {item.get('display', '')}")
-
-        lines.append("\n## Riepilogo Contatori per Form REDCap")
-        lines.append("| Form REDCap | Descrizione Clinica | Conteggio Referti | % sul Totale |")
-        lines.append("| :--- | :--- | :---: | :---: |")
-        total = result.get("total", 0)
-        for form_name, cnt in sorted(result.get("counts", {}).items(), key=lambda x: x[1], reverse=True):
-            pct = (cnt / total * 100) if total > 0 else 0
-            desc = AVAILABLE_FORMS.get(form_name, "Documento escluso / non senologico" if form_name == "skip" else "-")
-            lines.append(f"| `{form_name}` | {desc} | **{cnt}** | {pct:.1f}% |")
-
-        md_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        atomic_write_text(md_path, FormClassifier._build_mapping_markdown(result))
         exported["markdown"] = md_path
 
         return exported
+
+    @staticmethod
+    def _match_form_key(text_val: str) -> Optional[str]:
+        """Matches a canonical form name ordered longest-first to avoid prefix collisions."""
+        lowered = text_val.strip().lower()
+        if re.search(r"(?:^|[^a-z0-9_])skip(?:$|[^a-z0-9_])", lowered):
+            return "skip"
+        for form_key in sorted(AVAILABLE_FORMS.keys(), key=len, reverse=True):
+            if re.search(rf"(?:^|[^a-z0-9_]){re.escape(form_key)}(?:$|[^a-z0-9_])", lowered):
+                return form_key
+        return None
+
+    @staticmethod
+    def _strip_phi_headers(text_excerpt: str) -> str:
+        """Removes explicit patient identifier lines before optional LLM classification."""
+        cleaned_lines = []
+        phi_pat = re.compile(
+            r"^\s*(?:paziente|nominativo|assistit[oa]|cognome(?:\s+e\s+nome)?|codice\s+fiscale|c\.?\s*f\.?|nat[oa]\s+il|data\s+di\s+nascita)\s*[:\-].*$",
+            re.IGNORECASE,
+        )
+        for line in text_excerpt.splitlines():
+            if not phi_pat.match(line):
+                cleaned_lines.append(line)
+        return "\n".join(cleaned_lines)
 
     @staticmethod
     def classify_report(
@@ -266,7 +276,8 @@ class FormClassifier:
         # 2. Check explicit hint (e.g. from .NET API metadata, exam name or filename)
         if hint:
             # 2.0 Explicit pathology / biopsy hints must be checked before generic surgery department hints
-            if any(b in lower_hint for b in ["biops", "core", "fna", "agobiopt", "agoaspirat"]):
+            has_core_word = bool(re.search(r"(?:^|[^a-z])core(?:$|[^a-z])", lower_hint))
+            if has_core_word or any(b in lower_hint for b in ["biops", "fna", "agobiopt", "agoaspirat"]):
                 return "anatomia_patologica_preoperatoria"
             if any(i in lower_hint for i in ["istolog", "definitiv", "recettore", "estrogen", "progesteron", "sentinella", "osna", "bls", "e_i_c", "pezzo_operatorio", "pezzo operatorio"]):
                 return "anatomia_patologica"
@@ -297,7 +308,7 @@ class FormClassifier:
             if "multidisciplinare" in lower_hint:
                 return "dati_del_paziente"
 
-            for form_key in AVAILABLE_FORMS.keys():
+            for form_key in sorted(AVAILABLE_FORMS.keys(), key=len, reverse=True):
                 if form_key in lower_hint:
                     return form_key
 
@@ -360,6 +371,15 @@ class FormClassifier:
             return "anatomia_patologica"
 
         # 3.3 Chirurgia Senologica / Verbale operatorio / Lettera di dimissione
+        has_standalone_pathology_header = bool(
+            re.search(r"^\s*(?:servizio\s+di\s+|istituto\s+di\s+)?anatomia\s+patologica", lower_text)
+            or (
+                re.search(r"(?<!attesa\sdi\s)diagnosi\s+istopatologica", lower_text)
+                and "verbale operatorio" not in lower_text
+                and "lettera di dimissione" not in lower_text
+            )
+            or "frustoli agobioptici" in lower_text
+        )
         if (
             "lettera di dimissione" in lower_text
             or "verbale operatorio" in lower_text
@@ -371,7 +391,7 @@ class FormClassifier:
             or "tempo chirurgico" in lower_text
             or "visita chirurgica senologica" in lower_text
             or "intervento chirurgico senologico" in lower_text
-        ) and ("diagnosi istopatologica" not in lower_text and "frustoli" not in lower_text):
+        ) and not has_standalone_pathology_header:
             return "struttura_della_lesione"
 
         # 3.4 Radiologia
@@ -416,7 +436,9 @@ class FormClassifier:
 
         # 5. Fallback to quick local LLM classification (supports llama.cpp or Ollama configured in Settings)
         llm_timeout = getattr(cfg, "llm_fallback_timeout_seconds", 30)
-        text_excerpt = text if len(text) <= 2500 else f"{text[:1500]}\n...\n{text[-1000:]}"
+        redacted_text = FormClassifier._strip_phi_headers(text)
+        text_excerpt = redacted_text if len(redacted_text) <= 2500 else f"{redacted_text[:1500]}\n...\n{redacted_text[-1000:]}"
+        max_conc = getattr(cfg, "ai_max_concurrent_requests", 1)
         try:
             prompt = (
                 "Classifica il seguente referto medico senologico in uno e uno solo di questi strumenti REDCap:\n"
@@ -432,67 +454,64 @@ class FormClassifier:
                 "Rispondi ESCLUSIVAMENTE con il nome dello strumento (es. 'radiologia' o 'skip'):"
             )
 
-            # 5.1 Try llama.cpp server first if configured
-            if target_llama_url:
-                try:
-                    headers = {}
-                    if cfg.ai_cloudflared_client_id and cfg.ai_cloudflared_client_secret:
-                        headers["CF-Access-Client-Id"] = cfg.ai_cloudflared_client_id
-                        headers["CF-Access-Client-Secret"] = cfg.ai_cloudflared_client_secret
+            with llm_slot(max_conc):
+                # 5.1 Try llama.cpp server first if configured
+                if target_llama_url:
+                    try:
+                        headers = {}
+                        if cfg.ai_cloudflared_client_id and cfg.ai_cloudflared_client_secret:
+                            headers["CF-Access-Client-Id"] = cfg.ai_cloudflared_client_id
+                            headers["CF-Access-Client-Secret"] = cfg.ai_cloudflared_client_secret
 
-                    if getattr(cfg, "llama_cpp_api_mode", "chat").lower() == "chat":
-                        r_llama = requests.post(
-                            f"{target_llama_url}/v1/chat/completions",
-                            headers=headers,
-                            json={
-                                "model": cfg.llama_cpp_model or "llama-cpp-rpc",
-                                "messages": [{"role": "user", "content": prompt}],
-                                "temperature": 0.0,
-                                "max_tokens": 20,
-                                "stream": False,
-                            },
-                            timeout=llm_timeout,
-                        )
-                        predicted = (
-                            r_llama.json().get("choices", [{}])[0].get("message", {}).get("content", "").strip().lower()
-                            if r_llama.status_code == 200 else ""
-                        )
-                    else:
-                        r_llama = requests.post(
-                            f"{target_llama_url}/completion",
-                            headers=headers,
-                            json={"prompt": prompt, "temperature": 0.0, "n_predict": 20, "stream": False},
-                            timeout=llm_timeout,
-                        )
-                        predicted = r_llama.json().get("content", "").strip().lower() if r_llama.status_code == 200 else ""
+                        if getattr(cfg, "llama_cpp_api_mode", "chat").lower() == "chat":
+                            with requests.post(
+                                f"{target_llama_url}/v1/chat/completions",
+                                headers=headers,
+                                json={
+                                    "model": cfg.llama_cpp_model or "llama-cpp-rpc",
+                                    "messages": [{"role": "user", "content": prompt}],
+                                    "temperature": 0.0,
+                                    "max_tokens": 20,
+                                    "stream": False,
+                                },
+                                timeout=llm_timeout,
+                            ) as r_llama:
+                                predicted = (
+                                    r_llama.json().get("choices", [{}])[0].get("message", {}).get("content", "").strip().lower()
+                                    if r_llama.status_code == 200 else ""
+                                )
+                        else:
+                            with requests.post(
+                                f"{target_llama_url}/completion",
+                                headers=headers,
+                                json={"prompt": prompt, "temperature": 0.0, "n_predict": 20, "stream": False},
+                                timeout=llm_timeout,
+                            ) as r_llama:
+                                predicted = r_llama.json().get("content", "").strip().lower() if r_llama.status_code == 200 else ""
 
-                    if "skip" in predicted:
-                        return "skip"
-                    for form_key in AVAILABLE_FORMS.keys():
-                        if form_key in predicted:
-                            return form_key
-                except Exception as e:
-                    logger.debug(f"Classificazione LLM llama.cpp fallback fallita: {e}")
+                        matched = FormClassifier._match_form_key(predicted)
+                        if matched:
+                            return matched
+                    except Exception as e:
+                        logger.debug(f"Classificazione LLM llama.cpp fallback fallita: {e}")
 
-            # 5.2 Try Ollama fallback
-            if target_ollama_url:
-                r = requests.post(
-                    f"{target_ollama_url.rstrip('/')}/api/generate",
-                    json={
-                        "model": target_ollama_model,
-                        "prompt": prompt,
-                        "stream": False,
-                        "options": {"temperature": 0.0, "num_predict": 20}
-                    },
-                    timeout=llm_timeout,
-                )
-                if r.status_code == 200:
-                    predicted = r.json().get("response", "").strip().lower()
-                    if "skip" in predicted:
-                        return "skip"
-                    for form_key in AVAILABLE_FORMS.keys():
-                        if form_key in predicted:
-                            return form_key
+                # 5.2 Try Ollama fallback
+                if target_ollama_url:
+                    with requests.post(
+                        f"{target_ollama_url.rstrip('/')}/api/generate",
+                        json={
+                            "model": target_ollama_model,
+                            "prompt": prompt,
+                            "stream": False,
+                            "options": {"temperature": 0.0, "num_predict": 20}
+                        },
+                        timeout=llm_timeout,
+                    ) as r:
+                        if r.status_code == 200:
+                            predicted = r.json().get("response", "").strip().lower()
+                            matched = FormClassifier._match_form_key(predicted)
+                            if matched:
+                                return matched
         except Exception as e:
             logger.warning(f"Classificazione LLM non riuscita: {e}")
 
@@ -677,15 +696,20 @@ class FormClassifier:
             if has_radiotherapy and "radioterapia" not in targets:
                 targets.append("radioterapia")
 
-        # Rule 2: Surgery / Discharge summary
-        elif is_surgery_or_discharge:
+        # Rule 2: Surgery / Discharge summary (additive on composite reports)
+        if is_surgery_or_discharge:
+            if "struttura_della_lesione" not in targets and has_surgery_section:
+                targets.append("struttura_della_lesione")
             if has_anamnesis_or_comorbidity and "dati_del_paziente" not in targets:
                 targets.append("dati_del_paziente")
 
-        # Rule 3: Multidisciplinary visit
-        elif is_multidisciplinary:
+        # Rule 3: Multidisciplinary visit (additive for genuinely populated sections)
+        if is_multidisciplinary:
             if "dati_del_paziente" not in targets:
-                targets.insert(0, "dati_del_paziente")
+                if not is_oncology and not is_surgery_or_discharge:
+                    targets.insert(0, "dati_del_paziente")
+                else:
+                    targets.append("dati_del_paziente")
             if has_chemo_or_endocrine and "chemioterapia" not in targets:
                 targets.append("chemioterapia")
             if has_radiology_findings and "radiologia" not in targets:
@@ -702,7 +726,7 @@ class FormClassifier:
                 targets.append("radioterapia")
 
         # Rule 4: General medical visit (dati_del_paziente) with therapies mentioned
-        elif primary == "dati_del_paziente":
+        if primary == "dati_del_paziente" and not is_oncology and not is_surgery_or_discharge and not is_multidisciplinary:
             if has_chemo_or_endocrine and "chemioterapia" not in targets:
                 targets.append("chemioterapia")
             if has_radiotherapy and "radioterapia" not in targets:

@@ -30,6 +30,7 @@ import argparse
 from datetime import date
 import logging
 from pathlib import Path
+import re
 import sys
 
 from dotenv import load_dotenv
@@ -44,6 +45,7 @@ from src.priamo_cup_client import (
     UNITA_SENOLOGIA,
     PriamoCupClient,
 )
+from src.utils import atomic_write_text, normalize_person_name, sanitize_csv_cell
 from scripts.extract_patients_from_shared_file import (
     Paziente,
     display_rich_table,
@@ -53,7 +55,12 @@ from scripts.extract_patients_from_shared_file import (
 load_dotenv()
 
 # Rich formatting
-HAS_RICH = False
+try:
+    from rich.console import Console  # noqa: F401
+    from rich.table import Table  # noqa: F401
+    HAS_RICH = True
+except ImportError:
+    HAS_RICH = False
 
 logging.basicConfig(
     level=logging.INFO,
@@ -167,13 +174,14 @@ def main():
             sys.exit(1)
 
         cup_client = PriamoCupClient(settings=settings)
+        cup_output_dir = str(settings.cup_dir)
 
         if args.ytd:
             print(f"-> Download fogli lavoro PriamoCUP: YTD (1° Gennaio -> Ieri) per Unità {args.unit}, Agende {agende_list}...")
             f_path = cup_client.export_ytd(
                 codice_unita=args.unit,
                 agende=agende_list,
-                output_dir="data/cup",
+                output_dir=cup_output_dir,
             )
             report_files = [f_path]
         elif args.year:
@@ -182,19 +190,24 @@ def main():
                 year=args.year,
                 codice_unita=args.unit,
                 agende=agende_list,
-                output_dir="data/cup",
+                output_dir=cup_output_dir,
             )
             report_files = [f_path]
         elif args.month:
             # Parsing mese (es. '2025-10' o '10')
             month_str = str(args.month).strip()
-            if "-" in month_str:
-                parts = month_str.split("-")
-                target_year = int(parts[0])
-                target_month = int(parts[1])
+            m_ym = re.fullmatch(r"(\d{4})-(\d{1,2})", month_str)
+            m_m = re.fullmatch(r"(\d{1,2})", month_str)
+            if m_ym:
+                target_year, target_month = int(m_ym.group(1)), int(m_ym.group(2))
+            elif m_m:
+                target_year, target_month = date.today().year, int(m_m.group(1))
             else:
-                target_year = date.today().year
-                target_month = int(month_str)
+                print(f"[ERRORE] Formato mese non valido: {month_str!r} (atteso 'MM' o 'YYYY-MM').", file=sys.stderr)
+                sys.exit(1)
+            if not (1 <= target_month <= 12):
+                print(f"[ERRORE] Numero mese fuori intervallo: {target_month} (atteso 1..12).", file=sys.stderr)
+                sys.exit(1)
 
             print(f"-> Download fogli lavoro PriamoCUP per il mese {target_month:02d}/{target_year} (Unità {args.unit}, Agende {agende_list})...")
             f_path = cup_client.export_month(
@@ -202,7 +215,7 @@ def main():
                 month=target_month,
                 codice_unita=args.unit,
                 agende=agende_list,
-                output_dir="data/cup",
+                output_dir=cup_output_dir,
             )
             report_files = [f_path]
         elif args.months:
@@ -211,7 +224,7 @@ def main():
                 num_months=args.months,
                 codice_unita=args.unit,
                 agende=agende_list,
-                output_dir="data/cup",
+                output_dir=cup_output_dir,
             )
             report_files = [f_path]
         elif args.start_date and args.end_date:
@@ -221,7 +234,7 @@ def main():
                 end_date=args.end_date,
                 codice_unita=args.unit,
                 agende=agende_list,
-                output_dir="data/cup",
+                output_dir=cup_output_dir,
             )
             report_files = [f_path]
         else:
@@ -233,14 +246,14 @@ def main():
                     num_weeks=args.weeks,
                     codice_unita=args.unit,
                     agende=agende_list,
-                    output_dir="data/cup",
+                    output_dir=cup_output_dir,
                 )
             else:
                 f_path = cup_client.export_week(
                     ref_date=ref_date,
                     codice_unita=args.unit,
                     agende=agende_list,
-                    output_dir="data/cup",
+                    output_dir=cup_output_dir,
                 )
                 report_files = [f_path]
 
@@ -254,7 +267,19 @@ def main():
     for rep in report_files:
         pazienti_rep = estrai_pazienti_da_fogli_cup(rep, only_complete=args.only_complete)
         for p in pazienti_rep:
-            dedup_key = (p.cognome.lower(), (p.nome or "").lower(), p.data_nascita.isoformat() if p.data_nascita else "")
+            cf_norm = (p.codice_fiscale or "").strip().upper()
+            pid_norm = str(p.priamo_id or "").strip()
+            if cf_norm:
+                dedup_key = ("cf", cf_norm)
+            elif pid_norm:
+                dedup_key = ("pid", pid_norm)
+            else:
+                dedup_key = (
+                    "demo",
+                    normalize_person_name(p.cognome),
+                    normalize_person_name(p.nome or ""),
+                    p.data_nascita.isoformat() if p.data_nascita else "",
+                )
             if dedup_key not in all_pazienti_dict:
                 all_pazienti_dict[dedup_key] = p
             else:
@@ -309,16 +334,17 @@ def main():
 
         if is_json:
             import json
-            with open(out_path, "w", encoding="utf-8") as f:
-                json.dump(records_data, f, indent=2, ensure_ascii=False)
+            atomic_write_text(out_path, json.dumps(records_data, indent=2, ensure_ascii=False))
             print(f"[OK] Esportati {len(pazienti)} record in formato JSON: {out_path}")
         elif is_xlsx:
             df_out = pd.DataFrame(records_data)
-            df_out.to_excel(out_path, index=False)
+            df_safe = df_out.map(lambda v: sanitize_csv_cell(v) if isinstance(v, str) else v)
+            df_safe.to_excel(out_path, index=False, engine="openpyxl")
             print(f"[OK] Esportati {len(pazienti)} record in formato Excel (.xlsx): {out_path}")
         else:
             df_out = pd.DataFrame(records_data)
-            df_out.to_csv(out_path, index=False, encoding="utf-8-sig")
+            df_safe = df_out.map(lambda v: sanitize_csv_cell(v) if isinstance(v, str) else v)
+            atomic_write_text(out_path, "\ufeff" + df_safe.to_csv(index=False))
             print(f"[OK] Esportati {len(pazienti)} record in formato CSV: {out_path}")
 
 

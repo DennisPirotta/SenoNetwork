@@ -163,12 +163,9 @@ class PDFExtractor:
         return "1970-01-01"
 
     @staticmethod
-    def sort_pdfs_by_date(pdf_paths: List[Union[str, Path]]) -> List[Path]:
-        """Sorts a list of PDF file paths in chronological order (from oldest to newest).
-
-        Ensures that when merging records, newer clinical reports update older ones.
-        """
-        dated: List[Tuple[str, str, Path]] = []
+    def sort_pdfs_with_text(pdf_paths: List[Union[str, Path]]) -> List[Tuple[Path, str, str]]:
+        """Extracts text and document date once per PDF and returns tuples `(path, text, doc_date)` sorted chronologically."""
+        dated: List[Tuple[str, str, Path, str]] = []
         for p in pdf_paths:
             path = Path(p)
             try:
@@ -176,7 +173,15 @@ class PDFExtractor:
             except Exception:
                 t = ""
             dt = PDFExtractor.extract_document_date(path, t)
-            dated.append((dt, path.stem, path))
+            dated.append((dt, path.stem, path, t))
 
         dated.sort(key=lambda x: (x[0], x[1]))
-        return [item[2] for item in dated]
+        return [(item[2], item[3], item[0]) for item in dated]
+
+    @staticmethod
+    def sort_pdfs_by_date(pdf_paths: List[Union[str, Path]]) -> List[Path]:
+        """Sorts a list of PDF file paths in chronological order (from oldest to newest).
+
+        Ensures that when merging records, newer clinical reports update older ones.
+        """
+        return [item[0] for item in PDFExtractor.sort_pdfs_with_text(pdf_paths)]

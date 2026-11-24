@@ -8,16 +8,16 @@ import time
 from typing import Any, Dict, List, Optional
 import uuid
 
-from fastapi import APIRouter, BackgroundTasks, Body, Depends, HTTPException
+from fastapi import APIRouter, BackgroundTasks, Body, Depends, HTTPException, status
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from src.config import Settings, get_settings
 from src.patient_pipeline import PatientPipeline, PatientPipelineResult
 from scripts.extract_patients_from_shared_file import estrai_pazienti_univoci
-from src.routers.cup import _find_target_cup_file
-from src.routers.security import verify_api_key
-from src.utils import sanitize_identifier
+from src.routers.cup import _find_target_cup_file, invalidate_redcap_lookup_cache
+from src.routers.security import raise_internal_error, verify_api_key, verify_sse_or_api_key
+from src.utils import build_patient_slug, get_llm_semaphore, get_patient_lock, sanitize_identifier
 
 logger = logging.getLogger(__name__)
 
@@ -27,22 +27,35 @@ router = APIRouter(tags=["Clinical Pipeline"])
 _tasks_store: Dict[str, Dict[str, Any]] = {}
 _tasks_lock = threading.Lock()
 TASK_TTL_SECONDS = 3600.0
+STALE_ACTIVE_TTL_SECONDS = 14400.0
 MAX_TASKS_IN_STORE = 200
 
-_patient_locks_lock = threading.Lock()
-_patient_locks: Dict[str, threading.Lock] = {}
 
-_llm_semaphores_lock = threading.Lock()
-_llm_semaphores: Dict[int, threading.Semaphore] = {}
+def _get_patient_lock(patient_id: str) -> threading.Lock:
+    """Backward-compatible wrapper around shared patient lock registry."""
+    return get_patient_lock(patient_id)
+
+
+def _get_llm_semaphore(settings: Optional[Settings] = None) -> threading.Semaphore:
+    """Backward-compatible wrapper around shared LLM concurrency semaphore registry."""
+    raw_limit = getattr(settings, "ai_max_concurrent_requests", 1) if settings is not None else 1
+    limit = max(1, int(raw_limit if isinstance(raw_limit, int) else 1))
+    return get_llm_semaphore(limit)
 
 
 def _cleanup_old_tasks_locked() -> None:
-    """Removes expired completed/failed tasks and bounds total task store size."""
+    """Removes expired completed/failed tasks, stale stuck tasks, and bounds store size."""
     now = time.time()
     expired = [
         tid for tid, t in _tasks_store.items()
-        if t.get("status") in ("completed", "failed")
-        and (t.get("finished_at") or t.get("created_at") or now) < (now - TASK_TTL_SECONDS)
+        if (
+            t.get("status") in ("completed", "failed")
+            and (t.get("finished_at") or t.get("created_at") or now) < (now - TASK_TTL_SECONDS)
+        )
+        or (
+            t.get("status") in ("queued", "processing")
+            and (t.get("started_at") or t.get("created_at") or now) < (now - STALE_ACTIVE_TTL_SECONDS)
+        )
     ]
     for tid in expired:
         _tasks_store.pop(tid, None)
@@ -50,13 +63,16 @@ def _cleanup_old_tasks_locked() -> None:
     if len(_tasks_store) > MAX_TASKS_IN_STORE:
         removable = sorted(
             (
-                (t.get("finished_at") or t.get("created_at") or 0.0, tid)
+                (
+                    0 if t.get("status") in ("completed", "failed") else 1,
+                    t.get("finished_at") or t.get("created_at") or 0.0,
+                    tid,
+                )
                 for tid, t in _tasks_store.items()
-                if t.get("status") in ("completed", "failed")
             )
         )
         excess = len(_tasks_store) - MAX_TASKS_IN_STORE
-        for _, tid in removable[:excess]:
+        for _, _, tid in removable[:excess]:
             _tasks_store.pop(tid, None)
 
 
@@ -108,29 +124,6 @@ def get_task_snapshot(task_id: str) -> Optional[Dict[str, Any]]:
         return snap
 
 
-def _get_patient_lock(patient_id: str) -> threading.Lock:
-    """Returns a mutex keyed by sanitized patient_id to prevent concurrent double-processing."""
-    key = sanitize_identifier(patient_id)
-    with _patient_locks_lock:
-        if len(_patient_locks) > 1000:
-            stale = [k for k, lck in _patient_locks.items() if not lck.locked()]
-            for k in stale[: len(stale) // 2]:
-                _patient_locks.pop(k, None)
-        if key not in _patient_locks:
-            _patient_locks[key] = threading.Lock()
-        return _patient_locks[key]
-
-
-def _get_llm_semaphore(settings: Optional[Settings] = None) -> threading.Semaphore:
-    """Returns a bounded semaphore limiting concurrent LLM pipeline executions."""
-    raw_limit = getattr(settings, "ai_max_concurrent_requests", 1) if settings is not None else 1
-    limit = max(1, int(raw_limit if isinstance(raw_limit, int) else 1))
-    with _llm_semaphores_lock:
-        if limit not in _llm_semaphores:
-            _llm_semaphores[limit] = threading.Semaphore(limit)
-        return _llm_semaphores[limit]
-
-
 def get_pipeline(settings: Settings = Depends(get_settings)) -> PatientPipeline:
     return PatientPipeline(settings=settings)
 
@@ -161,6 +154,7 @@ class SinglePatientRequest(BaseModel):
     name: Optional[str] = Field(default=None, description="Nome del paziente")
     surname: Optional[str] = Field(default=None, description="Cognome del paziente")
     date_of_birth: Optional[str] = Field(default=None, description="Data di nascita (YYYY-MM-DD)")
+    codice_fiscale: Optional[str] = Field(default=None, description="Codice fiscale del paziente (opzionale)")
     auto_upload: bool = Field(default=True, description="Se True, carica direttamente i record su REDCap")
     dry_run: bool = Field(default=False, description="Se True, simula l'elaborazione senza modificare REDCap")
     overwrite: bool = Field(default=False, description="Se True, sovrascrive i campi REDCap già valorizzati")
@@ -189,6 +183,19 @@ class AsyncTaskCreatedResponse(BaseModel):
     total_items: int = 1
 
 
+def _resolve_request_patient_id(req: Optional[SinglePatientRequest], path_patient_id: Optional[str] = None) -> str:
+    """Resolves a validated patient_id or deterministic slug; raises 400 if empty."""
+    explicit = (path_patient_id or (req.patient_id if req else None) or "").strip()
+    if explicit:
+        return explicit
+    if req and (req.name or "").strip() and (req.surname or "").strip():
+        return build_patient_slug(req.name, req.surname, req.date_of_birth)
+    raise HTTPException(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        detail="Specificare 'patient_id' oppure 'name' e 'surname'."
+    )
+
+
 def _background_process_single(
     task_id: str,
     pipeline: PatientPipeline,
@@ -200,6 +207,7 @@ def _background_process_single(
     dry_run: bool,
     webhook: Optional[str],
     overwrite: bool = False,
+    codice_fiscale: Optional[str] = None,
 ):
     update_task(
         task_id,
@@ -222,7 +230,7 @@ def _background_process_single(
         append_task_event(task_id, pct, step_msg, event_entry, extra_doc=extra_doc)
 
     try:
-        with _get_patient_lock(patient_id), _get_llm_semaphore(pipeline.settings):
+        with get_patient_lock(patient_id):
             res = pipeline.process_patient(
                 patient_id=patient_id,
                 name=name,
@@ -232,7 +240,10 @@ def _background_process_single(
                 webhook_url=webhook,
                 progress_callback=on_progress,
                 overwrite=overwrite,
+                codice_fiscale=codice_fiscale,
             )
+        if res.redcap_upload_status == "uploaded":
+            invalidate_redcap_lookup_cache(pipeline.settings)
         update_task(
             task_id,
             status="completed",
@@ -242,7 +253,7 @@ def _background_process_single(
             items_done=1,
         )
     except Exception as e:
-        logger.error(f"Errore task {task_id}: {e}")
+        logger.exception("Errore task %s: %s", task_id, e)
         update_task(task_id, status="failed", error=str(e))
     finally:
         update_task(task_id, finished_at=time.time())
@@ -266,12 +277,14 @@ def _background_process_batch(
         processed_documents=[],
     )
     results = []
+    any_uploaded = False
 
     for idx, p in enumerate(cohort, 1):
         target_id = p.get("patient_id") or f"patient_{idx}"
         p_name = p.get("name")
         p_surname = p.get("surname")
         p_dob = p.get("date_of_birth")
+        p_cf = p.get("codice_fiscale")
 
         pct_start = int(((idx - 1) / total) * 100)
         update_task(
@@ -294,7 +307,7 @@ def _background_process_batch(
             append_task_event(task_id, clamped, prefixed_msg, event_entry, extra_doc=extra_doc)
 
         try:
-            with _get_patient_lock(target_id), _get_llm_semaphore(pipeline.settings):
+            with get_patient_lock(target_id):
                 res = pipeline.process_patient(
                     patient_id=target_id,
                     name=p_name,
@@ -303,10 +316,13 @@ def _background_process_batch(
                     auto_upload=auto_upload and not dry_run,
                     progress_callback=on_batch_progress,
                     overwrite=overwrite,
+                    codice_fiscale=p_cf,
                 )
+            if res.redcap_upload_status == "uploaded":
+                any_uploaded = True
             results.append(res.model_dump())
         except Exception as e:
-            logger.error(f"Errore elaborazione paziente {target_id}: {e}")
+            logger.exception("Errore elaborazione paziente %s: %s", target_id, e)
             results.append({
                 "patient_id": target_id,
                 "status": "error",
@@ -314,6 +330,9 @@ def _background_process_batch(
             })
 
         update_task(task_id, items_done=idx)
+
+    if any_uploaded:
+        invalidate_redcap_lookup_cache(pipeline.settings)
 
     update_task(
         task_id,
@@ -331,11 +350,11 @@ def process_patient_sync(
     pipeline: PatientPipeline = Depends(get_pipeline)
 ) -> PatientPipelineResult:
     """Elaborazione sincrona di un singolo paziente (download referti -> IA -> REDCap)."""
-    p_id = req.patient_id or f"{req.name}-{req.surname}-{req.date_of_birth or 'unk'}".lower().replace(" ", "-")
+    p_id = _resolve_request_patient_id(req)
     active_pipeline = _pipeline_with_backend(pipeline, req.ai_backend)
     try:
-        with _get_patient_lock(p_id), _get_llm_semaphore(active_pipeline.settings):
-            return active_pipeline.process_patient(
+        with get_patient_lock(p_id):
+            res = active_pipeline.process_patient(
                 patient_id=p_id,
                 name=req.name,
                 surname=req.surname,
@@ -343,11 +362,15 @@ def process_patient_sync(
                 auto_upload=req.auto_upload and not req.dry_run,
                 webhook_url=req.webhook_url,
                 overwrite=req.overwrite,
+                codice_fiscale=req.codice_fiscale,
             )
+        if res.redcap_upload_status == "uploaded":
+            invalidate_redcap_lookup_cache(active_pipeline.settings)
+        return res
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Errore elaborazione paziente: {e}")
+        raise_internal_error(logger, "Errore elaborazione paziente", e)
 
 
 @router.post("/api/patient/{patient_id}/process", dependencies=[Depends(verify_api_key)])
@@ -363,17 +386,27 @@ def process_patient_from_dotnet(
     dob = request.date_of_birth if request else None
     webhook = request.webhook_url if request else None
     overwrite = request.overwrite if request else False
+    codice_fiscale = request.codice_fiscale if request else None
     active_pipeline = _pipeline_with_backend(pipeline, request.ai_backend if request else None)
-    with _get_patient_lock(patient_id), _get_llm_semaphore(active_pipeline.settings):
-        return active_pipeline.process_patient(
-            patient_id=patient_id,
-            name=name,
-            surname=surname,
-            date_of_birth=dob,
-            auto_upload=auto_upload and not dry_run,
-            webhook_url=webhook,
-            overwrite=overwrite,
-        )
+    try:
+        with get_patient_lock(patient_id):
+            res = active_pipeline.process_patient(
+                patient_id=patient_id,
+                name=name,
+                surname=surname,
+                date_of_birth=dob,
+                auto_upload=auto_upload and not dry_run,
+                webhook_url=webhook,
+                overwrite=overwrite,
+                codice_fiscale=codice_fiscale,
+            )
+        if res.redcap_upload_status == "uploaded":
+            invalidate_redcap_lookup_cache(active_pipeline.settings)
+        return res
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise_internal_error(logger, f"Errore elaborazione paziente '{sanitize_identifier(patient_id)}'", e)
 
 
 @router.post("/api/pipeline/process-patient-async", dependencies=[Depends(verify_api_key)], response_model=AsyncTaskCreatedResponse)
@@ -386,11 +419,7 @@ def process_patient_async(
 ) -> AsyncTaskCreatedResponse:
     """Accoda l'elaborazione clinica di un singolo paziente in background e ritorna task_id."""
     effective_req = request
-    p_id = patient_id or (effective_req.patient_id if effective_req else None)
-    if not p_id and effective_req and effective_req.name and effective_req.surname:
-        p_id = f"{effective_req.name}-{effective_req.surname}-{effective_req.date_of_birth or 'unk'}".lower().replace(" ", "-")
-    if not p_id:
-        p_id = "unknown-patient"
+    p_id = _resolve_request_patient_id(effective_req, path_patient_id=patient_id)
 
     active_pipeline = _pipeline_with_backend(pipeline, effective_req.ai_backend if effective_req else None)
     task_id = str(uuid.uuid4())
@@ -401,6 +430,7 @@ def process_patient_async(
     surname = effective_req.surname if effective_req else None
     dob = effective_req.date_of_birth if effective_req else None
     webhook = effective_req.webhook_url if effective_req else None
+    codice_fiscale = effective_req.codice_fiscale if effective_req else None
 
     register_task(
         task_id,
@@ -434,6 +464,7 @@ def process_patient_async(
             dry_run=dry_run,
             webhook=webhook,
             overwrite=overwrite,
+            codice_fiscale=codice_fiscale,
         )
 
     return AsyncTaskCreatedResponse(
@@ -457,7 +488,6 @@ def process_batch_async(
     pzs = estrai_pazienti_univoci(target_file, only_complete=True)
 
     if req.patient_ids:
-        # Filtra solo i pazienti selezionati tramite ID/Slug
         wanted = set(req.patient_ids)
         cohort = [
             {
@@ -465,6 +495,7 @@ def process_batch_async(
                 "name": p.nome or "",
                 "surname": p.cognome,
                 "date_of_birth": p.data_nascita,
+                "codice_fiscale": p.codice_fiscale,
             }
             for p in pzs if p.patient_id in wanted or (p.priamo_id and p.priamo_id in wanted)
         ]
@@ -475,6 +506,7 @@ def process_batch_async(
                 "name": p.nome or "",
                 "surname": p.cognome,
                 "date_of_birth": p.data_nascita,
+                "codice_fiscale": p.codice_fiscale,
             }
             for p in pzs
         ]
@@ -531,19 +563,38 @@ def get_task_status(task_id: str) -> Dict[str, Any]:
     return snap
 
 
-@router.get("/api/tasks/{task_id}/events", dependencies=[Depends(verify_api_key)])
+@router.get("/api/tasks/{task_id}/events", dependencies=[Depends(verify_sse_or_api_key)])
 async def stream_task_events(task_id: str):
-    """Stream Server-Sent Events (SSE) per monitorare l'avanzamento in tempo reale sulla dashboard."""
+    """Stream Server-Sent Events (SSE) incrementale per monitorare l'avanzamento sulla dashboard."""
     if get_task_snapshot(task_id) is None:
         raise HTTPException(status_code=404, detail="Task non trovato.")
 
     async def event_generator():
+        sent_events_idx = 0
+        sent_docs_idx = 0
+
         while True:
             task = get_task_snapshot(task_id)
             if not task:
                 break
 
             status_val = task.get("status")
+            all_events = task.get("events_log") or []
+            all_docs = task.get("processed_documents") or []
+
+            # Reset cursors if task restarted/cleared events_log
+            if len(all_events) < sent_events_idx:
+                sent_events_idx = 0
+            if len(all_docs) < sent_docs_idx:
+                sent_docs_idx = 0
+
+            delta_events = all_events[sent_events_idx:]
+            delta_docs = all_docs[sent_docs_idx:]
+            is_incremental = sent_events_idx > 0 or sent_docs_idx > 0
+
+            sent_events_idx = len(all_events)
+            sent_docs_idx = len(all_docs)
+
             payload = {
                 "task_id": task_id,
                 "status": status_val,
@@ -551,8 +602,9 @@ async def stream_task_events(task_id: str):
                 "current_step": task.get("current_step", ""),
                 "items_done": task.get("items_done", 0),
                 "items_total": task.get("items_total", 1),
-                "events_log": task.get("events_log", []),
-                "processed_documents": task.get("processed_documents", []),
+                "incremental": is_incremental,
+                "events_log": delta_events,
+                "processed_documents": delta_docs,
                 "result": task.get("result") if status_val in ("completed", "failed") else None,
                 "error": task.get("error")
             }

@@ -172,11 +172,14 @@ def main():
 
     # 1. Caso singolo paziente da CLI
     if args.name and args.surname:
-        print(f"-> Verifica singolo paziente: {args.name} {args.surname} ({args.dob or 'Data nascita non indicata'})...")
+        if not args.dob:
+            print("[ERRORE] Per verificare un paziente singolo è necessario specificare --dob (es. --dob 1965-05-12).", file=sys.stderr)
+            sys.exit(1)
+        print(f"-> Verifica singolo paziente: {args.name} {args.surname} ({args.dob})...")
         p = client.search_patient(
             name=args.name,
             surname=args.surname,
-            date_of_birth=args.dob or "1900-01-01"
+            date_of_birth=args.dob
         )
         if p:
             if HAS_RICH:

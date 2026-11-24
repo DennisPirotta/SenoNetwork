@@ -1,9 +1,10 @@
 """Security and API Key Authentication module for SenoNetwork."""
 
+import logging
 import secrets
 import threading
 import time
-from typing import Dict, Optional
+from typing import Dict, NoReturn, Optional
 from fastapi import APIRouter, Depends, HTTPException, Query, Security, status
 from fastapi.security import APIKeyHeader
 from src.config import Settings, get_settings
@@ -56,26 +57,52 @@ def _validate_sse_token(token: str) -> bool:
     return False
 
 
+def _enforce_configured_or_loopback(settings: Settings) -> Optional[str]:
+    """Fails closed on non-loopback hosts when no API key is configured."""
+    configured_key = (settings.api_key or "").strip()
+    if configured_key:
+        return configured_key
+    host_val = (settings.api_host or "").strip().lower()
+    if host_val and host_val not in LOOPBACK_HOSTS and not settings.allow_insecure_local_dev:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Configurazione sicurezza incompleta: impostare SENONETWORK_API_KEY su host non-loopback."
+        )
+    return None
+
+
 def verify_api_key(
     header_key: Optional[str] = Security(api_key_header),
-    query_key: Optional[str] = Query(None, alias="api_key"),
+    settings: Settings = Depends(get_settings)
+) -> Optional[str]:
+    """Validates `X-API-Key` header for REST endpoints (rejects query string secrets)."""
+    configured_key = _enforce_configured_or_loopback(settings)
+    if not configured_key:
+        return None
+
+    if not header_key:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=f"Autenticazione richiesta: specificare l'header '{API_KEY_HEADER_NAME}'."
+        )
+
+    if not secrets.compare_digest(header_key.strip(), configured_key):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="API Key non valida. Accesso negato."
+        )
+
+    return header_key
+
+
+def verify_sse_or_api_key(
+    header_key: Optional[str] = Security(api_key_header),
     sse_token: Optional[str] = Query(None, alias="sse_token"),
     settings: Settings = Depends(get_settings)
 ) -> Optional[str]:
-    """Validates the incoming API key or short-lived SSE token against the configured settings.
-
-    Fails closed when bound to a non-loopback host without an API key (unless
-    `allow_insecure_local_dev=True`). When `settings.api_key` is configured,
-    accepts matching `X-API-Key` header, short-lived `sse_token`, or `api_key`.
-    """
-    configured_key = (settings.api_key or "").strip()
+    """Validates `X-API-Key` header or short-lived `sse_token` exclusively for SSE EventSource streams."""
+    configured_key = _enforce_configured_or_loopback(settings)
     if not configured_key:
-        host_val = (settings.api_host or "").strip().lower()
-        if host_val and host_val not in LOOPBACK_HOSTS and not settings.allow_insecure_local_dev:
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail="Configurazione sicurezza incompleta: impostare SENONETWORK_API_KEY su host non-loopback."
-            )
         return None
 
     if sse_token is not None:
@@ -86,21 +113,28 @@ def verify_api_key(
             detail="Token SSE non valido o scaduto."
         )
 
-    incoming_key = header_key or query_key
-    if not incoming_key:
+    if not header_key:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail=f"Autenticazione richiesta: specificare l'header '{API_KEY_HEADER_NAME}'."
         )
 
-    # Constant time comparison to prevent timing attacks
-    if not secrets.compare_digest(incoming_key.strip(), configured_key):
+    if not secrets.compare_digest(header_key.strip(), configured_key):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="API Key non valida. Accesso negato."
         )
 
-    return incoming_key
+    return header_key
+
+
+def raise_internal_error(log: logging.Logger, public_message: str, exc: Exception) -> NoReturn:
+    """Logs internal exception stack traces server-side and returns a sanitized HTTP 500 error."""
+    log.exception("%s: %s", public_message, exc)
+    raise HTTPException(
+        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        detail=f"{public_message}. Verificare i log applicativi sul server."
+    ) from exc
 
 
 @router.post("/api/security/sse-token", dependencies=[Depends(verify_api_key)])

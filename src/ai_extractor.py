@@ -166,6 +166,9 @@ class BaseAIExtractor(ABC):
             f"{d:02d}/{m:02d}/{yy}",
             f"{d:02d}-{m:02d}-{yy}",
             f"{d:02d}.{m:02d}.{yy}",
+            f"{d}/{m}/{yy}",
+            f"{d}-{m}-{yy}",
+            f"{d}.{m}.{yy}",
         ]
         lower_text = report_text.lower()
         if any(c in lower_text for c in candidates):
@@ -173,7 +176,7 @@ class BaseAIExtractor(ABC):
 
         m_long = _IT_MONTHS_LIST[m]
         m_short = _IT_MONTHS_SHORT[m]
-        textual_pat = rf"\b0?{d}\s+(?:{m_long}|{m_short})\.?\s+{y:04d}\b"
+        textual_pat = rf"\b0?{d}[\s\-]+(?:{m_long}|{m_short})\.?[\s\-]+(?:{y:04d}|{yy})\b"
         return bool(re.search(textual_pat, lower_text))
 
     @staticmethod
@@ -336,9 +339,11 @@ class LlamaCppExtractor(BaseAIExtractor):
         """Checks if the llama.cpp server is active and reachable."""
         for path in ("/health", "/v1/models", "/props"):
             try:
-                r = requests.get(f"{self.base_url}{path}", headers=self.headers, timeout=5)
-                if r.status_code == 200:
-                    return True
+                with contextlib.closing(
+                    requests.get(f"{self.base_url}{path}", headers=self.headers, timeout=2.5)
+                ) as r:
+                    if r.status_code == 200:
+                        return True
             except Exception:
                 pass
         return False
@@ -380,11 +385,24 @@ class LlamaCppExtractor(BaseAIExtractor):
         """Communicates with llama.cpp using /v1/chat/completions or /completion with streaming SSE."""
         if self.api_mode == "completion":
             endpoint = f"{self.base_url}/completion"
-            full_prompt = (
-                f"<|im_start|>system\n{system_prompt}<|im_end|>\n"
-                f"<|im_start|>user\n{user_prompt}<|im_end|>\n"
-                f"<|im_start|>assistant\n"
-            )
+            model_lower = (self.model or "").lower()
+            if any(k in model_lower for k in ("llama-3", "llama3")):
+                full_prompt = (
+                    f"<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\n{system_prompt}<|eot_id|>"
+                    f"<|start_header_id|>user<|end_header_id|>\n\n{user_prompt}<|eot_id|>"
+                    f"<|start_header_id|>assistant<|end_header_id|>\n\n"
+                )
+            elif "gemma" in model_lower:
+                full_prompt = (
+                    f"<start_of_turn>user\n{system_prompt}\n\n{user_prompt}<end_of_turn>\n"
+                    f"<start_of_turn>model\n"
+                )
+            else:
+                full_prompt = (
+                    f"<|im_start|>system\n{system_prompt}<|im_end|>\n"
+                    f"<|im_start|>user\n{user_prompt}<|im_end|>\n"
+                    f"<|im_start|>assistant\n"
+                )
             payload = {
                 "prompt": full_prompt,
                 "temperature": self.temperature,
@@ -407,6 +425,7 @@ class LlamaCppExtractor(BaseAIExtractor):
                 {"role": "user", "content": user_prompt}
             ],
             "temperature": self.temperature,
+            "max_tokens": 4096,
             "response_format": {
                 "type": "json_object",
                 "schema": json_schema
@@ -454,18 +473,18 @@ class OllamaExtractor(BaseAIExtractor):
     def is_available(self) -> bool:
         """Checks if the local Ollama instance is reachable."""
         try:
-            r = requests.get(f"{self.base_url}/api/tags", timeout=5)
-            return r.status_code == 200
+            with contextlib.closing(requests.get(f"{self.base_url}/api/tags", timeout=2.5)) as r:
+                return r.status_code == 200
         except Exception:
             return False
 
     def list_local_models(self) -> List[str]:
         """Returns the list of downloaded local model names."""
         try:
-            r = requests.get(f"{self.base_url}/api/tags", timeout=5)
-            if r.status_code == 200:
-                data = r.json()
-                return [m.get("name", "") for m in data.get("models", [])]
+            with contextlib.closing(requests.get(f"{self.base_url}/api/tags", timeout=5)) as r:
+                if r.status_code == 200:
+                    data = r.json()
+                    return [m.get("name", "") for m in data.get("models", [])]
         except Exception:
             pass
         return []
@@ -488,27 +507,75 @@ class OllamaExtractor(BaseAIExtractor):
             "stream": False,
             "options": {
                 "temperature": self.temperature,
+                "num_ctx": 8192,
                 "num_predict": 4096
             }
         }
-        response = requests.post(endpoint, json=payload, timeout=self.timeout_seconds)
-        if response.status_code in (400, 422):
-            logger.warning(f"Ollama ha rifiutato format json_schema (HTTP {response.status_code}); fallback a format='json'.")
-            payload["format"] = "json"
-            response = requests.post(endpoint, json=payload, timeout=self.timeout_seconds)
+        with contextlib.closing(requests.post(endpoint, json=payload, timeout=self.timeout_seconds)) as response:
+            if response.status_code in (400, 422):
+                logger.warning(f"Ollama ha rifiutato format json_schema (HTTP {response.status_code}); fallback a format='json'.")
+                payload["format"] = "json"
+            else:
+                response.raise_for_status()
+                res_json = response.json()
+                return res_json.get("message", {}).get("content", "")
 
-        response.raise_for_status()
-        res_json = response.json()
-        return res_json.get("message", {}).get("content", "")
+        with contextlib.closing(requests.post(endpoint, json=payload, timeout=self.timeout_seconds)) as fallback_resp:
+            fallback_resp.raise_for_status()
+            res_json = fallback_resp.json()
+            return res_json.get("message", {}).get("content", "")
+
+
+def _extract_first_balanced_json(text: str) -> Optional[str]:
+    """Extracts the first balanced top-level `{...}` JSON object ignoring trailing prose with braces."""
+    start = text.find("{")
+    if start == -1:
+        return None
+    depth = 0
+    in_string = False
+    escaped = False
+    for idx in range(start, len(text)):
+        ch = text[idx]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+        else:
+            if ch == '"':
+                in_string = True
+            elif ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    return text[start:idx + 1]
+    return None
 
 
 def parse_json_response(text: str) -> Dict[str, Any]:
-    """Safely parses JSON string, stripping any surrounding markdown markers."""
+    """Safely parses JSON string, stripping any surrounding markdown markers or trailing prose."""
     cleaned = text.strip()
     if cleaned.startswith("```"):
         cleaned = re.sub(r"^```(?:json)?", "", cleaned)
         cleaned = re.sub(r"```$", "", cleaned)
         cleaned = cleaned.strip()
+
+    try:
+        parsed = json.loads(cleaned)
+        if isinstance(parsed, dict):
+            return parsed
+    except json.JSONDecodeError:
+        pass
+
+    balanced = _extract_first_balanced_json(cleaned)
+    if balanced is not None:
+        try:
+            return json.loads(balanced)
+        except json.JSONDecodeError:
+            pass
 
     start = cleaned.find("{")
     end = cleaned.rfind("}")
@@ -518,6 +585,25 @@ def parse_json_response(text: str) -> Dict[str, Any]:
     return json.loads(cleaned)
 
 
+def probe_ai_health(settings: Settings) -> Dict[str, bool]:
+    """Probes llama.cpp RPC and Ollama endpoints concurrently."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    ollama = OllamaExtractor(base_url=settings.ollama_base_url)
+    llamacpp = LlamaCppExtractor(
+        base_url=settings.llama_cpp_base_url,
+        cf_client_id=settings.ai_cloudflared_client_id,
+        cf_client_secret=settings.ai_cloudflared_client_secret
+    )
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        fut_llama = pool.submit(llamacpp.is_available)
+        fut_ollama = pool.submit(ollama.is_available)
+        return {
+            "llama_cpp_rpc_available": fut_llama.result(),
+            "ollama_available": fut_ollama.result(),
+        }
+
+
 def get_ai_extractor(settings: Optional[Settings] = None) -> Union[LlamaCppExtractor, OllamaExtractor]:
     """Factory that returns the configured AI extractor.
     Defaults to LlamaCppExtractor (with distributed RPC inference),
@@ -525,7 +611,7 @@ def get_ai_extractor(settings: Optional[Settings] = None) -> Union[LlamaCppExtra
     """
     cfg = settings or Settings()
 
-    if cfg.ai_backend == "llama_cpp":
+    if (cfg.ai_backend or "llama_cpp").strip().lower() == "llama_cpp":
         extractor = LlamaCppExtractor(
             base_url=cfg.llama_cpp_base_url,
             api_mode=cfg.llama_cpp_api_mode,

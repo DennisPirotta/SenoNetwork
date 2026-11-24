@@ -1,5 +1,6 @@
 """Priamo HIS (Ospedale Valduce) Verification API Router."""
 
+import logging
 from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
@@ -8,14 +9,15 @@ from src.config import Settings, get_settings
 from src.dotnet_client import DotNetApiClient
 from scripts.extract_patients_from_shared_file import estrai_pazienti_univoci
 from src.routers.cup import _find_target_cup_file
-from src.routers.security import verify_api_key
+from src.routers.security import raise_internal_error, verify_api_key
 
+logger = logging.getLogger(__name__)
 router = APIRouter(tags=["Priamo HIS"])
 
 
 class VerifySinglePatientRequest(BaseModel):
-    name: str = Field(..., description="Nome del paziente")
-    surname: str = Field(..., description="Cognome del paziente")
+    name: str = Field(..., min_length=1, description="Nome del paziente")
+    surname: str = Field(..., min_length=1, description="Cognome del paziente")
     date_of_birth: Optional[str] = Field(default=None, description="Data di nascita (YYYY-MM-DD)")
 
 
@@ -26,7 +28,7 @@ class VerifyCohortRequest(BaseModel):
     )
     cup_file_name: Optional[str] = Field(default=None, description="Nome file CUP alternativo da cui caricare i pazienti")
     limit: Optional[int] = Field(default=None, ge=1, le=5000, description="Numero massimo di pazienti da verificare")
-    max_workers: int = Field(default=4, ge=1, le=16, description="Numero di thread concorrenti per la verifica")
+    max_workers: int = Field(default=4, ge=1, le=8, description="Numero di thread concorrenti per la verifica")
 
 
 @router.post("/api/priamo/verify-patient", dependencies=[Depends(verify_api_key)])
@@ -44,8 +46,8 @@ def verify_patient(
 
     try:
         p = dotnet.verify_patient_in_priamo(
-            name=req.name,
-            surname=req.surname,
+            name=req.name.strip(),
+            surname=req.surname.strip(),
             date_of_birth=req.date_of_birth
         )
 
@@ -72,7 +74,7 @@ def verify_patient(
             "slug": p.slug
         }
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Errore verifica Priamo: {e}")
+        raise_internal_error(logger, "Errore verifica Priamo", e)
 
 
 @router.post("/api/priamo/verify-cohort", dependencies=[Depends(verify_api_key)])
@@ -126,5 +128,7 @@ def verify_cohort(
             "error_count": error_count,
             "results": results
         }
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Errore verifica coorte Priamo: {e}")
+        raise_internal_error(logger, "Errore verifica coorte Priamo", e)

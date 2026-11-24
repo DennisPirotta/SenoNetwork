@@ -1,6 +1,7 @@
 """PriamoCUP Worksheets and Patients API Router."""
 
 from datetime import datetime
+import hashlib
 import io
 import json
 import logging
@@ -23,27 +24,37 @@ from src.priamo_cup_client import (
     PriamoCupClient,
 )
 from scripts.extract_patients_from_shared_file import estrai_pazienti_univoci
-from src.routers.security import verify_api_key
-from src.utils import normalize_person_name, sanitize_identifier
+from src.routers.security import raise_internal_error, verify_api_key
+from src.utils import normalize_person_name, sanitize_csv_cell, sanitize_identifier
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["Priamo CUP"])
 
 _CACHE_LOCK = threading.Lock()
-MAX_CUP_CACHE_ENTRIES = 64
+MAX_CUP_CACHE_ENTRIES = 32
 
-# Cache in-memory per il conteggio dei pazienti nei file CUP: (file_name, mtime) -> count
-_CUP_FILE_CACHE: Dict[Tuple[str, float], int] = {}
+# Cache in-memory dei pazienti estratti dai file CUP: (resolved_path, mtime_ns, only_complete) -> List[Paziente]
+_CUP_PARSED_CACHE: Dict[Tuple[str, int, bool], List[Any]] = {}
 
-# Cache in-memory per la corrispondenza dei record REDCap: TTL 60s
-_REDCAP_LOOKUP_CACHE: Dict[str, Any] = {
-    "timestamp": 0.0,
-    "by_cf": {},
-    "by_demographics": {},
-    "ambiguous_demographics": set(),
-    "by_id": {},
-}
+# Cache in-memory per la corrispondenza dei record REDCap partizionata per progetto: TTL 60s
+_REDCAP_LOOKUP_BY_PROJECT: Dict[str, Dict[str, Any]] = {}
+
+
+def _redcap_project_cache_key(settings: Settings) -> str:
+    url = (settings.redcap_api_url or "").strip()
+    tok = (settings.redcap_api_token or "").strip()
+    tok_hash = hashlib.sha256(tok.encode("utf-8")).hexdigest()[:12] if tok else "anon"
+    return f"{url}::{tok_hash}"
+
+
+def invalidate_redcap_lookup_cache(settings: Optional[Settings] = None) -> None:
+    """Invalidates cached REDCap lookup indices after mutations (imports or deletions)."""
+    with _CACHE_LOCK:
+        if settings is not None:
+            _REDCAP_LOOKUP_BY_PROJECT.pop(_redcap_project_cache_key(settings), None)
+        else:
+            _REDCAP_LOOKUP_BY_PROJECT.clear()
 
 
 def _normalize_dob(dob: Any) -> str:
@@ -61,21 +72,28 @@ def _normalize_dob(dob: Any) -> str:
     return s
 
 
+def _empty_lookup_entry() -> Dict[str, Any]:
+    return {
+        "timestamp": 0.0,
+        "by_cf": {},
+        "by_demographics": {},
+        "ambiguous_demographics": set(),
+        "by_id": {},
+    }
+
+
 def _get_redcap_lookup(settings: Settings, force_refresh: bool = False) -> Dict[str, Any]:
-    """Recupera l'elenco dei record REDCap per il matching con i pazienti CUP, con cache a 60 secondi."""
-    global _REDCAP_LOOKUP_CACHE
+    """Recupera l'elenco dei record REDCap per il matching con i pazienti CUP, con cache a 60 secondi per progetto."""
+    proj_key = _redcap_project_cache_key(settings)
     now = time.time()
     with _CACHE_LOCK:
-        if (
-            not force_refresh
-            and _REDCAP_LOOKUP_CACHE["timestamp"] > 0
-            and (now - _REDCAP_LOOKUP_CACHE["timestamp"]) < 60
-        ):
-            return _REDCAP_LOOKUP_CACHE
+        cached = _REDCAP_LOOKUP_BY_PROJECT.get(proj_key)
+        if not force_refresh and cached and cached["timestamp"] > 0 and (now - cached["timestamp"]) < 60:
+            return cached
 
     if not settings.redcap_api_url or not settings.redcap_api_token:
         with _CACHE_LOCK:
-            return _REDCAP_LOOKUP_CACHE
+            return _REDCAP_LOOKUP_BY_PROJECT.get(proj_key) or _empty_lookup_entry()
 
     try:
         svc = REDCapService(api_url=settings.redcap_api_url, api_token=settings.redcap_api_token)
@@ -117,19 +135,22 @@ def _get_redcap_lookup(settings: Settings, force_refresh: bool = False) -> Dict[
             by_demo.pop(key, None)
 
         new_cache = {
-            "timestamp": now,
+            "timestamp": time.time(),
             "by_cf": by_cf,
             "by_demographics": by_demo,
             "ambiguous_demographics": ambiguous_demo,
             "by_id": by_id,
         }
         with _CACHE_LOCK:
-            _REDCAP_LOOKUP_CACHE = new_cache
-            return _REDCAP_LOOKUP_CACHE
+            if len(_REDCAP_LOOKUP_BY_PROJECT) >= 16:
+                oldest_proj = next(iter(_REDCAP_LOOKUP_BY_PROJECT))
+                _REDCAP_LOOKUP_BY_PROJECT.pop(oldest_proj, None)
+            _REDCAP_LOOKUP_BY_PROJECT[proj_key] = new_cache
+            return new_cache
     except Exception as e:
-        logger.debug(f"Impossibile aggiornare cache record REDCap per CUP: {e}")
+        logger.debug("Impossibile aggiornare cache record REDCap per CUP: %s", e)
         with _CACHE_LOCK:
-            return _REDCAP_LOOKUP_CACHE
+            return _REDCAP_LOOKUP_BY_PROJECT.get(proj_key) or _empty_lookup_entry()
 
 
 def _check_local_state(patient_id: str, state_dir: Path) -> Tuple[bool, bool]:
@@ -145,19 +166,20 @@ def _check_local_state(patient_id: str, state_dir: Path) -> Tuple[bool, bool]:
             data = json.load(f)
             uploaded = data.get("redcap_upload_status") == "uploaded"
             return True, uploaded
-    except Exception:
+    except Exception as e:
+        logger.debug("Impossibile leggere state file %s: %s", p_path, e)
         return True, False
 
 
 class CupDownloadRequest(BaseModel):
     ytd: bool = Field(default=False, description="Scarica da 1° Gennaio fino a ieri (YTD)")
-    year: Optional[int] = Field(default=None, description="Anno intero da scaricare (es. 2025)")
+    year: Optional[int] = Field(default=None, ge=2000, le=2100, description="Anno intero da scaricare (es. 2025)")
     month: Optional[str] = Field(default=None, description="Mese da scaricare (YYYY-MM o MM, es. '2026-10')")
-    months: Optional[int] = Field(default=None, description="Ultimi N mesi da scaricare")
+    months: Optional[int] = Field(default=None, ge=1, le=60, description="Ultimi N mesi da scaricare")
     start_date: Optional[str] = Field(default=None, description="Data inizio (YYYY-MM-DD)")
     end_date: Optional[str] = Field(default=None, description="Data fine (YYYY-MM-DD)")
-    weeks: Optional[int] = Field(default=None, description="Numero di settimane")
-    unit: str = Field(default=UNITA_SENOLOGIA, description="Codice unità operativa (default: 37002 Senologia)")
+    weeks: Optional[int] = Field(default=None, ge=1, le=104, description="Numero di settimane")
+    unit: str = Field(default=UNITA_SENOLOGIA, pattern=r"^[A-Za-z0-9_\-]{1,20}$", description="Codice unità operativa (default: 37002 Senologia)")
     agendas: Optional[List[str]] = Field(default=None, description="Elenco agende (default: 3000, 3003, 3004, 3035, 3036)")
 
 
@@ -183,23 +205,31 @@ def _find_target_cup_file(file_name: Optional[str] = None, cup_dir: Optional[Pat
     return files[0]
 
 
+def _get_cup_patients_cached(f: Path, only_complete: bool = False) -> List[Any]:
+    """Parses and caches unique patients extracted from a CUP Excel worksheet keyed by `(path, mtime_ns, only_complete)`."""
+    if not f.exists():
+        return estrai_pazienti_univoci(f, only_complete=only_complete)
+    mtime_ns = f.stat().st_mtime_ns
+    key = (str(f.resolve()), mtime_ns, bool(only_complete))
+    with _CACHE_LOCK:
+        if key in _CUP_PARSED_CACHE:
+            return list(_CUP_PARSED_CACHE[key])
+
+    pts = estrai_pazienti_univoci(f, only_complete=only_complete)
+    with _CACHE_LOCK:
+        if len(_CUP_PARSED_CACHE) >= MAX_CUP_CACHE_ENTRIES:
+            oldest = next(iter(_CUP_PARSED_CACHE))
+            _CUP_PARSED_CACHE.pop(oldest, None)
+        _CUP_PARSED_CACHE[key] = list(pts)
+    return pts
+
+
 def _get_cup_patient_count(f: Path) -> int:
     """Restituisce il numero di pazienti univoci memorizzato in cache per il file specificato."""
     try:
-        mtime = f.stat().st_mtime
-        key = (f.name, mtime)
-        with _CACHE_LOCK:
-            if key in _CUP_FILE_CACHE:
-                return _CUP_FILE_CACHE[key]
-        pts = estrai_pazienti_univoci(f)
-        count = len(pts)
-        with _CACHE_LOCK:
-            if len(_CUP_FILE_CACHE) >= MAX_CUP_CACHE_ENTRIES:
-                oldest = next(iter(_CUP_FILE_CACHE))
-                _CUP_FILE_CACHE.pop(oldest, None)
-            _CUP_FILE_CACHE[key] = count
-        return count
-    except Exception:
+        return len(_get_cup_patients_cached(f, only_complete=False))
+    except Exception as e:
+        logger.warning("Impossibile estrarre conteggio pazienti da %s: %s", f.name, e)
         return 0
 
 
@@ -232,22 +262,25 @@ def download_cup_worksheets(
             output_dir=str(settings.cup_dir),
         )
 
-        # Estrai pazienti per contare i record univoci e aggiorna la cache
+        # Estrai pazienti per contare i record univoci e popola la cache
         pazienti = estrai_pazienti_univoci(downloaded_file)
-        with _CACHE_LOCK:
-            if len(_CUP_FILE_CACHE) >= MAX_CUP_CACHE_ENTRIES:
-                oldest = next(iter(_CUP_FILE_CACHE))
-                _CUP_FILE_CACHE.pop(oldest, None)
-            _CUP_FILE_CACHE[(downloaded_file.name, downloaded_file.stat().st_mtime)] = len(pazienti)
+        if downloaded_file.exists():
+            key = (str(downloaded_file.resolve()), downloaded_file.stat().st_mtime_ns, False)
+            with _CACHE_LOCK:
+                if len(_CUP_PARSED_CACHE) >= MAX_CUP_CACHE_ENTRIES:
+                    oldest = next(iter(_CUP_PARSED_CACHE))
+                    _CUP_PARSED_CACHE.pop(oldest, None)
+                _CUP_PARSED_CACHE[key] = list(pazienti)
 
-        size_kb = downloaded_file.stat().st_size / 1024
+        size_bytes = downloaded_file.stat().st_size
+        size_kb = size_bytes / 1024
         size_str = f"{size_kb:.1f} KB" if size_kb < 1024 else f"{(size_kb / 1024):.2f} MB"
 
         return {
             "status": "success",
             "file_name": downloaded_file.name,
             "file_path": str(downloaded_file),
-            "size_bytes": downloaded_file.stat().st_size,
+            "size_bytes": size_bytes,
             "size_formatted": size_str,
             "total_unique_patients": len(pazienti),
             "unit": req.unit,
@@ -256,18 +289,20 @@ def download_cup_worksheets(
         }
     except HTTPException:
         raise
-    except requests.exceptions.ConnectionError as e:
+    except ValueError as ve:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(ve))
+    except requests.exceptions.ConnectionError:
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail=f"Impossibile connettersi a Priamo CUP ({settings.priamo_cup_url}): rete non raggiungibile. Verificare che la VPN Valduce sia attiva."
         )
-    except requests.exceptions.Timeout as e:
+    except requests.exceptions.Timeout:
         raise HTTPException(
             status_code=status.HTTP_504_GATEWAY_TIMEOUT,
             detail=f"Timeout durante la connessione a Priamo CUP ({settings.priamo_cup_url})."
         )
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Errore download PriamoCUP: {e}")
+        raise_internal_error(logger, "Errore download PriamoCUP", e)
 
 
 @router.post("/api/cup/download-latest", dependencies=[Depends(verify_api_key)])
@@ -300,13 +335,14 @@ def list_cup_files(settings: Settings = Depends(get_settings)) -> List[Dict[str,
     items = []
     for f in files:
         count = _get_cup_patient_count(f)
-        size_kb = f.stat().st_size / 1024
+        st = f.stat()
+        size_kb = st.st_size / 1024
         size_str = f"{size_kb:.1f} KB" if size_kb < 1024 else f"{(size_kb / 1024):.2f} MB"
-        mtime = f.stat().st_mtime
+        mtime = st.st_mtime
         items.append({
             "name": f.name,
             "path": str(f),
-            "size_bytes": f.stat().st_size,
+            "size_bytes": st.st_size,
             "size_formatted": size_str,
             "modified_timestamp": mtime,
             "modified_at": datetime.fromtimestamp(mtime).strftime("%Y-%m-%d %H:%M"),
@@ -321,10 +357,15 @@ def list_cup_files(settings: Settings = Depends(get_settings)) -> List[Dict[str,
 def download_cup_file_raw(file_name: str, settings: Settings = Depends(get_settings)):
     """Permette di scaricare direttamente il file Excel originale archiviato nella cartella CUP."""
     target = _find_target_cup_file(file_name, cup_dir=settings.cup_dir)
+    media_type = (
+        "application/vnd.ms-excel"
+        if target.suffix.lower() == ".xls"
+        else "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    )
     return FileResponse(
         path=str(target),
         filename=target.name,
-        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        media_type=media_type
     )
 
 
@@ -343,7 +384,7 @@ def get_cup_patients(
     """Restituisce l'elenco dei pazienti univoci estratti dal foglio CUP con filtri, paginazione e verifica stato REDCap."""
     target_name = file_name or cup_file
     target_file = _find_target_cup_file(target_name, cup_dir=settings.cup_dir)
-    pazienti = estrai_pazienti_univoci(target_file, only_complete=only_complete)
+    pazienti = _get_cup_patients_cached(target_file, only_complete=only_complete)
 
     # Filtraggio per ricerca testuale
     if search and search.strip():
@@ -429,11 +470,12 @@ def export_cup_patients(
     """Esporta l'anagrafica dei pazienti univoci in streaming per il download diretto dal browser."""
     target_name = file_name or cup_file
     target_file = _find_target_cup_file(target_name, cup_dir=settings.cup_dir)
-    pazienti = estrai_pazienti_univoci(target_file, only_complete=only_complete)
+    pazienti = _get_cup_patients_cached(target_file, only_complete=only_complete)
     rows = [p.to_export_dict() for p in pazienti]
     df = pd.DataFrame(rows)
 
-    base_name = f"anagrafica_{target_file.stem}"
+    safe_stem = sanitize_identifier(target_file.stem, default="cup")
+    base_name = f"anagrafica_{safe_stem}"
 
     if format == "json":
         buf = io.BytesIO()
@@ -442,7 +484,7 @@ def export_cup_patients(
         return StreamingResponse(
             buf,
             media_type="application/json",
-            headers={"Content-Disposition": f"attachment; filename={base_name}.json"}
+            headers={"Content-Disposition": f'attachment; filename="{base_name}.json"'}
         )
     elif format == "xlsx":
         buf = io.BytesIO()
@@ -452,14 +494,15 @@ def export_cup_patients(
         return StreamingResponse(
             buf,
             media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            headers={"Content-Disposition": f"attachment; filename={base_name}.xlsx"}
+            headers={"Content-Disposition": f'attachment; filename="{base_name}.xlsx"'}
         )
     else:
+        safe_df = df.map(sanitize_csv_cell)
         buf = io.StringIO()
-        df.to_csv(buf, index=False, encoding="utf-8")
+        safe_df.to_csv(buf, index=False, encoding="utf-8")
         buf.seek(0)
         return StreamingResponse(
             io.BytesIO(buf.getvalue().encode("utf-8")),
             media_type="text/csv",
-            headers={"Content-Disposition": f"attachment; filename={base_name}.csv"}
+            headers={"Content-Disposition": f'attachment; filename="{base_name}.csv"'}
         )

@@ -18,14 +18,15 @@ function escapeHtml(val) {
 // =============================================================================
 class APIClient {
   static getApiKey() {
-    return localStorage.getItem("senonetwork_api_key") || "";
+    return sessionStorage.getItem("senonetwork_api_key") || "";
   }
 
   static setApiKey(key) {
+    localStorage.removeItem("senonetwork_api_key");
     if (key) {
-      localStorage.setItem("senonetwork_api_key", key.trim());
+      sessionStorage.setItem("senonetwork_api_key", key.trim());
     } else {
-      localStorage.removeItem("senonetwork_api_key");
+      sessionStorage.removeItem("senonetwork_api_key");
     }
   }
 
@@ -123,7 +124,7 @@ class APIClient {
   static triggerSync(payload = {}) {
     return this.request("/api/sync/check-updates-async", { method: "POST", body: payload });
   }
-  static getRedCapRecords(limit = 100) {
+  static getRedCapRecords(limit = 500) {
     return this.request(`/api/redcap/records?limit=${limit}`);
   }
   static deleteRedCapRecord(recordId) {
@@ -249,8 +250,16 @@ class OverviewController {
     }
 
     if (data.redcap_metrics) {
-      document.getElementById("kpi-redcap-records").textContent = data.redcap_metrics.records_count || 0;
-      document.getElementById("kpi-completed-records").textContent = data.redcap_metrics.fully_completed_records || 0;
+      if (data.redcap_metrics.status === "error") {
+        document.getElementById("kpi-redcap-records").textContent = "Err";
+        document.getElementById("kpi-completed-records").textContent = "-";
+      } else {
+        document.getElementById("kpi-redcap-records").textContent = data.redcap_metrics.records_count || 0;
+        document.getElementById("kpi-completed-records").textContent = data.redcap_metrics.fully_completed_records || 0;
+      }
+      if (data.redcap_metrics.total_forms) {
+        OverviewController.totalForms = data.redcap_metrics.total_forms;
+      }
     }
 
     if (data.storage_metrics) {
@@ -259,14 +268,28 @@ class OverviewController {
   }
 }
 
+OverviewController.totalForms = 8;
+
 // =============================================================================
 // 4. Priamo CUP Controller (conforme a modern-web-guidance responsive-table)
 // =============================================================================
 class CupController {
   static currentPage = 1;
+  static totalPages = 1;
   static pageSize = 20;
   static currentFile = "";
   static filesList = [];
+
+  static _toIsoDate(val) {
+    const s = String(val || "").trim();
+    if (!s || s === "-") return "";
+    if (/^\d{4}-\d{2}-\d{2}$/.test(s)) return s;
+    const m = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
+    if (m) {
+      return `${m[3]}-${m[2].padStart(2, "0")}-${m[1].padStart(2, "0")}`;
+    }
+    return "";
+  }
 
   static async loadFiles() {
     try {
@@ -434,6 +457,9 @@ class CupController {
 
     const patients = res.items || [];
     if (patients.length === 0) {
+      this.totalPages = 1;
+      document.getElementById("btn-cup-prev").disabled = true;
+      document.getElementById("btn-cup-next").disabled = true;
       tbody.innerHTML = '<tr><td colspan="7" style="text-align: center; color: var(--text-muted); padding: 2rem;">Nessun paziente trovato per i criteri selezionati.</td></tr>';
       document.getElementById("cup-pagination-info").textContent = "Nessun paziente trovato";
       return;
@@ -457,7 +483,9 @@ class CupController {
       let statusBadge = '<span class="badge badge-neutral">Da Elaborare</span>';
       if (inRedcap) {
         const idLabel = redcapId ? ` #${safeRedcapId}` : '';
-        const formsLabel = (formsCount !== undefined && formsCount !== null) ? ` (${escapeHtml(formsCount)}/8)` : '';
+        const formsLabel = (formsCount !== undefined && formsCount !== null)
+          ? ` (${escapeHtml(formsCount)}/${escapeHtml(OverviewController.totalForms)})`
+          : '';
         statusBadge = `<span class="badge badge-success" title="Paziente registrato in REDCap (ID: ${safeRedcapId || 'N/D'})">✓ REDCap${idLabel}${formsLabel}</span>`;
       } else if (hasLocal) {
         statusBadge = '<span class="badge badge-info" title="Referti elaborati in locale ma non caricati su REDCap">✓ In Locale</span>';
@@ -496,7 +524,7 @@ class CupController {
         document.getElementById("pipe-patient-id").value = redcapId || id;
         document.getElementById("pipe-name").value = name;
         document.getElementById("pipe-surname").value = surname;
-        document.getElementById("pipe-dob").value = dob;
+        document.getElementById("pipe-dob").value = CupController._toIsoDate(dob);
 
         TabManager.switchToTab("tab-btn-pipeline", "panel-pipeline");
       });
@@ -528,6 +556,9 @@ class CupController {
     const start = (this.currentPage - 1) * this.pageSize + 1;
     const end = Math.min(start + patients.length - 1, total);
     const totalPages = res.total_pages || Math.max(1, Math.ceil(total / this.pageSize));
+    this.totalPages = totalPages;
+    document.getElementById("btn-cup-prev").disabled = this.currentPage <= 1;
+    document.getElementById("btn-cup-next").disabled = this.currentPage >= totalPages;
     document.getElementById("cup-pagination-info").textContent =
       `Visualizzazione ${start}-${end} di ${total} pazienti (Pagina ${this.currentPage} di ${totalPages})`;
   }
@@ -540,6 +571,15 @@ class PipelineRealtimeController {
   static currentEventSource = null;
   static taskStartTime = 0;
   static timerInterval = null;
+  static docCards = [];
+  static taskCompletedOrFailed = false;
+
+  static _stopTimer() {
+    if (this.timerInterval) {
+      clearInterval(this.timerInterval);
+      this.timerInterval = null;
+    }
+  }
 
   static init() {
     document.getElementById("btn-start-single-pipeline").addEventListener("click", () => this.startSingle());
@@ -586,6 +626,8 @@ class PipelineRealtimeController {
 
       await this.connectSSE(res.task_id);
     } catch (err) {
+      this._stopTimer();
+      this.taskCompletedOrFailed = true;
       this.appendLog(`Errore avvio task: ${err.message}`, "error");
       document.getElementById("pipeline-live-badge").className = "badge badge-danger";
       document.getElementById("pipeline-live-badge").textContent = "Errore Avvio";
@@ -613,6 +655,8 @@ class PipelineRealtimeController {
 
       await this.connectSSE(res.task_id);
     } catch (err) {
+      this._stopTimer();
+      this.taskCompletedOrFailed = true;
       this.appendLog(`Errore avvio batch: ${err.message}`, "error");
       document.getElementById("pipeline-live-badge").className = "badge badge-danger";
       document.getElementById("pipeline-live-badge").textContent = "Errore Avvio";
@@ -624,11 +668,10 @@ class PipelineRealtimeController {
       this.currentEventSource.close();
       this.currentEventSource = null;
     }
-    if (this.timerInterval) {
-      clearInterval(this.timerInterval);
-      this.timerInterval = null;
-    }
+    this._stopTimer();
     this.seenLogKeys.clear();
+    this.docCards = [];
+    this.taskCompletedOrFailed = false;
 
     document.getElementById("pipeline-live-badge").className = "badge badge-info";
     document.getElementById("pipeline-live-badge").textContent = "In Esecuzione";
@@ -659,6 +702,10 @@ class PipelineRealtimeController {
           url = `${url}?sse_token=${encodeURIComponent(tokRes.sse_token)}`;
         }
       } catch (err) {
+        this._stopTimer();
+        this.taskCompletedOrFailed = true;
+        document.getElementById("pipeline-live-badge").className = "badge badge-danger";
+        document.getElementById("pipeline-live-badge").textContent = "Errore Auth SSE";
         this.appendLog(`Impossibile ottenere token SSE: ${err.message}`, "error");
         return;
       }
@@ -681,7 +728,12 @@ class PipelineRealtimeController {
       console.warn("Connessione SSE terminata o chiusa:", err);
       eventSource.close();
       this.currentEventSource = null;
-      if (this.timerInterval) clearInterval(this.timerInterval);
+      this._stopTimer();
+      if (!this.taskCompletedOrFailed) {
+        document.getElementById("pipeline-live-badge").className = "badge badge-warning";
+        document.getElementById("pipeline-live-badge").textContent = "Disconnesso";
+        this.appendLog("Connessione streaming SSE interrotta prima del completamento.", "error");
+      }
     };
   }
 
@@ -697,31 +749,50 @@ class PipelineRealtimeController {
     // Append new log lines from server
     if (data.events_log && Array.isArray(data.events_log)) {
       data.events_log.forEach(ev => {
-        this.appendLogUnique(ev.message, ev.time);
+        if (data.incremental) {
+          this.appendLogLine(ev.message, ev.time);
+        } else {
+          this.appendLogUnique(ev.message, ev.time);
+        }
       });
     }
 
-    // Render processed documents cards
+    // Render processed documents cards (supports incremental deltas and full snapshots)
     if (data.processed_documents && Array.isArray(data.processed_documents)) {
-      this.renderDocCards(data.processed_documents);
+      if (data.incremental) {
+        this.docCards.push(...data.processed_documents);
+      } else {
+        this.docCards = [...data.processed_documents];
+      }
+      this.renderDocCards(this.docCards);
     }
 
     // Completion or failure handling
     if (data.status === "completed") {
+      this.taskCompletedOrFailed = true;
       document.getElementById("pipeline-live-badge").className = "badge badge-success";
       document.getElementById("pipeline-live-badge").textContent = "✓ Completato";
       this.appendLog("✓ Task completato con successo!", "success");
-      if (this.timerInterval) clearInterval(this.timerInterval);
+      this._stopTimer();
+      if (this.currentEventSource) {
+        this.currentEventSource.close();
+        this.currentEventSource = null;
+      }
 
       if (data.result) {
         this.renderResultJson(data.result);
       }
       OverviewController.load();
     } else if (data.status === "failed") {
+      this.taskCompletedOrFailed = true;
       document.getElementById("pipeline-live-badge").className = "badge badge-danger";
       document.getElementById("pipeline-live-badge").textContent = "✗ Fallito";
       this.appendLog(`✗ Errore task: ${data.error || 'Errore sconosciuto'}`, "error");
-      if (this.timerInterval) clearInterval(this.timerInterval);
+      this._stopTimer();
+      if (this.currentEventSource) {
+        this.currentEventSource.close();
+        this.currentEventSource = null;
+      }
     }
   }
 
@@ -739,11 +810,7 @@ class PipelineRealtimeController {
   }
 
   static seenLogKeys = new Set();
-  static appendLogUnique(msg, timeStr) {
-    const key = `${timeStr}_${msg}`;
-    if (this.seenLogKeys.has(key)) return;
-    this.seenLogKeys.add(key);
-
+  static appendLogLine(msg, timeStr) {
     const term = document.getElementById("pipeline-event-terminal");
     const line = document.createElement("div");
     line.className = "event-terminal-line";
@@ -754,6 +821,13 @@ class PipelineRealtimeController {
     `;
     term.appendChild(line);
     term.scrollTop = term.scrollHeight;
+  }
+
+  static appendLogUnique(msg, timeStr) {
+    const key = `${timeStr}_${msg}`;
+    if (this.seenLogKeys.has(key)) return;
+    this.seenLogKeys.add(key);
+    this.appendLogLine(msg, timeStr);
   }
 
   static renderDocCards(docs) {
@@ -793,9 +867,27 @@ class PipelineRealtimeController {
 
   static copyJson() {
     const text = document.getElementById("pipeline-result-json").textContent;
-    navigator.clipboard.writeText(text).then(() => {
-      alert("JSON copiato negli appunti!");
-    });
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).then(() => {
+        alert("JSON copiato negli appunti!");
+      }).catch(err => {
+        alert(`Copia negli appunti non riuscita: ${err.message}`);
+      });
+      return;
+    }
+    try {
+      const ta = document.createElement("textarea");
+      ta.value = text;
+      ta.style.position = "fixed";
+      ta.style.opacity = "0";
+      document.body.appendChild(ta);
+      ta.select();
+      const ok = document.execCommand("copy");
+      ta.remove();
+      alert(ok ? "JSON copiato negli appunti!" : "Copia negli appunti non supportata in questo contesto.");
+    } catch (err) {
+      alert(`Copia negli appunti non riuscita: ${err.message}`);
+    }
   }
 }
 
@@ -968,8 +1060,8 @@ class RedCapController {
           <td style="font-weight: 600;">${fullName}</td>
           <td>${dob}</td>
           <td>
-            <span class="badge ${completedCount >= 8 ? 'badge-success' : 'badge-warning'}">
-              ${escapeHtml(completedCount)}/8 form
+            <span class="badge ${completedCount >= OverviewController.totalForms ? 'badge-success' : 'badge-warning'}">
+              ${escapeHtml(completedCount)}/${escapeHtml(OverviewController.totalForms)} form
             </span>
           </td>
           <td>
@@ -1078,8 +1170,10 @@ document.addEventListener("DOMContentLoaded", () => {
     }
   });
   document.getElementById("btn-cup-next").addEventListener("click", () => {
-    CupController.currentPage++;
-    CupController.loadPatients();
+    if (CupController.currentPage < CupController.totalPages) {
+      CupController.currentPage++;
+      CupController.loadPatients();
+    }
   });
   document.getElementById("btn-cup-download-remote").addEventListener("click", async () => {
     const btn = document.getElementById("btn-cup-download-remote");

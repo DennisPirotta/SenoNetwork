@@ -28,6 +28,9 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 # Add project root to sys.path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from src.config import get_settings
+from src.utils import atomic_write_text, build_patient_slug, sanitize_csv_cell
+
 load_dotenv()
 
 # Rich formatting
@@ -196,16 +199,7 @@ class Paziente(BaseModel):
                 name = str(data.get("nome") or "").strip()
                 surname = str(data.get("cognome") or "").strip()
                 dob = data.get("data_nascita")
-                dob_str = ""
-                if dob:
-                    if hasattr(dob, "isoformat"):
-                        dob_str = dob.isoformat()
-                    else:
-                        dob_str = str(dob)[:10]
-
-                parts = [p for p in [name, surname, dob_str] if p]
-                raw_slug = "-".join(parts).lower().replace(" ", "-")
-                clean_slug = re.sub(r"[^a-z0-9\-]", "", raw_slug).strip("-")
+                clean_slug = build_patient_slug(name, surname, dob)
                 data["patient_id"] = clean_slug or "paziente-anonimo"
         return data
 
@@ -687,10 +681,19 @@ def main():
     args = parse_args()
 
     # Se richiesto download diretto da PriamoCUP
-    download_requested = args.download_cup or args.ytd or args.year or args.month or args.months
+    settings = get_settings()
+    cup_output_dir = str(settings.cup_dir)
+    download_requested = (
+        args.download_cup
+        or args.ytd
+        or args.year
+        or args.month
+        or args.months
+        or (args.start_date and args.end_date)
+    )
     if download_requested:
         from src.priamo_cup_client import PriamoCupClient
-        cup_client = PriamoCupClient()
+        cup_client = PriamoCupClient(settings=settings)
         agendas_list = [a.strip() for a in args.agendas.split(",") if a.strip()]
 
         if args.ytd:
@@ -698,7 +701,7 @@ def main():
             downloaded_file = cup_client.export_ytd(
                 codice_unita=args.unit,
                 agende=agendas_list,
-                output_dir="data/cup",
+                output_dir=cup_output_dir,
             )
         elif args.year:
             print(f"-> Download fogli lavoro PriamoCUP per l'anno {args.year} (Unità {args.unit}, Agende {agendas_list})...")
@@ -706,17 +709,22 @@ def main():
                 year=args.year,
                 codice_unita=args.unit,
                 agende=agendas_list,
-                output_dir="data/cup",
+                output_dir=cup_output_dir,
             )
         elif args.month:
             month_str = str(args.month).strip()
-            if "-" in month_str:
-                parts = month_str.split("-")
-                target_year = int(parts[0])
-                target_month = int(parts[1])
+            m_ym = re.fullmatch(r"(\d{4})-(\d{1,2})", month_str)
+            m_m = re.fullmatch(r"(\d{1,2})", month_str)
+            if m_ym:
+                target_year, target_month = int(m_ym.group(1)), int(m_ym.group(2))
+            elif m_m:
+                target_year, target_month = date.today().year, int(m_m.group(1))
             else:
-                target_year = date.today().year
-                target_month = int(month_str)
+                print(f"[ERRORE] Formato mese non valido: {month_str!r} (atteso 'MM' o 'YYYY-MM').", file=sys.stderr)
+                sys.exit(1)
+            if not (1 <= target_month <= 12):
+                print(f"[ERRORE] Numero mese fuori intervallo: {target_month} (atteso 1..12).", file=sys.stderr)
+                sys.exit(1)
 
             print(f"-> Download fogli lavoro PriamoCUP per il mese {target_month:02d}/{target_year} (Unità {args.unit}, Agende {agendas_list})...")
             downloaded_file = cup_client.export_month(
@@ -724,7 +732,7 @@ def main():
                 month=target_month,
                 codice_unita=args.unit,
                 agende=agendas_list,
-                output_dir="data/cup",
+                output_dir=cup_output_dir,
             )
         elif args.months:
             print(f"-> Download fogli lavoro PriamoCUP per gli ultimi {args.months} mesi (Unità {args.unit}, Agende {agendas_list})...")
@@ -732,7 +740,7 @@ def main():
                 num_months=args.months,
                 codice_unita=args.unit,
                 agende=agendas_list,
-                output_dir="data/cup",
+                output_dir=cup_output_dir,
             )
         elif args.start_date and args.end_date:
             print(f"-> Download fogli lavoro PriamoCUP (Unità {args.unit}, Agende {agendas_list}, Periodo {args.start_date} -> {args.end_date})...")
@@ -741,7 +749,7 @@ def main():
                 end_date=args.end_date,
                 codice_unita=args.unit,
                 agende=agendas_list,
-                output_dir="data/cup",
+                output_dir=cup_output_dir,
             )
         else:
             ref_d = args.start_date or date.today()
@@ -752,7 +760,7 @@ def main():
                     num_weeks=args.weeks,
                     codice_unita=args.unit,
                     agende=agendas_list,
-                    output_dir="data/cup",
+                    output_dir=cup_output_dir,
                 )
                 downloaded_file = files[0] if files else None
             else:
@@ -760,7 +768,7 @@ def main():
                     ref_date=ref_d,
                     codice_unita=args.unit,
                     agende=agendas_list,
-                    output_dir="data/cup",
+                    output_dir=cup_output_dir,
                 )
 
         if not downloaded_file:
@@ -807,17 +815,18 @@ def main():
         if is_json:
             import json
             data = [p.to_export_dict() for p in pazienti]
-            with open(out_path, "w", encoding="utf-8") as f:
-                json.dump(data, f, indent=2, ensure_ascii=False)
+            atomic_write_text(out_path, json.dumps(data, indent=2, ensure_ascii=False))
             print(f"\n[OK] Esportati {len(pazienti)} record in formato JSON: {out_path}")
         elif is_xlsx:
             df_out = pd.DataFrame([p.to_export_dict() for p in pazienti])
-            df_out.to_excel(out_path, index=False)
+            df_safe = df_out.map(lambda v: sanitize_csv_cell(v) if isinstance(v, str) else v)
+            df_safe.to_excel(out_path, index=False, engine="openpyxl")
             print(f"\n[OK] Esportati {len(pazienti)} record in formato Excel: {out_path}")
         else:
             # CSV con colonne PAZ_NOME, PAZ_COGNOME, PAZ_DATA_NASCITA e standard
             df_out = pd.DataFrame([p.to_export_dict() for p in pazienti])
-            df_out.to_csv(out_path, index=False, encoding="utf-8-sig")
+            df_safe = df_out.map(lambda v: sanitize_csv_cell(v) if isinstance(v, str) else v)
+            atomic_write_text(out_path, "\ufeff" + df_safe.to_csv(index=False))
             print(f"\n[OK] Esportati {len(pazienti)} record in formato CSV: {out_path}")
 
 

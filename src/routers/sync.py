@@ -1,6 +1,7 @@
 """REDCap Reconciliation & Sync API Router."""
 
 import json
+import logging
 import time
 from typing import Any, Dict, List, Optional
 import uuid
@@ -9,15 +10,16 @@ from pydantic import BaseModel, Field
 
 from src.config import Settings, get_settings
 from src.sync_service import RedCapSyncService
+from src.routers.cup import invalidate_redcap_lookup_cache
 from src.routers.pipeline import (
-    _get_llm_semaphore,
-    _get_patient_lock,
     append_task_event,
     register_task,
     update_task,
 )
-from src.routers.security import verify_api_key
+from src.routers.security import raise_internal_error, verify_api_key
+from src.utils import get_patient_lock
 
+logger = logging.getLogger(__name__)
 router = APIRouter(tags=["REDCap Sync"])
 
 
@@ -76,7 +78,7 @@ def _run_background_sync(
     )
     try:
         if req.patient_id:
-            with _get_patient_lock(req.patient_id), _get_llm_semaphore(getattr(sync_service, "settings", None)):
+            with get_patient_lock(req.patient_id):
                 res = sync_service.check_and_update_patient(
                     patient_id=req.patient_id,
                     name=req.name,
@@ -88,6 +90,8 @@ def _run_background_sync(
                     force_reprocess=req.force_reprocess,
                     overwrite_mode=req.overwrite_mode,
                 )
+            if res.status == "updated" and not req.dry_run:
+                invalidate_redcap_lookup_cache(getattr(sync_service, "settings", None))
             update_task(
                 task_id,
                 status="completed",
@@ -97,16 +101,18 @@ def _run_background_sync(
                 items_done=1,
             )
         else:
-            with _get_llm_semaphore(getattr(sync_service, "settings", None)):
-                report = sync_service.sync_all(
-                    target_forms=req.target_forms,
-                    auto_upload=req.auto_upload and not req.dry_run,
-                    dry_run=req.dry_run,
-                    force_reprocess=req.force_reprocess,
-                    limit=req.limit,
-                    only_incomplete=req.only_incomplete,
-                    overwrite_mode=req.overwrite_mode,
-                )
+            # Per-patient locks & LLM semaphore are acquired internally by sync_all / check_and_update_patient
+            report = sync_service.sync_all(
+                target_forms=req.target_forms,
+                auto_upload=req.auto_upload and not req.dry_run,
+                dry_run=req.dry_run,
+                force_reprocess=req.force_reprocess,
+                limit=req.limit,
+                only_incomplete=req.only_incomplete,
+                overwrite_mode=req.overwrite_mode,
+            )
+            if report.patients_updated > 0 and not req.dry_run:
+                invalidate_redcap_lookup_cache(getattr(sync_service, "settings", None))
             update_task(
                 task_id,
                 status="completed",
@@ -119,6 +125,7 @@ def _run_background_sync(
                 items_total=max(1, report.patients_inspected),
             )
     except Exception as e:
+        logger.exception("Errore task sync %s: %s", task_id, e)
         update_task(task_id, status="failed", error=str(e), current_step=f"Errore sync: {e}")
     finally:
         update_task(task_id, finished_at=time.time())
@@ -134,8 +141,8 @@ def sync_check_updates_sync(
     params = req or SyncTriggerRequest()
     try:
         if params.patient_id:
-            with _get_patient_lock(params.patient_id), _get_llm_semaphore(getattr(sync_service, "settings", None)):
-                return sync_service.check_and_update_patient(
+            with get_patient_lock(params.patient_id):
+                res = sync_service.check_and_update_patient(
                     patient_id=params.patient_id,
                     name=params.name,
                     surname=params.surname,
@@ -146,19 +153,26 @@ def sync_check_updates_sync(
                     force_reprocess=params.force_reprocess,
                     overwrite_mode=params.overwrite_mode,
                 )
+            if getattr(res, "status", None) == "updated" and not params.dry_run:
+                invalidate_redcap_lookup_cache(getattr(sync_service, "settings", None))
+            return res
         else:
-            with _get_llm_semaphore(getattr(sync_service, "settings", None)):
-                return sync_service.sync_all(
-                    target_forms=params.target_forms,
-                    auto_upload=params.auto_upload and not params.dry_run,
-                    dry_run=params.dry_run,
-                    force_reprocess=params.force_reprocess,
-                    limit=params.limit,
-                    only_incomplete=params.only_incomplete,
-                    overwrite_mode=params.overwrite_mode,
-                )
+            report = sync_service.sync_all(
+                target_forms=params.target_forms,
+                auto_upload=params.auto_upload and not params.dry_run,
+                dry_run=params.dry_run,
+                force_reprocess=params.force_reprocess,
+                limit=params.limit,
+                only_incomplete=params.only_incomplete,
+                overwrite_mode=params.overwrite_mode,
+            )
+            if getattr(report, "patients_updated", 0) > 0 and not params.dry_run:
+                invalidate_redcap_lookup_cache(getattr(sync_service, "settings", None))
+            return report
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Errore esecuzione sync: {e}")
+        raise_internal_error(logger, "Errore esecuzione sync", e)
 
 
 @router.post("/api/sync/check-updates-async", dependencies=[Depends(verify_api_key)], response_model=AsyncTaskResponse)
@@ -215,9 +229,11 @@ def get_incomplete_patients(
     """Restituisce l'elenco dei pazienti presenti in REDCap che hanno ancora form clinici incompleti."""
     filter_forms = [form] if form else None
     try:
-        return sync_service.get_patients_from_redcap(filter_incomplete_forms=filter_forms)
+        if filter_forms:
+            return sync_service.get_patients_from_redcap(filter_incomplete_forms=filter_forms)
+        return sync_service.get_patients_from_redcap(filter_incomplete_forms=None, only_incomplete=True)
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Errore recupero pazienti incompleti: {e}")
+        raise_internal_error(logger, "Errore recupero pazienti incompleti", e)
 
 
 @router.get("/api/sync/latest-report", dependencies=[Depends(verify_api_key)])
@@ -227,7 +243,7 @@ def get_latest_sync_report(settings: Settings = Depends(get_settings)) -> Dict[s
     if not audit_dir.exists():
         raise HTTPException(status_code=404, detail="Nessun report di sincronizzazione trovato.")
 
-    reports = sorted(list(audit_dir.glob("sync_report_*.json")), reverse=True)
+    reports = sorted(list(audit_dir.glob("sync_report_*.json")), key=lambda p: p.stat().st_mtime, reverse=True)
     if not reports:
         raise HTTPException(status_code=404, detail="Nessun report di sincronizzazione archiviato.")
 
@@ -235,4 +251,4 @@ def get_latest_sync_report(settings: Settings = Depends(get_settings)) -> Dict[s
         with open(reports[0], "r", encoding="utf-8") as f:
             return json.load(f)
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Errore lettura report: {e}")
+        raise_internal_error(logger, "Errore lettura report sync", e)

@@ -1,11 +1,13 @@
 """Data Quality Audit & Clinical Inconsistencies API Router."""
 
+import logging
 from typing import Any, Dict, List, Optional
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, Query
 from src.config import Settings, get_settings
 from src.audit_service import RedCapAuditReport, RedCapDataAuditor
-from src.routers.security import verify_api_key
+from src.routers.security import raise_internal_error, verify_api_key
 
+logger = logging.getLogger(__name__)
 router = APIRouter(tags=["Data Quality & Audit"])
 
 
@@ -23,7 +25,7 @@ def get_audit_report(
             auditor.export_reports(report)
         return report
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Errore generazione report audit: {e}")
+        raise_internal_error(logger, "Errore generazione report audit", e)
 
 
 @router.get("/api/audit/anomalies", dependencies=[Depends(verify_api_key)])
@@ -57,7 +59,7 @@ def get_audit_anomalies(
 
         return anomalies
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Errore recupero anomalie: {e}")
+        raise_internal_error(logger, "Errore recupero anomalie", e)
 
 
 @router.get("/api/audit/completion-matrix", dependencies=[Depends(verify_api_key)])
@@ -69,4 +71,4 @@ def get_completion_matrix(
     try:
         return auditor.build_completion_matrix()
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Errore generazione matrice completamento: {e}")
+        raise_internal_error(logger, "Errore generazione matrice completamento", e)

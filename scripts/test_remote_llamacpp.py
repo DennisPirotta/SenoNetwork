@@ -41,7 +41,6 @@ from typing import Any, Dict, Optional, Tuple
 try:
     import requests
     import urllib3
-    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 except ImportError:
     print("[ERRORE] Pacchetto 'requests' non trovato. Installa con: pip install requests")
     sys.exit(1)
@@ -101,11 +100,13 @@ class LlamaRemoteTester:
         api_key: Optional[str] = None,
         cf_client_id: Optional[str] = None,
         cf_client_secret: Optional[str] = None,
-        verbose: bool = False
+        verbose: bool = False,
+        verify_ssl: bool = True,
     ):
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
         self.verbose = verbose
+        self.verify_ssl = verify_ssl
 
         self.headers: Dict[str, str] = {
             "Content-Type": "application/json",
@@ -156,7 +157,7 @@ class LlamaRemoteTester:
 
         t_start = time.time()
         try:
-            resp = requests.get(url, headers=self.headers, timeout=self.timeout, verify=False)
+            resp = requests.get(url, headers=self.headers, timeout=self.timeout, verify=self.verify_ssl)
             latency = (time.time() - t_start) * 1000
             self.results["latency_ms"] = round(latency, 1)
 
@@ -181,7 +182,7 @@ class LlamaRemoteTester:
         # Fallback test: prova GET /props
         try:
             t_start = time.time()
-            resp = requests.get(f"{self.base_url}/props", headers=self.headers, timeout=self.timeout, verify=False)
+            resp = requests.get(f"{self.base_url}/props", headers=self.headers, timeout=self.timeout, verify=self.verify_ssl)
             latency = (time.time() - t_start) * 1000
             self.results["latency_ms"] = round(latency, 1)
 
@@ -206,7 +207,7 @@ class LlamaRemoteTester:
 
         # 1. Prova /props (proprietà native llama-server)
         try:
-            r = requests.get(f"{self.base_url}/props", headers=self.headers, timeout=self.timeout, verify=False)
+            r = requests.get(f"{self.base_url}/props", headers=self.headers, timeout=self.timeout, verify=self.verify_ssl)
             if r.status_code == 200:
                 data = r.json()
                 self._log_debug("GET /props response", data)
@@ -219,7 +220,7 @@ class LlamaRemoteTester:
 
         # 2. Prova /v1/models (compatibile OpenAI)
         try:
-            r = requests.get(f"{self.base_url}/v1/models", headers=self.headers, timeout=self.timeout, verify=False)
+            r = requests.get(f"{self.base_url}/v1/models", headers=self.headers, timeout=self.timeout, verify=self.verify_ssl)
             if r.status_code == 200:
                 data = r.json()
                 self._log_debug("GET /v1/models response", data)
@@ -268,7 +269,7 @@ class LlamaRemoteTester:
                 headers=self.headers,
                 json=payload_chat,
                 timeout=self.timeout,
-                verify=False
+                verify=self.verify_ssl
             )
             elapsed = time.time() - t_start
             self._log_debug(f"Chat completion status: {r.status_code}", r.text)
@@ -317,7 +318,7 @@ class LlamaRemoteTester:
                 headers=self.headers,
                 json=payload_compl,
                 timeout=self.timeout,
-                verify=False
+                verify=self.verify_ssl
             )
             elapsed = time.time() - t_start
             if r.status_code == 200:
@@ -393,7 +394,7 @@ class LlamaRemoteTester:
                 headers=self.headers,
                 json=payload_chat,
                 timeout=self.timeout,
-                verify=False
+                verify=self.verify_ssl
             )
             if r.status_code == 200:
                 raw_text = r.json()["choices"][0]["message"]["content"]
@@ -423,7 +424,7 @@ class LlamaRemoteTester:
                 headers=self.headers,
                 json=payload_compl,
                 timeout=self.timeout,
-                verify=False
+                verify=self.verify_ssl
             )
             if r.status_code == 200:
                 raw_text = r.json().get("content", "")
@@ -506,7 +507,7 @@ class LlamaRemoteTester:
                     "n_predict": 512,
                     "stream": False
                 }
-                r = requests.post(endpoint, headers=self.headers, json=payload, timeout=self.timeout, verify=False)
+                r = requests.post(endpoint, headers=self.headers, json=payload, timeout=self.timeout, verify=self.verify_ssl)
                 r.raise_for_status()
                 raw_out = r.json().get("content", "")
             else:
@@ -523,7 +524,7 @@ class LlamaRemoteTester:
                     },
                     "stream": False
                 }
-                r = requests.post(endpoint, headers=self.headers, json=payload, timeout=self.timeout, verify=False)
+                r = requests.post(endpoint, headers=self.headers, json=payload, timeout=self.timeout, verify=self.verify_ssl)
                 r.raise_for_status()
                 raw_out = r.json()["choices"][0]["message"]["content"]
 
@@ -632,7 +633,15 @@ def main():
         action="store_true",
         help="Mostra payload JSON e dettagli di debug completi."
     )
+    parser.add_argument(
+        "--insecure",
+        action="store_true",
+        help="Disabilita la verifica dei certificati TLS/SSL (solo per test interni con certificati self-signed)."
+    )
     args = parser.parse_args()
+
+    if args.insecure:
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
     # Risoluzione URL
     target_url = args.url or os.getenv("LLAMA_CPP_BASE_URL", "http://localhost:8080")
@@ -644,7 +653,8 @@ def main():
         api_key=args.api_key,
         cf_client_id=args.cf_client_id,
         cf_client_secret=args.cf_client_secret,
-        verbose=args.verbose
+        verbose=args.verbose,
+        verify_ssl=not args.insecure,
     )
 
     # 1. Connettività

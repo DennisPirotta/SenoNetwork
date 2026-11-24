@@ -1,14 +1,17 @@
 """REDCap Records Management API Router."""
 
+import logging
 from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 
 from src.config import Settings, get_settings
 import src.redcap_service as redcap_service
 from src.redcap_service import REDCapService
-from src.routers.security import verify_api_key
+from src.routers.cup import invalidate_redcap_lookup_cache
+from src.routers.security import raise_internal_error, verify_api_key
 from src.utils import sanitize_identifier
 
+logger = logging.getLogger(__name__)
 router = APIRouter(tags=["REDCap Records"])
 
 
@@ -23,8 +26,8 @@ def get_redcap_service(settings: Settings = Depends(get_settings)) -> REDCapServ
 
 @router.get("/api/redcap/records", dependencies=[Depends(verify_api_key)])
 def get_all_records(
-    limit: Optional[int] = Query(None, ge=1, description="Numero massimo di record da restituire"),
-    filter_logic: Optional[str] = Query(None, description="Espressione logica REDCap (es. [age] > 50)"),
+    limit: Optional[int] = Query(None, ge=1, le=5000, description="Numero massimo di record da restituire"),
+    filter_logic: Optional[str] = Query(None, max_length=1000, description="Espressione logica REDCap (es. [age] > 50)"),
     form: Optional[str] = Query(None, description="Filtra campi appartenenti a un singolo form"),
     redcap_svc: REDCapService = Depends(get_redcap_service)
 ) -> List[Dict[str, Any]]:
@@ -41,7 +44,7 @@ def get_all_records(
             records = records[:limit]
         return records
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Errore recupero record REDCap: {e}")
+        raise_internal_error(logger, "Errore recupero record REDCap", e)
 
 
 @router.get("/api/redcap/records/summary", dependencies=[Depends(verify_api_key)])
@@ -52,7 +55,7 @@ def get_records_summary(
     try:
         return redcap_svc.get_records_summary()
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Errore generazione riassunto REDCap: {e}")
+        raise_internal_error(logger, "Errore generazione riassunto REDCap", e)
 
 
 @router.get("/api/redcap/records/{record_id}", dependencies=[Depends(verify_api_key)])
@@ -72,7 +75,7 @@ def get_single_record(
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Errore recupero record '{clean_id}': {e}")
+        raise_internal_error(logger, f"Errore recupero record '{clean_id}'", e)
 
 
 @router.delete("/api/redcap/records/{record_id}", dependencies=[Depends(verify_api_key)])
@@ -96,6 +99,7 @@ def delete_single_record(
         if count == 0:
             raise HTTPException(status_code=404, detail=f"Record '{clean_id}' non trovato o non eliminato da REDCap.")
 
+        invalidate_redcap_lookup_cache(settings)
         return {
             "status": "deleted",
             "record_id": clean_id,
@@ -107,7 +111,7 @@ def delete_single_record(
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Errore eliminazione record '{clean_id}': {e}")
+        raise_internal_error(logger, f"Errore eliminazione record '{clean_id}'", e)
 
 
 @router.delete("/api/redcap/records", dependencies=[Depends(verify_api_key)])
@@ -138,6 +142,7 @@ def delete_all_records(
             api_url=settings.redcap_api_url,
             api_token=delete_token
         )
+        invalidate_redcap_lookup_cache(settings)
         return {
             "status": "deleted",
             "deleted_count": count,
@@ -148,4 +153,4 @@ def delete_all_records(
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Errore eliminazione massiva record REDCap: {e}")
+        raise_internal_error(logger, "Errore eliminazione massiva record REDCap", e)

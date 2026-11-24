@@ -1,9 +1,14 @@
+import copy
 import json
 import logging
 from pathlib import Path
+import threading
 from typing import Any, Dict, List, Optional, Union
 
+from src.utils import atomic_write_text
+
 logger = logging.getLogger(__name__)
+_GUIDELINES_LOCK = threading.Lock()
 
 # Default comprehensive clinical guidelines across all REDCap forms
 DEFAULT_CLINICAL_GUIDELINES: Dict[str, Any] = {
@@ -164,12 +169,13 @@ class ClinicalGuidelinesManager:
 
     @classmethod
     def get_instance(cls, config_path: Optional[Union[str, Path]] = None) -> "ClinicalGuidelinesManager":
-        """Singleton accessor."""
-        if cls._instance is None:
-            cls._instance = cls(config_path=config_path)
-        elif config_path and Path(config_path) != cls._instance.config_path:
-            cls._instance = cls(config_path=config_path)
-        return cls._instance
+        """Thread-safe singleton accessor."""
+        with _GUIDELINES_LOCK:
+            if cls._instance is None:
+                cls._instance = cls(config_path=config_path)
+            elif config_path and Path(config_path) != cls._instance.config_path:
+                cls._instance = cls(config_path=config_path)
+            return cls._instance
 
     def load(self) -> None:
         """Loads guidelines from JSON config file or initializes defaults if not present."""
@@ -182,31 +188,29 @@ class ClinicalGuidelinesManager:
                 logger.info(f"Linee guida cliniche caricate con successo da {self.config_path}")
             except Exception as e:
                 logger.warning(f"Errore nella lettura di {self.config_path} ({e}). Utilizzo linee guida predefinite.")
-                self.data = json.loads(json.dumps(DEFAULT_CLINICAL_GUIDELINES))
+                self.data = copy.deepcopy(DEFAULT_CLINICAL_GUIDELINES)
         else:
             # File doesn't exist yet: initialize with defaults and save to provide a template
-            self.data = json.loads(json.dumps(DEFAULT_CLINICAL_GUIDELINES))
+            self.data = copy.deepcopy(DEFAULT_CLINICAL_GUIDELINES)
             self.save()
             logger.info(f"File linee guida cliniche inizializzato con i default in {self.config_path}")
 
     def save(self) -> None:
-        """Saves current guidelines back to JSON config file."""
+        """Atomically saves current guidelines back to JSON config file."""
         try:
-            self.config_path.parent.mkdir(parents=True, exist_ok=True)
-            with open(self.config_path, "w", encoding="utf-8") as f:
-                json.dump(self.data, f, indent=2, ensure_ascii=False)
+            atomic_write_text(self.config_path, json.dumps(self.data, indent=2, ensure_ascii=False))
             logger.debug(f"Linee guida cliniche salvate in {self.config_path}")
         except Exception as e:
             logger.error(f"Errore nel salvataggio delle linee guida cliniche su {self.config_path}: {e}")
 
     def _deep_merge(self, base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
         """Recursively merges override dictionary into base dictionary."""
-        result = json.loads(json.dumps(base))
+        result = copy.deepcopy(base)
         for key, val in override.items():
             if key in result and isinstance(result[key], dict) and isinstance(val, dict):
                 result[key] = self._deep_merge(result[key], val)
             else:
-                result[key] = val
+                result[key] = copy.deepcopy(val)
         return result
 
     def get_forms(self) -> Dict[str, Any]:
@@ -260,17 +264,22 @@ class ClinicalGuidelinesManager:
         save: bool = True
     ) -> None:
         """Adds or updates a field-level guideline."""
-        forms = self.data.setdefault("forms", {})
-        form_dict = forms.setdefault(form_name, {
-            "title": form_name,
-            "description": "",
-            "general_guidelines": [],
-            "field_guidelines": {}
-        })
-        field_dict = form_dict.setdefault("field_guidelines", {})
-        field_dict[field_name] = guideline
-        if save:
-            self.save()
+        clean_form = (form_name or "").strip()
+        clean_field = (field_name or "").strip()
+        if not clean_form or not clean_field:
+            raise ValueError("form_name e field_name non possono essere vuoti.")
+        with _GUIDELINES_LOCK:
+            forms = self.data.setdefault("forms", {})
+            form_dict = forms.setdefault(clean_form, {
+                "title": clean_form,
+                "description": "",
+                "general_guidelines": [],
+                "field_guidelines": {}
+            })
+            field_dict = form_dict.setdefault("field_guidelines", {})
+            field_dict[clean_field] = guideline
+            if save:
+                self.save()
 
     def add_form_general_guideline(
         self,

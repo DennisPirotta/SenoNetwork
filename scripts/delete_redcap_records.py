@@ -25,7 +25,8 @@ from dotenv import load_dotenv
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src.config import get_settings
-from src.redcap_service import REDCapService, delete_redcap_records
+from src.redcap_service import REDCapService
+from src.utils import sanitize_identifier
 
 load_dotenv()
 
@@ -124,7 +125,8 @@ def main():
             success = service.delete_record(record_id=target_id, arm=args.arm)
             if success:
                 if args.clean_state:
-                    state_file = settings.state_dir / f"{target_id}_state.json"
+                    safe_id = sanitize_identifier(target_id)
+                    state_file = settings.state_dir / f"{safe_id}_state.json"
                     if state_file.exists():
                         state_file.unlink(missing_ok=True)
                         print(f"  • Rimosso file di stato locale: {state_file}")

@@ -4,11 +4,12 @@ import re
 from datetime import date
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
+from urllib.parse import quote
 import requests
 
 from src.config import Settings, get_settings
 from src.priamo_client import PriamoClient, PriamoPatient
-from src.utils import sanitize_identifier
+from src.utils import atomic_write_bytes, build_patient_slug, sanitize_identifier
 
 logger = logging.getLogger(__name__)
 
@@ -130,9 +131,13 @@ class DotNetApiClient:
             dob_str = f"{parts[-3]}-{parts[-2]}-{parts[-1]}"
             try:
                 dob = date.fromisoformat(dob_str)
-                name = parts[0].title()
-                surname = " ".join(parts[1:-3]).title()
-                return self.priamo.search_patient(name, surname, dob)
+                name_tokens = parts[:-3]
+                for split_idx in range(1, len(name_tokens)):
+                    cand_name = " ".join(name_tokens[:split_idx]).title()
+                    cand_surname = " ".join(name_tokens[split_idx:]).title()
+                    found = self.priamo.search_patient(cand_name, cand_surname, dob)
+                    if found:
+                        return found
             except Exception:
                 pass
 
@@ -164,12 +169,17 @@ class DotNetApiClient:
         """Queries a generic REST .NET API using multithreaded download workers."""
         from concurrent.futures import ThreadPoolExecutor, as_completed
 
-        url = f"{self.base_url}/patients/{patient_id}/documents"
+        safe_pid = sanitize_identifier(patient_id)
+        encoded_pid = quote(safe_pid, safe="")
+        verify_ssl = getattr(self.settings, "priamo_verify_ssl", True)
+        destination_dir.mkdir(parents=True, exist_ok=True)
+
+        url = f"{self.base_url}/patients/{encoded_pid}/documents"
         headers = {"Accept": "application/json"}
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
 
-        resp = requests.get(url, headers=headers, timeout=self.timeout_seconds)
+        resp = requests.get(url, headers=headers, timeout=self.timeout_seconds, verify=verify_ssl)
         resp.raise_for_status()
         docs = resp.json()
 
@@ -181,13 +191,18 @@ class DotNetApiClient:
             raw_fname = doc.get("filename") or f"{doc_id}.pdf"
             fname = Path(str(raw_fname)).name or f"{doc_id}.pdf"
             dest = destination_dir / fname
-            dl_url = f"{self.base_url}/patients/{patient_id}/documents/{doc_id}/download"
+            dl_url = f"{self.base_url}/patients/{encoded_pid}/documents/{quote(doc_id, safe='')}/download"
             try:
-                with requests.get(dl_url, headers=headers, stream=True, timeout=self.timeout_seconds) as r:
+                with requests.get(
+                    dl_url,
+                    headers=headers,
+                    stream=True,
+                    timeout=self.timeout_seconds,
+                    verify=verify_ssl,
+                ) as r:
                     r.raise_for_status()
-                    with open(dest, "wb") as f:
-                        for chunk in r.iter_content(chunk_size=8192):
-                            f.write(chunk)
+                    content = b"".join(chunk for chunk in r.iter_content(chunk_size=8192) if chunk)
+                atomic_write_bytes(dest, content)
                 return dest
             except Exception as e:
                 logger.error(f"Errore download doc {doc_id} da generic API: {e}")
@@ -217,11 +232,7 @@ class DotNetApiClient:
         """
         candidate_ids = [sanitize_identifier(patient_id)]
         if name and surname:
-            dob_str = ""
-            if date_of_birth:
-                dob_str = date_of_birth.isoformat() if isinstance(date_of_birth, date) else str(date_of_birth)
-            raw_slug = f"{name}-{surname}-{dob_str}".lower().replace(" ", "-").strip("-")
-            clean_slug = re.sub(r"[^a-z0-9\-]", "", raw_slug)
+            clean_slug = build_patient_slug(name, surname, date_of_birth)
             if clean_slug and clean_slug not in candidate_ids:
                 candidate_ids.append(clean_slug)
 
@@ -244,10 +255,16 @@ class DotNetApiClient:
                     if pdfs:
                         return pdfs
 
-        # Also check if files in data/input_pdf contain candidate_id with token boundary matching
+        # Also check configured input_pdf_dir and legacy data/input_pdf with token boundary matching
         # (prevents loose substring matching where digit '1' matched 'referto_01' or 'SENO1142')
-        input_pdf_dir = Path("data/input_pdf")
-        if input_pdf_dir.exists():
+        input_dirs: List[Path] = [Path("data/input_pdf")]
+        cfg_input_dir = getattr(self.settings, "pdf_input_dir", None)
+        if cfg_input_dir and str(cfg_input_dir) != "data/input_pdf":
+            input_dirs.append(Path(cfg_input_dir))
+
+        for input_pdf_dir in input_dirs:
+            if not input_pdf_dir.exists():
+                continue
             for cid in candidate_ids:
                 cid_pattern = re.compile(rf"(?:^|[_\-\s]){re.escape(cid.lower())}(?:[_\-\s]|$)", re.IGNORECASE)
                 matched = [
@@ -341,8 +358,7 @@ class DotNetApiClient:
                 seen.add(key)
 
                 # Patient identifier for REDCap
-                patient_slug = f"{name}-{surname}-{dob.isoformat()}".lower().replace(" ", "-")
-                patient_slug = re.sub(r"[^a-z0-9\-]", "", patient_slug)
+                patient_slug = build_patient_slug(name, surname, dob)
 
                 record = {
                     "patient_id": patient_slug,

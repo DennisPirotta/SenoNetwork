@@ -87,6 +87,12 @@ def parse_args():
         action="store_true",
         help="Verifica tutti i pazienti presenti in REDCap, non solo quelli con form incompleti."
     )
+    parser.add_argument(
+        "--overwrite-mode",
+        choices=["fill_missing", "overwrite"],
+        default="fill_missing",
+        help="Strategia di aggiornamento REDCap: 'fill_missing' (default) o 'overwrite'."
+    )
     return parser.parse_args()
 
 
@@ -118,7 +124,8 @@ def main():
             target_forms=target_forms,
             auto_upload=not args.dry_run,
             dry_run=args.dry_run,
-            force_reprocess=args.force_reprocess
+            force_reprocess=args.force_reprocess,
+            overwrite_mode=args.overwrite_mode,
         )
         logger.info(f"Esito: {res.status.upper()} | Modifiche: {res.field_updates_count} campi in {res.duration_sec}s")
         for u in res.field_updates:
@@ -137,7 +144,8 @@ def main():
                     dry_run=args.dry_run,
                     force_reprocess=args.force_reprocess,
                     limit=args.limit,
-                    only_incomplete=not args.all_patients
+                    only_incomplete=not args.all_patients,
+                    overwrite_mode=args.overwrite_mode,
                 )
             except Exception as e:
                 logger.error(f"Errore nel ciclo di sync: {e}")
@@ -147,18 +155,23 @@ def main():
                 break
     else:
         logger.info("Esecuzione scansione one-shot...")
-        report = sync_service.sync_all(
-            target_forms=target_forms,
-            auto_upload=not args.dry_run,
-            dry_run=args.dry_run,
-            force_reprocess=args.force_reprocess,
-            limit=args.limit,
-            only_incomplete=not args.all_patients
-        )
-        logger.info(
-            f"Riepilogo: {report.patients_updated}/{report.patients_inspected} pazienti aggiornati "
-            f"({report.total_fields_updated} campi arricchiti) in {report.duration_sec}s"
-        )
+        try:
+            report = sync_service.sync_all(
+                target_forms=target_forms,
+                auto_upload=not args.dry_run,
+                dry_run=args.dry_run,
+                force_reprocess=args.force_reprocess,
+                limit=args.limit,
+                only_incomplete=not args.all_patients,
+                overwrite_mode=args.overwrite_mode,
+            )
+            logger.info(
+                f"Riepilogo: {report.patients_updated}/{report.patients_inspected} pazienti aggiornati "
+                f"({report.total_fields_updated} campi arricchiti) in {report.duration_sec}s"
+            )
+        except Exception as e:
+            logger.error(f"Errore durante la scansione one-shot: {e}")
+            sys.exit(1)
 
 
 if __name__ == "__main__":

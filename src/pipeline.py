@@ -14,6 +14,7 @@ from src.config import Settings
 from src.models import ExtractionResult, REDCapField
 from src.pdf_extractor import PDFExtractor
 from src.redcap_service import REDCapService
+from src.utils import atomic_write_text, sanitize_csv_cell
 
 logger = logging.getLogger(__name__)
 
@@ -116,28 +117,21 @@ class ExtractionPipeline:
 
     @staticmethod
     def export_to_json(results: List[ExtractionResult], output_file: Union[str, Path]) -> Path:
-        """Saves extraction results and REDCap records to a JSON file."""
+        """Atomically saves extraction results and REDCap records to a JSON file."""
         out_path = Path(output_file)
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-
         data = [res.model_dump() for res in results]
-        with open(out_path, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-
+        atomic_write_text(out_path, json.dumps(data, ensure_ascii=False, indent=2))
         return out_path
 
     @staticmethod
     def export_to_redcap_csv(results: List[ExtractionResult], output_file: Union[str, Path]) -> Path:
-        """Exports normalized records to a CSV file matching REDCap Data Import Tool specifications."""
+        """Atomically exports normalized records to a CSV file matching REDCap Data Import Tool specifications."""
         out_path = Path(output_file)
-        out_path.parent.mkdir(parents=True, exist_ok=True)
 
         # Gather successful records
         records = [r.redcap_record for r in results if r.status == "success" and r.redcap_record]
         if not records:
-            # Write empty file with header if no records
-            with open(out_path, "w", encoding="utf-8-sig") as f:
-                f.write("record_id\n")
+            atomic_write_text(out_path, "record_id\n", encoding="utf-8-sig")
             return out_path
 
         # Determine all distinct column headers preserving order
@@ -147,10 +141,13 @@ class ExtractionPipeline:
                 if k not in all_columns:
                     all_columns.append(k)
 
-        with open(out_path, "w", encoding="utf-8-sig", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=all_columns)
-            writer.writeheader()
-            for rec in records:
-                writer.writerow(rec)
+        import io
+        buf = io.StringIO()
+        writer = csv.DictWriter(buf, fieldnames=all_columns)
+        writer.writeheader()
+        for rec in records:
+            safe_rec = {k: sanitize_csv_cell(v) for k, v in rec.items()}
+            writer.writerow(safe_rec)
+        atomic_write_text(out_path, buf.getvalue(), encoding="utf-8-sig")
 
         return out_path

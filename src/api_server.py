@@ -11,19 +11,18 @@ Exposes REST endpoints and SSE streams for:
 """
 
 import argparse
-from concurrent.futures import ThreadPoolExecutor
 from functools import lru_cache
 import logging
 from pathlib import Path
 import sys
 from typing import List, Optional
 import uvicorn
-from fastapi import Depends, FastAPI
+from fastapi import Depends, FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
-from src.ai_extractor import LlamaCppExtractor, OllamaExtractor
+from src.ai_extractor import probe_ai_health
 from src.audit_service import RedCapAuditReport, RedCapDataAuditor  # noqa: F401
 from src.config import Settings, get_settings
 from src.dotnet_client import DotNetApiClient
@@ -89,6 +88,8 @@ openapi_tags = [
     {"name": "System", "description": "Verifica dello stato di salute dei sottosistemi e connettività."},
 ]
 
+has_api_key_configured = bool(settings.api_key and settings.api_key.strip())
+
 app = FastAPI(
     title="SenoNetwork Medical Report Extractor & Quality API",
     description=(
@@ -97,6 +98,9 @@ app = FastAPI(
     ),
     version="2.0.0",
     openapi_tags=openapi_tags,
+    docs_url=None if has_api_key_configured else "/docs",
+    redoc_url=None if has_api_key_configured else "/redoc",
+    openapi_url=None if has_api_key_configured else "/openapi.json",
 )
 
 # CORS Middleware per consentire chiamate dalla dashboard web
@@ -115,9 +119,26 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=configured_origins,
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allow_headers=["X-API-Key", "Content-Type", "Accept", "Authorization"],
 )
+
+
+@app.middleware("http")
+async def add_security_headers(request: Request, call_next):
+    """Injects defense-in-depth HTTP security response headers."""
+    response = await call_next(request)
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("X-Frame-Options", "DENY")
+    response.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
+    response.headers.setdefault("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
+    if not request.url.path.startswith(("/docs", "/redoc")):
+        response.headers.setdefault(
+            "Content-Security-Policy",
+            "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; "
+            "img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'",
+        )
+    return response
 
 
 @lru_cache
@@ -128,26 +149,15 @@ def get_shared_settings() -> Settings:
 @app.get("/health", tags=["System"])
 def health_check(settings: Settings = Depends(get_settings)):
     """Verifica lo stato dei server IA (llama.cpp RPC e Ollama), REDCap e Priamo .NET."""
-    ollama = OllamaExtractor(base_url=settings.ollama_base_url)
-    llamacpp = LlamaCppExtractor(
-        base_url=settings.llama_cpp_base_url,
-        cf_client_id=settings.ai_cloudflared_client_id,
-        cf_client_secret=settings.ai_cloudflared_client_secret
-    )
+    ai_status = probe_ai_health(settings)
     dotnet = DotNetApiClient(settings=settings)
-
-    with ThreadPoolExecutor(max_workers=2) as pool:
-        fut_llama = pool.submit(llamacpp.is_available)
-        fut_ollama = pool.submit(ollama.is_available)
-        llama_ok = fut_llama.result()
-        ollama_ok = fut_ollama.result()
 
     return {
         "status": "online",
         "version": "2.0.0",
         "ai_backend_configured": settings.ai_backend,
-        "llama_cpp_rpc_available": llama_ok,
-        "ollama_available": ollama_ok,
+        "llama_cpp_rpc_available": ai_status["llama_cpp_rpc_available"],
+        "ollama_available": ai_status["ollama_available"],
         "ollama_model": settings.ollama_model,
         "redcap_configured": bool(settings.redcap_api_url and settings.redcap_api_token),
         "priamo_dotnet_configured": dotnet.is_priamo_configured,

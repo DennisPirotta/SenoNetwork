@@ -2,6 +2,20 @@ from typing import Any, Dict, List, Optional
 from src.models import REDCapField
 
 
+def _format_choice_items(choices: Dict[str, str], quote: str = "'") -> str:
+    """Formats REDCap choice mappings without truncating meaningful prefix labels."""
+    items = []
+    for code, raw_label in choices.items():
+        lbl = raw_label.strip()
+        prefix = f"{code} - "
+        if lbl.startswith(prefix):
+            lbl = lbl[len(prefix):].strip()
+        if len(lbl) > 42:
+            lbl = lbl[:40] + ".."
+        items.append(f"{quote}{code}{quote}={lbl}")
+    return ", ".join(items)
+
+
 class SchemaBuilder:
     """Builds JSON Schema and prompt documentation from REDCap fields with integrated clinical guidelines."""
 
@@ -215,25 +229,9 @@ class SchemaBuilder:
             if guidelines_mgr:
                 field_guide = guidelines_mgr.get_field_guideline(f.field_name, form_name or f.form_name)
 
-            if f.field_type in {"dropdown", "radio", "yesno", "truefalse"}:
-                choices = f.parse_choices()
-                ch_items = []
-                for k, v in choices.items():
-                    clean_v = v.split(" - ")[-1].strip() if " - " in v else v.strip()
-                    if len(clean_v) > 36:
-                        clean_v = clean_v[:34] + ".."
-                    ch_items.append(f'"{k}"={clean_v}')
-                line = f"- `{f.field_name}` ({f.field_type}): {label} [{', '.join(ch_items)}]"
-
-            elif f.field_type == "checkbox":
-                choices = f.parse_choices()
-                ch_items = []
-                for k, v in choices.items():
-                    clean_v = v.split(" - ")[-1].strip() if " - " in v else v.strip()
-                    if len(clean_v) > 36:
-                        clean_v = clean_v[:34] + ".."
-                    ch_items.append(f'"{k}"={clean_v}')
-                line = f"- `{f.field_name}` ({f.field_type}): {label} [{', '.join(ch_items)}]"
+            if f.field_type in {"dropdown", "radio", "yesno", "truefalse", "checkbox"}:
+                choices_str = _format_choice_items(f.parse_choices(), quote='"')
+                line = f"- `{f.field_name}` ({f.field_type}): {label} [{choices_str}]"
 
             elif f.field_type == "text" and f.text_validation_type_or_show_slider_number:
                 vt = f.text_validation_type_or_show_slider_number

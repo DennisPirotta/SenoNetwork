@@ -16,7 +16,7 @@ from src.models import REDCapField
 from src.pdf_extractor import PDFExtractor
 from src.patient_pipeline import PatientPipeline, compute_file_hash
 from src.redcap_service import REDCapService
-from src.utils import atomic_write_text, mask_phi, sanitize_identifier
+from src.utils import atomic_write_text, get_patient_lock, llm_slot, mask_phi, sanitize_identifier
 
 logger = logging.getLogger(__name__)
 
@@ -116,13 +116,16 @@ class RedCapSyncService:
 
     def get_patients_from_redcap(
         self,
-        filter_incomplete_forms: Optional[List[str]] = None
+        filter_incomplete_forms: Optional[List[str]] = None,
+        only_incomplete: bool = False,
     ) -> List[Dict[str, Any]]:
         """Exports patient records from REDCap and optionally filters those with incomplete forms.
 
         Args:
             filter_incomplete_forms: Optional list of form names to check (e.g. ['anatomia_patologica']).
-                                     If provided, returns only records where at least one form is not complete ("2").
+                                     If provided, returns only records where at least one target form is not complete ("2").
+            only_incomplete: When True and `filter_incomplete_forms` is None, still filters to patients
+                             having at least one incomplete form across all `AVAILABLE_FORMS`.
         """
         # We query identifying fields and all form complete status flags
         forms_list = list(AVAILABLE_FORMS.keys())
@@ -134,12 +137,12 @@ class RedCapSyncService:
         if not records:
             return []
 
-        if not filter_incomplete_forms:
+        if not filter_incomplete_forms and not only_incomplete:
             for r in records:
                 r["incomplete_forms"] = self.detect_incomplete_forms(r)
             return records
 
-        target_forms = [f.lower().strip() for f in filter_incomplete_forms]
+        target_forms = [f.lower().strip() for f in (filter_incomplete_forms or forms_list)]
         incomplete_records = []
         for r in records:
             r["incomplete_forms"] = self.detect_incomplete_forms(r)
@@ -201,7 +204,8 @@ class RedCapSyncService:
         auto_upload: bool = True,
         dry_run: bool = False,
         force_reprocess: bool = False,
-        overwrite_mode: Optional[str] = None
+        overwrite_mode: Optional[str] = None,
+        existing_record_cache: Optional[Dict[str, Any]] = None,
     ) -> PatientSyncResult:
         """Audits a single patient in REDCap, inspects reports, and updates missing or updated data.
 
@@ -215,6 +219,7 @@ class RedCapSyncService:
             dry_run: If True, only computes and reports changes without writing to REDCap.
             force_reprocess: If True, re-processes existing PDF reports even if their hash was already logged.
             overwrite_mode: 'fill_missing' (default: only update empty/0 fields) or 'overwrite' (replace existing).
+            existing_record_cache: Optional prefetched REDCap record dictionary to avoid extra N+1 GET calls.
         """
         start_time = time.time()
         mode = (overwrite_mode or self.settings.sync_overwrite_mode).strip().lower()
@@ -223,18 +228,19 @@ class RedCapSyncService:
             f"mode={mode}, dry_run={dry_run}) ---"
         )
 
-        # Step 1: Query existing REDCap record
-        existing_record: Optional[Dict[str, Any]] = None
-        try:
-            existing_record = self.redcap_service.get_record(patient_id)
-        except Exception as e:
-            logger.error(f"Errore recupero record REDCap per {patient_id}: {e}")
-            return PatientSyncResult(
-                patient_id=patient_id,
-                status="error",
-                error=f"Errore connessione REDCap: {e}",
-                duration_sec=round(time.time() - start_time, 2)
-            )
+        # Step 1: Query existing REDCap record (use prefetched record when provided)
+        existing_record: Optional[Dict[str, Any]] = existing_record_cache
+        if existing_record is None:
+            try:
+                existing_record = self.redcap_service.get_record(patient_id)
+            except Exception as e:
+                logger.error(f"Errore recupero record REDCap per {patient_id}: {e}")
+                return PatientSyncResult(
+                    patient_id=patient_id,
+                    status="error",
+                    error=f"Errore connessione REDCap: {e}",
+                    duration_sec=round(time.time() - start_time, 2)
+                )
 
         # Se non trovato direttamente con l'ID fornito, prova a cercare il record_id nativo di REDCap
         # per dati anagrafici, garantendo di mantenere sempre il patient_id / record_id di REDCap.
@@ -316,21 +322,39 @@ class RedCapSyncService:
                 duration_sec=round(time.time() - start_time, 2)
             )
 
-        # Step 4: Check state file to identify new or relevant reports
+        # Step 4: Check state file to identify new or previously failed reports
         patient_state = self.load_patient_state(patient_id)
-        known_hashes: Set[str] = {f.get("sha256") for f in patient_state.get("files", []) if f.get("sha256")}
+        prev_upload_failed = patient_state.get("redcap_upload_status") == "error"
+        known_hashes: Set[str] = (
+            set()
+            if prev_upload_failed
+            else {
+                f.get("sha256")
+                for f in patient_state.get("files", [])
+                if f.get("sha256") and f.get("status", "success") in ("success", "skipped")
+            }
+        )
 
-        field_updates: List[FieldUpdateDetail] = []
+        orig_snapshot = dict(existing_record)
+        working_record = dict(existing_record)
+        updates_by_field: Dict[str, FieldUpdateDetail] = {}
         updates_payload: Dict[str, Any] = {"record_id": str(patient_id)}
         forms_updated: Set[str] = set()
         new_reports_count = 0
+        doc_errors: List[str] = []
 
         # Pre-load metadata
         self.load_metadata()
 
-        # Sort available reports in chronological order
+        # Sort available reports chronologically once without duplicate PDF parsing
+        pdf_text_cache: Dict[Path, str] = {}
         if available_pdfs:
-            available_pdfs = PDFExtractor.sort_pdfs_by_date(available_pdfs)
+            sorted_entries = PDFExtractor.sort_pdfs_with_text(available_pdfs)
+            available_pdfs = []
+            for p_item, txt_item, _ in sorted_entries:
+                available_pdfs.append(p_item)
+                if txt_item:
+                    pdf_text_cache[p_item] = txt_item
 
         for pdf_path in available_pdfs:
             pdf_path = Path(pdf_path)
@@ -342,17 +366,14 @@ class RedCapSyncService:
             if is_new_file:
                 new_reports_count += 1
 
-            # Decide whether to inspect this report:
-            # - If it's a brand new file
-            # - Or if force_reprocess is True
-            # - Or if one of our forms_to_audit is still incomplete
-            should_process = is_new_file or force_reprocess or bool(forms_to_audit)
+            # Process only brand-new/unuploaded PDFs unless force_reprocess is explicitly requested
+            should_process = is_new_file or force_reprocess
             if not should_process:
                 continue
 
             try:
-                # 4.1 Extract text
-                report_text = PDFExtractor.extract_text(pdf_path)
+                # 4.1 Reuse text extracted during chronological sorting
+                report_text = pdf_text_cache.get(pdf_path) or PDFExtractor.extract_text(pdf_path)
                 if not report_text.strip():
                     continue
 
@@ -380,7 +401,7 @@ class RedCapSyncService:
                 for form_idx, classified_form in enumerate(valid_doc_forms):
                     # Check if this form is relevant to audit
                     if forms_to_audit and classified_form not in forms_to_audit:
-                        if existing_record.get(f"{classified_form}_complete") == "2" and not force_reprocess:
+                        if working_record.get(f"{classified_form}_complete") == "2" and not force_reprocess:
                             continue
 
                     is_primary = (form_idx == 0)
@@ -389,7 +410,7 @@ class RedCapSyncService:
                         f"({'primario' if is_primary else 'secondario'})..."
                     )
 
-                    # 4.3 AI Extraction
+                    # 4.3 AI Extraction (guarded by LLM concurrency semaphore)
                     target_fields = self.pipeline.get_fields_for_form(classified_form)
                     extract_kwargs: Dict[str, Any] = {
                         "report_text": report_text,
@@ -403,18 +424,19 @@ class RedCapSyncService:
                     if "include_unchecked_checkboxes" in extract_sig_params:
                         extract_kwargs["include_unchecked_checkboxes"] = (mode == "overwrite")
 
-                    extraction_res = self.ai_extractor.extract_from_text(**extract_kwargs)
+                    with llm_slot(getattr(self.settings, "ai_max_concurrent_requests", 1)):
+                        extraction_res = self.ai_extractor.extract_from_text(**extract_kwargs)
 
                     if extraction_res.status != "success":
-                        logger.warning(
-                            f"Estrazione fallita per {pdf_path.name} ({classified_form}): {extraction_res.error_message}"
-                        )
+                        err_msg = f"{pdf_path.name} ({classified_form}): {extraction_res.error_message}"
+                        doc_errors.append(err_msg)
+                        logger.warning(f"Estrazione fallita per {err_msg}")
                         continue
 
                     doc_forms_processed.append(classified_form)
                     extracted_data = extraction_res.redcap_record
 
-                    # 4.4 Compute diff with existing REDCap record
+                    # 4.4 Compute diff against evolving working_record; preserve orig_snapshot for audit detail
                     form_has_updates = False
                     for k, new_v in extracted_data.items():
                         if k in ("record_id",):
@@ -423,8 +445,10 @@ class RedCapSyncService:
                         if new_v in (None, ""):
                             continue
 
-                        old_v = existing_record.get(k)
-                        old_str = str(old_v).strip() if old_v is not None else ""
+                        cur_v = working_record.get(k)
+                        cur_str = str(cur_v).strip() if cur_v is not None else ""
+                        orig_v = orig_snapshot.get(k)
+                        orig_str = str(orig_v).strip() if orig_v is not None else ""
                         new_str = str(new_v).strip()
 
                         # Completion field logic: never auto-promote to '2' or downgrade '2'
@@ -433,53 +457,50 @@ class RedCapSyncService:
 
                         # Checkbox fields: format {field}___{code}
                         if "___" in k:
-                            if old_str != new_str:
+                            if cur_str != new_str:
                                 if mode == "overwrite" or (
-                                    mode != "overwrite" and old_str in ("", "0") and new_str == "1"
+                                    mode != "overwrite" and orig_str in ("", "0") and cur_str in ("", "0") and new_str == "1"
                                 ):
-                                    field_updates.append(
-                                        FieldUpdateDetail(
-                                            field_name=k,
-                                            form_name=classified_form,
-                                            old_value=old_v,
-                                            new_value=new_v,
-                                            update_type="new_field" if old_str in ("", "0") else "overwrite"
-                                        )
+                                    updates_by_field[k] = FieldUpdateDetail(
+                                        field_name=k,
+                                        form_name=classified_form,
+                                        old_value=orig_v,
+                                        new_value=new_v,
+                                        update_type="new_field" if orig_str in ("", "0") else "overwrite"
                                     )
                                     updates_payload[k] = new_v
+                                    working_record[k] = new_v
                                     form_has_updates = True
                             continue
 
                         # Standard fields (radio, dropdown, text, number, date)
-                        if not old_str:
-                            field_updates.append(
-                                FieldUpdateDetail(
-                                    field_name=k,
-                                    form_name=classified_form,
-                                    old_value=old_v,
-                                    new_value=new_v,
-                                    update_type="new_field"
-                                )
+                        if not cur_str and not orig_str:
+                            updates_by_field[k] = FieldUpdateDetail(
+                                field_name=k,
+                                form_name=classified_form,
+                                old_value=orig_v,
+                                new_value=new_v,
+                                update_type="new_field"
                             )
                             updates_payload[k] = new_v
+                            working_record[k] = new_v
                             form_has_updates = True
-                        elif old_str != new_str and mode == "overwrite":
+                        elif cur_str != new_str and mode == "overwrite":
                             # Only overwrite populated REDCap fields when overwrite mode is explicitly requested
-                            field_updates.append(
-                                FieldUpdateDetail(
-                                    field_name=k,
-                                    form_name=classified_form,
-                                    old_value=old_v,
-                                    new_value=new_v,
-                                    update_type="overwrite"
-                                )
+                            updates_by_field[k] = FieldUpdateDetail(
+                                field_name=k,
+                                form_name=classified_form,
+                                old_value=orig_v,
+                                new_value=new_v,
+                                update_type="overwrite" if orig_str else "new_field"
                             )
                             updates_payload[k] = new_v
+                            working_record[k] = new_v
                             form_has_updates = True
 
                     if form_has_updates:
                         forms_updated.add(classified_form)
-                        if str(existing_record.get(f"{classified_form}_complete") or "").strip() != "2":
+                        if str(orig_snapshot.get(f"{classified_form}_complete") or "").strip() != "2":
                             updates_payload[f"{classified_form}_complete"] = "1"
 
                 # Upsert in-memory state file entry deduplicated by sha256
@@ -503,6 +524,9 @@ class RedCapSyncService:
 
             except Exception as e:
                 logger.error(f"Errore elaborazione referto {pdf_path.name}: {e}")
+                doc_errors.append(f"{pdf_path.name}: {e}")
+
+        field_updates = list(updates_by_field.values())
 
         # Step 5: Upload updates to REDCap if not dry_run and updates exist
         import_response = None
@@ -515,6 +539,9 @@ class RedCapSyncService:
                 logger.info(f"-> Aggiornamento REDCap riuscito: {import_response}")
             except Exception as e:
                 logger.error(f"-> Fallimento importazione aggiornamenti su REDCap: {e}")
+                patient_state["redcap_upload_status"] = "error"
+                patient_state["last_sync"] = datetime.now().isoformat()
+                self.save_patient_state(patient_id, patient_state)
                 return PatientSyncResult(
                     patient_id=patient_id,
                     name=p_name,
@@ -535,10 +562,17 @@ class RedCapSyncService:
             all_forms = set(patient_state.get("forms_populated", []))
             all_forms.update(forms_updated)
             patient_state["forms_populated"] = sorted(list(all_forms))
+            patient_state["redcap_upload_status"] = "uploaded" if (has_changes and auto_upload) else patient_state.get("redcap_upload_status", "skipped")
             patient_state["last_sync"] = datetime.now().isoformat()
             self.save_patient_state(patient_id, patient_state)
 
-        status_result = "updated" if has_changes else "up_to_date"
+        if has_changes:
+            status_result = "updated"
+        elif doc_errors:
+            status_result = "error"
+        else:
+            status_result = "up_to_date"
+
         logger.info(
             f"=== SYNC COMPLETATO PER {patient_id}: {status_result.upper()} "
             f"({len(field_updates)} modifiche su form: {sorted(list(forms_updated))}) ==="
@@ -556,6 +590,7 @@ class RedCapSyncService:
             field_updates_count=len(field_updates),
             field_updates=field_updates,
             redcap_import_response=import_response,
+            error="; ".join(doc_errors) if doc_errors else None,
             duration_sec=round(time.time() - start_time, 2)
         )
 
@@ -583,13 +618,30 @@ class RedCapSyncService:
         logger.info(f"=== INIZIO AUDIT & SYNC REDCAP (target_forms={target_forms}, dry_run={dry_run}) ===")
 
         # Step 1: Discover patients from REDCap
-        records = self.get_patients_from_redcap(
-            filter_incomplete_forms=target_forms if only_incomplete else None
-        )
+        filter_forms = target_forms if target_forms else (list(AVAILABLE_FORMS.keys()) if only_incomplete else None)
+        records = self.get_patients_from_redcap(filter_incomplete_forms=filter_forms)
         if limit:
             records = records[:limit]
 
         logger.info(f"Trovati {len(records)} pazienti da verificare su REDCap.")
+
+        # Prefetch full records in bulk to avoid N+1 per-patient GET roundtrips
+        bulk_records_map: Dict[str, Dict[str, Any]] = {}
+        record_ids_to_fetch = [str(r.get("record_id", "")).strip() for r in records if str(r.get("record_id", "")).strip()]
+        if (
+            record_ids_to_fetch
+            and getattr(self.redcap_service, "api_url", None)
+            and getattr(self.redcap_service, "api_token", None)
+        ):
+            try:
+                full_records = self.redcap_service.export_records_from_api(records=record_ids_to_fetch)
+                if isinstance(full_records, list):
+                    for fr in full_records:
+                        frid = str(fr.get("record_id", "")).strip()
+                        if frid:
+                            bulk_records_map[frid] = fr
+            except Exception as e:
+                logger.debug(f"Prefetch batch REDCap saltato, fallback a fetch singolo: {e}")
 
         results: List[PatientSyncResult] = []
         all_forms_affected: Set[str] = set()
@@ -602,17 +654,32 @@ class RedCapSyncService:
                 continue
 
             logger.info(f"[{idx}/{len(records)}] Controllo paziente: {pid}...")
-            res = self.check_and_update_patient(
-                patient_id=pid,
-                name=rec.get("name"),
-                surname=rec.get("surname"),
-                dob=rec.get("date_of_birth"),
-                target_forms=target_forms,
-                auto_upload=auto_upload,
-                dry_run=dry_run,
-                force_reprocess=force_reprocess,
-                overwrite_mode=overwrite_mode,
-            )
+            try:
+                with get_patient_lock(pid):
+                    check_kwargs: Dict[str, Any] = {
+                        "patient_id": pid,
+                        "name": rec.get("name"),
+                        "surname": rec.get("surname"),
+                        "dob": rec.get("date_of_birth"),
+                        "target_forms": target_forms,
+                        "auto_upload": auto_upload,
+                        "dry_run": dry_run,
+                        "force_reprocess": force_reprocess,
+                        "overwrite_mode": overwrite_mode,
+                    }
+                    if pid in bulk_records_map:
+                        check_kwargs["existing_record_cache"] = bulk_records_map[pid]
+                    res = self.check_and_update_patient(**check_kwargs)
+            except Exception as e:
+                logger.error(f"Errore inatteso durante sync paziente {pid}: {e}")
+                res = PatientSyncResult(
+                    patient_id=pid,
+                    name=rec.get("name"),
+                    surname=rec.get("surname"),
+                    date_of_birth=str(rec.get("date_of_birth") or ""),
+                    status="error",
+                    error=str(e),
+                )
             results.append(res)
 
             if res.status == "updated":
@@ -635,7 +702,7 @@ class RedCapSyncService:
         # Save audit report atomically
         audit_dir = self.settings.sync_audit_dir
         audit_dir.mkdir(parents=True, exist_ok=True)
-        report_filename = f"sync_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+        report_filename = f"sync_report_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.json"
         atomic_write_text(audit_dir / report_filename, report.model_dump_json(indent=2))
 
         logger.info(
@@ -650,7 +717,11 @@ class RedCapSyncService:
         target_forms: Optional[List[str]] = None,
         auto_upload: bool = True,
         dry_run: bool = False,
-        stop_event: Optional[Any] = None
+        stop_event: Optional[Any] = None,
+        force_reprocess: bool = False,
+        limit: Optional[int] = None,
+        only_incomplete: bool = True,
+        overwrite_mode: Optional[str] = None,
     ):
         """Runs the synchronization loop periodically at specified interval."""
         logger.info(f"Avvio ciclo periodico di sincronizzazione REDCap ogni {interval_seconds}s...")
@@ -663,7 +734,11 @@ class RedCapSyncService:
                 self.sync_all(
                     target_forms=target_forms,
                     auto_upload=auto_upload,
-                    dry_run=dry_run
+                    dry_run=dry_run,
+                    force_reprocess=force_reprocess,
+                    limit=limit,
+                    only_incomplete=only_incomplete,
+                    overwrite_mode=overwrite_mode,
                 )
             except Exception as e:
                 logger.error(f"Errore durante l'esecuzione del ciclo di sync: {e}")

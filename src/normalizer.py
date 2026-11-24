@@ -245,8 +245,8 @@ class REDCapNormalizer:
         expr = re.sub(r"\bOR\b", "or", expr, flags=re.IGNORECASE)
         expr = re.sub(r"\bNOT\b", "not", expr, flags=re.IGNORECASE)
 
-        # Convert unquoted integer comparisons (e.g. == 1 -> == "1")
-        expr = re.sub(r"([=!<>]=?\s*)(\d+)(?!\w|\'|\")", r'\1"\2"', expr)
+        # Convert unquoted numeric comparisons (including decimals) safely (e.g. == 1 -> == "1", >= 14.5 -> >= "14.5")
+        expr = re.sub(r"([=!<>]=?\s*)(-?\d+(?:\.\d+)?)(?!\w|\.|\'|\")", r'\1"\2"', expr)
 
         # Convert inequality comparisons with numeric operands to float comparison
         def replace_inequality(m):
@@ -295,12 +295,20 @@ class REDCapNormalizer:
             if lower_val == label.strip().lower():
                 return code
 
-        # 4. Token-level exact match (e.g. if choice is "Destro" and value is "seno destro")
+        # 4. Token-level exact match (prefer highest specificity / token count, e.g. 'Carcinoma duttale' over 'Carcinoma')
         val_tokens = set(re.findall(r"\w+", lower_val))
+        best_token_code: Optional[str] = None
+        best_token_score = (0, 0.0)
         for code, label in choices.items():
-            label_tokens = set(re.findall(r"\w+", label.strip().lower()))
+            clean_label = label.strip().lower()
+            label_tokens = set(re.findall(r"\w+", clean_label))
             if label_tokens and label_tokens.issubset(val_tokens):
-                return code
+                score = (len(label_tokens), difflib.SequenceMatcher(None, lower_val, clean_label).ratio())
+                if score > best_token_score:
+                    best_token_score = score
+                    best_token_code = code
+        if best_token_code is not None:
+            return best_token_code
 
         # 5. Fuzzy match guarded against differing numeric/alphanumeric clinical codes
         # Prevents dangerous collisions like "Grado 3" -> "Grado 1" or "BI-RADS 4A" -> "BI-RADS 4B"
