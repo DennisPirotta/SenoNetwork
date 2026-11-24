@@ -161,6 +161,48 @@ def test_cup_patients_compatibility_and_local_state(client):
         first_patient = data["items"][0]
         assert "has_local_state" in first_patient
         assert isinstance(first_patient["has_local_state"], bool)
+        assert "in_redcap" in first_patient
+        assert isinstance(first_patient["in_redcap"], bool)
+
+
+def test_cup_patients_redcap_matching(client):
+    files_resp = client.get("/api/cup/files")
+    first_file = files_resp.json()[0]["name"]
+
+    # First get the first patient from this file
+    sample_resp = client.get(f"/api/cup/patients?cup_file={first_file}&page=1&page_size=1")
+    items = sample_resp.json()["items"]
+    assert len(items) > 0
+    p = items[0]
+    cognome = p["cognome"]
+    nome = p["nome"]
+    dob = p["data_nascita"]
+
+    mock_summary = [
+        {
+            "record_id": "42",
+            "name": nome,
+            "surname": cognome,
+            "date_of_birth": dob,
+            "forms_completed_count": 5,
+            "forms_status": {"dati_del_paziente": "Completato"}
+        }
+    ]
+
+    with patch("src.routers.cup.REDCapService") as MockServiceClass:
+        mock_svc = MagicMock()
+        mock_svc.get_records_summary.return_value = mock_summary
+        MockServiceClass.return_value = mock_svc
+
+        # Force refresh redcap lookup
+        resp = client.get(f"/api/cup/patients?cup_file={first_file}&page=1&page_size=1&refresh_redcap=true")
+        assert resp.status_code == 200
+        res_items = resp.json()["items"]
+        assert len(res_items) > 0
+        matched = res_items[0]
+        assert matched["in_redcap"] is True
+        assert matched["redcap_record_id"] == "42"
+        assert matched["redcap_forms_completed"] == 5
 
 
 def test_dashboard_html_contains_cup_files_table(client):

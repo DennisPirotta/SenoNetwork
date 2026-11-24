@@ -389,11 +389,16 @@ class CupController {
 
       const hasLocal = p.has_local_state;
       const inRedcap = p.in_redcap;
+      const redcapId = p.redcap_record_id;
+      const formsCount = p.redcap_forms_completed;
+
       let statusBadge = '<span class="badge badge-neutral">Da Elaborare</span>';
       if (inRedcap) {
-        statusBadge = '<span class="badge badge-success">✓ In REDCap</span>';
+        const idLabel = redcapId ? ` #${redcapId}` : '';
+        const formsLabel = (formsCount !== undefined && formsCount !== null) ? ` (${formsCount}/8)` : '';
+        statusBadge = `<span class="badge badge-success" title="Paziente registrato in REDCap (ID: ${redcapId || 'N/D'})">✓ REDCap${idLabel}${formsLabel}</span>`;
       } else if (hasLocal) {
-        statusBadge = '<span class="badge badge-info">✓ In Locale</span>';
+        statusBadge = '<span class="badge badge-info" title="Referti elaborati in locale ma non caricati su REDCap">✓ In Locale</span>';
       }
 
       tr.innerHTML = `
@@ -405,7 +410,7 @@ class CupController {
         <td>${statusBadge}</td>
         <td>
           <div style="display: flex; gap: 0.375rem;">
-            <button type="button" class="btn btn-primary btn-sm btn-action-pipeline" data-id="${p.patient_id || ''}" data-name="${p.nome || ''}" data-surname="${p.cognome || ''}" data-dob="${p.data_nascita || ''}">
+            <button type="button" class="btn btn-primary btn-sm btn-action-pipeline" data-id="${p.patient_id || ''}" data-redcap-id="${redcapId || ''}" data-name="${p.nome || ''}" data-surname="${p.cognome || ''}" data-dob="${p.data_nascita || ''}">
               ⚡ Pipeline
             </button>
             <button type="button" class="btn btn-secondary btn-sm btn-action-verify" data-name="${p.nome || ''}" data-surname="${p.cognome || ''}" data-dob="${p.data_nascita || ''}">
@@ -421,11 +426,12 @@ class CupController {
     tbody.querySelectorAll(".btn-action-pipeline").forEach(b => {
       b.addEventListener("click", () => {
         const id = b.getAttribute("data-id");
+        const redcapId = b.getAttribute("data-redcap-id");
         const name = b.getAttribute("data-name");
         const surname = b.getAttribute("data-surname");
         const dob = b.getAttribute("data-dob");
 
-        document.getElementById("pipe-patient-id").value = id;
+        document.getElementById("pipe-patient-id").value = redcapId || id;
         document.getElementById("pipe-name").value = name;
         document.getElementById("pipe-surname").value = surname;
         document.getElementById("pipe-dob").value = dob;

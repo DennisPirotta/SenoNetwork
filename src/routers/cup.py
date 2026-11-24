@@ -2,9 +2,14 @@
 
 from datetime import date, datetime
 import io
+import json
+import logging
 import math
 from pathlib import Path
+import re
+import time
 from typing import Any, Dict, List, Optional, Tuple
+import unicodedata
 from fastapi import APIRouter, Body, Depends, HTTPException, Query, Response, status
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field
@@ -12,6 +17,7 @@ import pandas as pd
 import requests
 
 from src.config import Settings, get_settings
+from src.redcap_service import REDCapService
 from src.priamo_cup_client import (
     AGENDE_SENOLOGIA,
     UNITA_SENOLOGIA,
@@ -24,10 +30,107 @@ from scripts.extract_patients_from_shared_file import (
 )
 from src.routers.security import verify_api_key
 
+logger = logging.getLogger(__name__)
+
 router = APIRouter(tags=["Priamo CUP"])
 
 # Cache in-memory per il conteggio dei pazienti nei file CUP: (file_name, mtime) -> count
 _CUP_FILE_CACHE: Dict[Tuple[str, float], int] = {}
+
+# Cache in-memory per la corrispondenza dei record REDCap: TTL 60s
+_REDCAP_LOOKUP_CACHE: Dict[str, Any] = {
+    "timestamp": 0.0,
+    "by_demographics": {},
+    "by_name": {},
+    "by_id": {},
+}
+
+
+def _normalize_name(s: Optional[str]) -> str:
+    """Normalizza un nome/cognome per confronto robusto senza accenti e caratteri speciali."""
+    if not s:
+        return ""
+    norm = unicodedata.normalize("NFKD", str(s)).encode("ASCII", "ignore").decode("utf-8")
+    return re.sub(r"[^a-z0-9]", "", norm.lower())
+
+
+def _normalize_dob(dob: Any) -> str:
+    """Normalizza una data di nascita in formato ISO 'YYYY-MM-DD'."""
+    if not dob:
+        return ""
+    if hasattr(dob, "isoformat"):
+        return dob.isoformat()[:10]
+    s = str(dob).strip()[:10]
+    for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%Y/%m/%d", "%d-%m-%Y"):
+        try:
+            return datetime.strptime(s, fmt).strftime("%Y-%m-%d")
+        except ValueError:
+            pass
+    return s
+
+
+def _get_redcap_lookup(settings: Settings, force_refresh: bool = False) -> Dict[str, Any]:
+    """Recupera l'elenco dei record REDCap per il matching con i pazienti CUP, con cache a 60 secondi."""
+    global _REDCAP_LOOKUP_CACHE
+    now = time.time()
+    if not force_refresh and (now - _REDCAP_LOOKUP_CACHE["timestamp"]) < 60 and _REDCAP_LOOKUP_CACHE["timestamp"] > 0:
+        return _REDCAP_LOOKUP_CACHE
+
+    if not settings.redcap_api_url or not settings.redcap_api_token:
+        return _REDCAP_LOOKUP_CACHE
+
+    try:
+        svc = REDCapService(api_url=settings.redcap_api_url, api_token=settings.redcap_api_token)
+        summary = svc.get_records_summary()
+        by_demo: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
+        by_name: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
+        by_id: Dict[str, Dict[str, Any]] = {}
+
+        for rec in summary:
+            rid = str(rec.get("record_id", "")).strip()
+            name_norm = _normalize_name(rec.get("name"))
+            sur_norm = _normalize_name(rec.get("surname"))
+            dob_norm = _normalize_dob(rec.get("date_of_birth"))
+            forms_completed = rec.get("forms_completed_count", 0)
+
+            rec_info = {
+                "record_id": rid,
+                "forms_completed_count": forms_completed,
+                "forms_status": rec.get("forms_status", {}),
+            }
+
+            if rid:
+                by_id[rid.lower()] = rec_info
+
+            if sur_norm and name_norm:
+                if dob_norm:
+                    by_demo[(sur_norm, name_norm, dob_norm)] = rec_info
+                by_name.setdefault((sur_norm, name_norm), []).append(rec_info)
+
+        _REDCAP_LOOKUP_CACHE = {
+            "timestamp": now,
+            "by_demographics": by_demo,
+            "by_name": by_name,
+            "by_id": by_id,
+        }
+    except Exception as e:
+        logger.debug(f"Impossibile aggiornare cache record REDCap per CUP: {e}")
+
+    return _REDCAP_LOOKUP_CACHE
+
+
+def _check_local_state(patient_id: str, state_dir: Path) -> Tuple[bool, bool]:
+    """Verifica l'esistenza del file di stato locale e lo status dell'upload su REDCap."""
+    p_path = state_dir / f"{patient_id}_state.json"
+    if not p_path.exists():
+        return False, False
+    try:
+        with open(p_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            uploaded = data.get("redcap_upload_status") == "uploaded"
+            return True, uploaded
+    except Exception:
+        return True, False
 
 
 class CupDownloadRequest(BaseModel):
@@ -208,9 +311,11 @@ def get_cup_patients(
     agenda: Optional[str] = Query(None, description="Filtra per codice agenda (es. 3004)"),
     only_complete: bool = Query(False, description="Filtra solo pazienti con data nascita e nome presenti"),
     page: int = Query(1, ge=1, description="Numero pagina (1-based)"),
-    page_size: int = Query(50, ge=1, le=500, description="Dimensione pagina")
+    page_size: int = Query(50, ge=1, le=500, description="Dimensione pagina"),
+    refresh_redcap: bool = Query(False, description="Forza l'aggiornamento della cache dei record REDCap"),
+    settings: Settings = Depends(get_settings)
 ) -> Dict[str, Any]:
-    """Restituisce l'elenco dei pazienti univoci estratti dal foglio CUP con filtri e paginazione."""
+    """Restituisce l'elenco dei pazienti univoci estratti dal foglio CUP con filtri, paginazione e verifica stato REDCap."""
     target_name = file_name or cup_file
     target_file = _find_target_cup_file(target_name)
     pazienti = estrai_pazienti_univoci(target_file, only_complete=only_complete)
@@ -236,12 +341,43 @@ def get_cup_patients(
     end_idx = start_idx + page_size
     page_items = pazienti[start_idx:end_idx]
 
-    # Verifica presenza file di stato locale (già elaborato dalla pipeline)
+    # Verifica corrispondenza con REDCap e file di stato locale
+    redcap_lookup = _get_redcap_lookup(settings, force_refresh=refresh_redcap)
     state_dir = Path("data/state")
     items = []
+
     for p in page_items:
+        sur_norm = _normalize_name(p.cognome)
+        name_norm = _normalize_name(p.nome)
+        dob_norm = _normalize_dob(p.data_nascita)
+
+        redcap_match = None
+        # 1. Matching anagrafico completo (cognome, nome, data di nascita)
+        if (sur_norm, name_norm, dob_norm) in redcap_lookup.get("by_demographics", {}):
+            redcap_match = redcap_lookup["by_demographics"][(sur_norm, name_norm, dob_norm)]
+        # 2. Matching anagrafico su cognome e nome univoci
+        elif (sur_norm, name_norm) in redcap_lookup.get("by_name", {}):
+            candidates = redcap_lookup["by_name"][(sur_norm, name_norm)]
+            if len(candidates) == 1:
+                redcap_match = candidates[0]
+        # 3. Matching su ID (se patient_id o priamo_id coincide con record_id)
+        elif p.patient_id and p.patient_id.lower() in redcap_lookup.get("by_id", {}):
+            redcap_match = redcap_lookup["by_id"][p.patient_id.lower()]
+        elif p.priamo_id and str(p.priamo_id).lower() in redcap_lookup.get("by_id", {}):
+            redcap_match = redcap_lookup["by_id"][str(p.priamo_id).lower()]
+
+        # 4. Verifica stato locale (su slug del paziente o record_id REDCap)
+        has_local, is_local_uploaded = _check_local_state(p.patient_id, state_dir)
+        if not has_local and redcap_match:
+            has_local, is_local_uploaded = _check_local_state(redcap_match["record_id"], state_dir)
+
+        in_redcap = (redcap_match is not None) or is_local_uploaded
+
         d = p.to_export_dict()
-        d["has_local_state"] = (state_dir / f"{p.patient_id}_state.json").exists()
+        d["has_local_state"] = has_local
+        d["in_redcap"] = in_redcap
+        d["redcap_record_id"] = redcap_match["record_id"] if redcap_match else None
+        d["redcap_forms_completed"] = redcap_match["forms_completed_count"] if redcap_match else None
         items.append(d)
 
     return {
