@@ -13,12 +13,14 @@ Exposes REST endpoints and SSE streams for:
 import argparse
 from functools import lru_cache
 import logging
+from pathlib import Path
 import sys
 from typing import Any, Dict, List, Optional
 import uvicorn
 from fastapi import BackgroundTasks, Depends, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import RedirectResponse
+from fastapi.responses import FileResponse, RedirectResponse
+from fastapi.staticfiles import StaticFiles
 
 from src.ai_extractor import LlamaCppExtractor, OllamaExtractor
 from src.audit_service import RedCapAuditReport, RedCapDataAuditor
@@ -123,9 +125,26 @@ def health_check(settings: Settings = Depends(get_shared_settings)):
     }
 
 
+static_dir = Path(__file__).resolve().parent / "static"
+if static_dir.exists():
+    app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
+
+
 @app.get("/", include_in_schema=False)
 def root():
-    """Reindirizza alla documentazione interattiva Swagger."""
+    """Serve la Dashboard Web di SenoNetwork."""
+    index_file = static_dir / "index.html"
+    if index_file.exists():
+        return FileResponse(index_file)
+    return RedirectResponse(url="/docs")
+
+
+@app.get("/dashboard", include_in_schema=False)
+def dashboard_view():
+    """Endpoint esplicito per la Dashboard Web di SenoNetwork."""
+    index_file = static_dir / "index.html"
+    if index_file.exists():
+        return FileResponse(index_file)
     return RedirectResponse(url="/docs")
 
 

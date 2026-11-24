@@ -73,8 +73,23 @@ def _background_process_single(
 ):
     _tasks_store[task_id]["status"] = "processing"
     _tasks_store[task_id]["started_at"] = time.time()
-    _tasks_store[task_id]["progress_pct"] = 10
-    _tasks_store[task_id]["current_step"] = f"Download e analisi referti per {patient_id}..."
+    _tasks_store[task_id]["progress_pct"] = 5
+    _tasks_store[task_id]["current_step"] = f"Inizializzazione elaborazione per {patient_id}..."
+    _tasks_store[task_id]["events_log"] = []
+    _tasks_store[task_id]["processed_documents"] = []
+
+    def on_progress(step_msg: str, pct: int, extra: Optional[Dict[str, Any]] = None):
+        _tasks_store[task_id]["progress_pct"] = pct
+        _tasks_store[task_id]["current_step"] = step_msg
+        event_entry = {
+            "time": time.strftime("%H:%M:%S"),
+            "message": step_msg,
+            "pct": pct,
+            "extra": extra
+        }
+        _tasks_store[task_id].setdefault("events_log", []).append(event_entry)
+        if extra and "filename" in extra:
+            _tasks_store[task_id].setdefault("processed_documents", []).append(extra)
 
     try:
         res = pipeline.process_patient(
@@ -83,7 +98,8 @@ def _background_process_single(
             surname=surname,
             date_of_birth=dob,
             auto_upload=auto_upload and not dry_run,
-            webhook_url=webhook
+            webhook_url=webhook,
+            progress_callback=on_progress
         )
         _tasks_store[task_id]["status"] = "completed"
         _tasks_store[task_id]["progress_pct"] = 100
@@ -109,6 +125,8 @@ def _background_process_batch(
     _tasks_store[task_id]["started_at"] = time.time()
     total = len(cohort)
     _tasks_store[task_id]["items_total"] = total
+    _tasks_store[task_id]["events_log"] = []
+    _tasks_store[task_id]["processed_documents"] = []
     results = []
 
     for idx, p in enumerate(cohort, 1):
@@ -117,9 +135,23 @@ def _background_process_batch(
         p_surname = p.get("surname")
         p_dob = p.get("date_of_birth")
 
-        pct = int(((idx - 1) / total) * 100)
-        _tasks_store[task_id]["progress_pct"] = pct
+        pct_start = int(((idx - 1) / total) * 100)
+        _tasks_store[task_id]["progress_pct"] = pct_start
         _tasks_store[task_id]["current_step"] = f"[{idx}/{total}] Elaborazione: {p_name or ''} {p_surname or ''} ({target_id})"
+
+        def on_batch_progress(step_msg: str, pct: int, extra: Optional[Dict[str, Any]] = None):
+            scaled_pct = pct_start + int(pct / 100 * (100 / total))
+            _tasks_store[task_id]["progress_pct"] = min(scaled_pct, 99)
+            _tasks_store[task_id]["current_step"] = f"[{idx}/{total}] {step_msg}"
+            event_entry = {
+                "time": time.strftime("%H:%M:%S"),
+                "message": f"[{idx}/{total}] {step_msg}",
+                "pct": min(scaled_pct, 99),
+                "extra": extra
+            }
+            _tasks_store[task_id].setdefault("events_log", []).append(event_entry)
+            if extra and "filename" in extra:
+                _tasks_store[task_id].setdefault("processed_documents", []).append(extra)
 
         try:
             res = pipeline.process_patient(
@@ -127,7 +159,8 @@ def _background_process_batch(
                 name=p_name,
                 surname=p_surname,
                 date_of_birth=p_dob,
-                auto_upload=auto_upload and not dry_run
+                auto_upload=auto_upload and not dry_run,
+                progress_callback=on_batch_progress
             )
             results.append(res.model_dump())
         except Exception as e:
@@ -349,7 +382,7 @@ async def stream_task_events(task_id: str):
             current_pct = task.get("progress_pct", 0)
             status_val = task.get("status")
 
-            # Invia evento solo se c'è stato un aggiornamento o al termine
+            # Invia payload arricchito con eventi e schede documenti
             payload = {
                 "task_id": task_id,
                 "status": status_val,
@@ -357,6 +390,9 @@ async def stream_task_events(task_id: str):
                 "current_step": task.get("current_step", ""),
                 "items_done": task.get("items_done", 0),
                 "items_total": task.get("items_total", 1),
+                "events_log": task.get("events_log", []),
+                "processed_documents": task.get("processed_documents", []),
+                "result": task.get("result") if status_val in ("completed", "failed") else None,
                 "error": task.get("error")
             }
             yield f"data: {json.dumps(payload)}\n\n"
@@ -364,7 +400,7 @@ async def stream_task_events(task_id: str):
             if status_val in ("completed", "failed"):
                 break
 
-            await asyncio.sleep(1.0)
+            await asyncio.sleep(0.5)
 
     return StreamingResponse(
         event_generator(),

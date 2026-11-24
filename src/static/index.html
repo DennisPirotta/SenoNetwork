@@ -1,0 +1,505 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>SenoNetwork - Clinical AI & Data Quality Dashboard</title>
+  <link rel="stylesheet" href="/static/css/dashboard.css">
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🩺</text></svg>">
+</head>
+<body>
+
+  <!-- Top Application Header -->
+  <header class="app-header">
+    <div class="header-container">
+      <div class="brand">
+        <div class="brand-icon">SN</div>
+        <div class="brand-text">
+          <h1>SenoNetwork</h1>
+          <p>Pipeline Referti Senologici &bull; IA Locale RPC &bull; REDCap Valduce</p>
+        </div>
+      </div>
+      <div class="header-controls">
+        <div class="system-status-indicator" id="global-status-pill">
+          <span class="status-dot pulse" id="global-status-dot"></span>
+          <span id="global-status-text">Verifica stato...</span>
+        </div>
+        <button type="button" class="btn btn-secondary btn-sm" id="btn-open-settings" title="Configura API Key">
+          ⚙️ Impostazioni
+        </button>
+      </div>
+    </div>
+  </header>
+
+  <!-- Navigation Tabs (Modern Web Guidance compliance) -->
+  <nav class="nav-tabs-wrapper" aria-label="Navigazione Sezioni Dashboard">
+    <div class="tabs-container">
+      <div role="tablist" aria-label="Sezioni Principali">
+        <button type="button" role="tab" id="tab-btn-overview" aria-selected="true" aria-controls="panel-overview">
+          📊 Panoramica & KPI
+        </button>
+        <button type="button" role="tab" id="tab-btn-cup" aria-selected="false" aria-controls="panel-cup">
+          🏥 Priamo CUP Pazienti
+        </button>
+        <button type="button" role="tab" id="tab-btn-pipeline" aria-selected="false" aria-controls="panel-pipeline">
+          ⚡ Pipeline IA Real-Time
+        </button>
+        <button type="button" role="tab" id="tab-btn-audit" aria-selected="false" aria-controls="panel-audit">
+          🛡️ Data Quality & Audit
+        </button>
+        <button type="button" role="tab" id="tab-btn-sync" aria-selected="false" aria-controls="panel-sync">
+          🔄 Riconciliazione Sync
+        </button>
+        <button type="button" role="tab" id="tab-btn-redcap" aria-selected="false" aria-controls="panel-redcap">
+          🗄️ Record REDCap
+        </button>
+      </div>
+    </div>
+  </nav>
+
+  <!-- Main Content Panels -->
+  <main class="main-content">
+
+    <!-- PANEL 1: PANORAMICA & KPI -->
+    <section role="tabpanel" id="panel-overview" aria-labelledby="tab-btn-overview" tabindex="0">
+      <!-- Sottosistemi Status Grid -->
+      <div class="card" style="margin-bottom: 1.25rem;">
+        <div class="card-header">
+          <h2 class="card-title">Stato Connettività Sottosistemi Ospedalieri</h2>
+          <button type="button" class="btn btn-secondary btn-sm" id="btn-refresh-overview">Aggiorna Stato</button>
+        </div>
+        <div class="grid-4" id="subsystems-grid">
+          <div class="card" style="background-color: var(--surface-alt);">
+            <div class="kpi-label">llama.cpp RPC Master (2 GPU)</div>
+            <div id="status-llama-rpc" style="font-weight: 600; margin-top: 0.25rem;">Controllo...</div>
+          </div>
+          <div class="card" style="background-color: var(--surface-alt);">
+            <div class="kpi-label">Ollama Locale (Fallback)</div>
+            <div id="status-ollama" style="font-weight: 600; margin-top: 0.25rem;">Controllo...</div>
+          </div>
+          <div class="card" style="background-color: var(--surface-alt);">
+            <div class="kpi-label">Database REDCap Valduce</div>
+            <div id="status-redcap" style="font-weight: 600; margin-top: 0.25rem;">Controllo...</div>
+          </div>
+          <div class="card" style="background-color: var(--surface-alt);">
+            <div class="kpi-label">Priamo .NET / HIS Ospedaliero</div>
+            <div id="status-priamo" style="font-weight: 600; margin-top: 0.25rem;">Controllo...</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- KPI Metrics Grid -->
+      <div class="grid-4" style="margin-bottom: 1.25rem;">
+        <div class="card kpi-card">
+          <div>
+            <div class="kpi-value" id="kpi-cup-files">-</div>
+            <div class="kpi-label">Fogli CUP Disponibili</div>
+          </div>
+          <div class="kpi-icon blue">📁</div>
+        </div>
+        <div class="card kpi-card">
+          <div>
+            <div class="kpi-value" id="kpi-redcap-records">-</div>
+            <div class="kpi-label">Pazienti su REDCap</div>
+          </div>
+          <div class="kpi-icon">👥</div>
+        </div>
+        <div class="card kpi-card">
+          <div>
+            <div class="kpi-value" id="kpi-completed-records">-</div>
+            <div class="kpi-label">Form 100% Completati</div>
+          </div>
+          <div class="kpi-icon green">✅</div>
+        </div>
+        <div class="card kpi-card">
+          <div>
+            <div class="kpi-value" id="kpi-downloaded-pdfs">-</div>
+            <div class="kpi-label">Referti PDF Locali</div>
+          </div>
+          <div class="kpi-icon amber">📄</div>
+        </div>
+      </div>
+
+      <!-- Quick Actions Grid -->
+      <div class="grid-2">
+        <div class="card">
+          <h3 class="card-title">Azioni Rapide Pipeline</h3>
+          <p class="card-subtitle">Operazioni frequenti sulla coorte senologica</p>
+          <div style="display: flex; gap: 0.75rem; flex-wrap: wrap;">
+            <button type="button" class="btn btn-primary" id="btn-quick-cup-download">
+              ⬇️ Scarica Ultimo Foglio CUP
+            </button>
+            <button type="button" class="btn btn-secondary" id="btn-quick-run-audit">
+              🔍 Esegui Audit Qualità
+            </button>
+            <button type="button" class="btn btn-secondary" id="btn-quick-goto-pipeline">
+              ⚡ Avvia Estrazione IA
+            </button>
+          </div>
+        </div>
+        <div class="card">
+          <h3 class="card-title">Ultimo Foglio CUP Ingestito</h3>
+          <p class="card-subtitle" id="cup-latest-desc">Rilevamento in corso...</p>
+          <div id="cup-latest-details" style="font-size: 0.875rem; color: var(--text-muted);">
+            Seleziona la scheda Priamo CUP per esplorare tutti i pazienti estratti.
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- PANEL 2: PRIAMO CUP PAZIENTI -->
+    <section role="tabpanel" id="panel-cup" aria-labelledby="tab-btn-cup" hidden tabindex="0">
+      <div class="card" style="margin-bottom: 1.25rem;">
+        <div class="card-header">
+          <div>
+            <h2 class="card-title">Ambulatorio Senologia (Unità 37002) - Fogli di Lavoro</h2>
+            <p class="card-subtitle">Pazienti estratti dai fogli di lavoro CUP ospedalieri</p>
+          </div>
+          <div style="display: flex; gap: 0.5rem;">
+            <button type="button" class="btn btn-primary" id="btn-cup-download-remote">
+              ⬇️ Scarica da Priamo CUP
+            </button>
+            <button type="button" class="btn btn-secondary" id="btn-cup-export-csv">
+              Esporta CSV
+            </button>
+            <button type="button" class="btn btn-secondary" id="btn-cup-export-json">
+              Esporta JSON
+            </button>
+          </div>
+        </div>
+
+        <!-- Search and Filters Bar -->
+        <div class="form-row" style="margin-bottom: 1rem;">
+          <div style="flex: 2;">
+            <label class="form-label" for="cup-search-input">Cerca Paziente</label>
+            <input type="text" class="form-input" id="cup-search-input" placeholder="Cerca per Nome, Cognome, CF, ID MEF o Priamo...">
+          </div>
+          <div style="flex: 1;">
+            <label class="form-label" for="cup-file-select">Foglio di Lavoro</label>
+            <select class="form-select" id="cup-file-select">
+              <option value="">Caricamento file...</option>
+            </select>
+          </div>
+          <div style="flex: 0 0 auto;">
+            <button type="button" class="btn btn-secondary" id="btn-cup-search-submit" style="height: 38px;">
+              🔍 Cerca
+            </button>
+          </div>
+        </div>
+
+        <!-- Patients Responsive Table (conforme a responsive-table) -->
+        <div class="table-wrapper" tabindex="0" role="region" aria-labelledby="cup-table-caption">
+          <table>
+            <caption id="cup-table-caption" style="display: none;">Elenco Pazienti CUP Senologia</caption>
+            <thead>
+              <tr>
+                <th>Paziente (Nominativo)</th>
+                <th>Data Nascita</th>
+                <th>Codice Fiscale</th>
+                <th>ID Priamo / MEF</th>
+                <th>Comune Nascita</th>
+                <th>Stato REDCap</th>
+                <th>Azioni</th>
+              </tr>
+            </thead>
+            <tbody id="cup-patients-tbody">
+              <tr>
+                <td colspan="7" style="text-align: center; color: var(--text-muted); padding: 2rem;">
+                  Caricamento pazienti in corso...
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <!-- Pagination -->
+        <div style="display: flex; justify-content: space-between; align-items: center; margin-top: 1rem;">
+          <div style="font-size: 0.8125rem; color: var(--text-muted);" id="cup-pagination-info">
+            Visualizzazione risultati...
+          </div>
+          <div style="display: flex; gap: 0.5rem;">
+            <button type="button" class="btn btn-secondary btn-sm" id="btn-cup-prev">⬅️ Precedente</button>
+            <button type="button" class="btn btn-secondary btn-sm" id="btn-cup-next">Successiva ➡️</button>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- PANEL 3: PIPELINE IA & MONITORAGGIO REAL-TIME -->
+    <section role="tabpanel" id="panel-pipeline" aria-labelledby="tab-btn-pipeline" hidden tabindex="0">
+      <div class="grid-2" style="margin-bottom: 1.25rem;">
+        <!-- Configurazione Lancio -->
+        <div class="card">
+          <div class="card-header">
+            <h2 class="card-title">Avvio Pipeline Clinica</h2>
+          </div>
+          
+          <div class="form-group">
+            <label class="form-label" for="pipe-patient-id">Identificatore Paziente (ID, Slug o CF)</label>
+            <input type="text" class="form-input" id="pipe-patient-id" placeholder="es. lidia-acquati-1959-08-01 o ID Priamo">
+          </div>
+
+          <div class="form-row">
+            <div class="form-group">
+              <label class="form-label" for="pipe-name">Nome</label>
+              <input type="text" class="form-input" id="pipe-name" placeholder="es. Lidia">
+            </div>
+            <div class="form-group">
+              <label class="form-label" for="pipe-surname">Cognome</label>
+              <input type="text" class="form-input" id="pipe-surname" placeholder="es. Acquati">
+            </div>
+            <div class="form-group">
+              <label class="form-label" for="pipe-dob">Data di Nascita</label>
+              <input type="date" class="form-input" id="pipe-dob">
+            </div>
+          </div>
+
+          <div class="form-row">
+            <div class="form-group">
+              <label class="form-label" for="pipe-backend-select">Motore IA Inferenza</label>
+              <select class="form-select" id="pipe-backend-select">
+                <option value="llama_cpp">llama.cpp RPC (Cluster Distribuito 2 GPU)</option>
+                <option value="ollama">Ollama Locale</option>
+              </select>
+            </div>
+            <div class="form-group" style="display: flex; flex-direction: column; justify-content: flex-end; padding-bottom: 0.5rem;">
+              <label style="display: flex; align-items: center; gap: 0.5rem; font-size: 0.875rem; cursor: pointer;">
+                <input type="checkbox" id="pipe-auto-upload" checked>
+                <span>Carica automaticamente su REDCap</span>
+              </label>
+              <label style="display: flex; align-items: center; gap: 0.5rem; font-size: 0.875rem; cursor: pointer; margin-top: 0.25rem;">
+                <input type="checkbox" id="pipe-dry-run">
+                <span>Simulazione (Dry Run senza modifiche)</span>
+              </label>
+            </div>
+          </div>
+
+          <div style="margin-top: 1rem; display: flex; gap: 0.75rem;">
+            <button type="button" class="btn btn-primary" id="btn-start-single-pipeline">
+              🚀 Avvia Pipeline Paziente
+            </button>
+            <button type="button" class="btn btn-secondary" id="btn-batch-modal-open">
+              📦 Elaborazione Batch Coorte
+            </button>
+          </div>
+        </div>
+
+        <!-- Monitoraggio Real-Time Status -->
+        <div class="card">
+          <div class="card-header">
+            <h2 class="card-title">Stato Esecuzione Real-Time</h2>
+            <span class="badge badge-neutral" id="pipeline-live-badge">In attesa</span>
+          </div>
+
+          <div class="pipeline-progress-container">
+            <div class="progress-header">
+              <div class="progress-step-text" id="live-step-text">Nessun task attivo</div>
+              <div class="progress-percentage" id="live-percentage">0%</div>
+            </div>
+            <div class="progress-track">
+              <div class="progress-fill" id="live-progress-fill"></div>
+            </div>
+          </div>
+
+          <div style="display: flex; justify-content: space-between; font-size: 0.8125rem; color: var(--text-muted); margin-bottom: 0.75rem;">
+            <div>Task ID: <code id="live-task-id">-</code></div>
+            <div>Tempo trascorso: <span id="live-elapsed-time">0s</span></div>
+          </div>
+
+          <!-- Live Event Terminal Feed -->
+          <div class="event-terminal" id="pipeline-event-terminal" aria-label="Console Eventi Pipeline">
+            <div class="event-terminal-line">
+              <span class="event-time">[00:00:00]</span>
+              <span class="event-msg">Pronto per l'avvio della pipeline clinica.</span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Schede dei Documenti Elaborati nel Task -->
+      <div class="card">
+        <div class="card-header">
+          <h2 class="card-title">Referti Clinici Elaborati dall'IA</h2>
+          <span style="font-size: 0.8125rem; color: var(--text-muted);" id="live-docs-counter">0 documenti</span>
+        </div>
+        <div class="doc-cards-grid" id="live-doc-cards-grid">
+          <div style="grid-column: 1 / -1; text-align: center; color: var(--text-muted); padding: 1.5rem;">
+            I referti elaborati compariranno qui in tempo reale con i form target e i campi estratti.
+          </div>
+        </div>
+
+        <!-- JSON Output Viewer (Collapsible) -->
+        <div style="margin-top: 1.5rem;" id="result-json-wrapper" hidden>
+          <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.5rem;">
+            <h3 class="card-title" style="font-size: 0.875rem;">Dati Consolidati REDCap (Risultato Finale)</h3>
+            <button type="button" class="btn btn-secondary btn-sm" id="btn-copy-json">📋 Copia JSON</button>
+          </div>
+          <pre class="json-viewer" id="pipeline-result-json"></pre>
+        </div>
+      </div>
+    </section>
+
+    <!-- PANEL 4: DATA QUALITY & AUDIT REDCAP -->
+    <section role="tabpanel" id="panel-audit" aria-labelledby="tab-btn-audit" hidden tabindex="0">
+      <div class="card" style="margin-bottom: 1.25rem;">
+        <div class="card-header">
+          <div>
+            <h2 class="card-title">Matrice Qualità & Conformità Dati REDCap</h2>
+            <p class="card-subtitle">Verifica coerenza clinica, pTNM, margini e avanzamento form</p>
+          </div>
+          <button type="button" class="btn btn-primary" id="btn-run-full-audit">
+            🔍 Riesegui Audit Completo
+          </button>
+        </div>
+
+        <!-- Audit Summary KPIs -->
+        <div class="grid-4" style="margin-bottom: 1.25rem;">
+          <div class="card" style="background-color: var(--surface-alt);">
+            <div class="kpi-label">Pazienti Auditati</div>
+            <div class="kpi-value" id="audit-total-patients" style="font-size: 1.5rem;">-</div>
+          </div>
+          <div class="card" style="background-color: var(--surface-alt);">
+            <div class="kpi-label">Form 100% Completi</div>
+            <div class="kpi-value" id="audit-complete-records" style="font-size: 1.5rem; color: var(--status-success);">-</div>
+          </div>
+          <div class="card" style="background-color: var(--surface-alt);">
+            <div class="kpi-label">Falsi Completamenti</div>
+            <div class="kpi-value" id="audit-false-complete" style="font-size: 1.5rem; color: var(--status-warning);">-</div>
+          </div>
+          <div class="card" style="background-color: var(--surface-alt);">
+            <div class="kpi-label">Incongruenze Critiche</div>
+            <div class="kpi-value" id="audit-critical-anomalies" style="font-size: 1.5rem; color: var(--status-danger);">-</div>
+          </div>
+        </div>
+
+        <!-- Rendered Audit Report -->
+        <div class="card" style="background-color: var(--surface-alt);">
+          <h3 class="card-title" style="margin-bottom: 0.75rem;">Report Dettagliato Incongruenze e Avanzamento</h3>
+          <div id="audit-report-container" style="line-height: 1.6; font-size: 0.875rem;">
+            Caricamento audit in corso...
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- PANEL 5: RICONCILIAZIONE & SYNC -->
+    <section role="tabpanel" id="panel-sync" aria-labelledby="tab-btn-sync" hidden tabindex="0">
+      <div class="card" style="margin-bottom: 1.25rem;">
+        <div class="card-header">
+          <div>
+            <h2 class="card-title">Riconciliazione Periodica & Sync Referti Post-Operatorio</h2>
+            <p class="card-subtitle">Rileva form incompleti su REDCap e scarica nuovi referti (es. istologici definitivi)</p>
+          </div>
+          <button type="button" class="btn btn-primary" id="btn-trigger-sync">
+            🔄 Verifica & Sincronizza Aggiornamenti
+          </button>
+        </div>
+
+        <div class="table-wrapper" tabindex="0" role="region" aria-labelledby="sync-table-caption">
+          <table>
+            <caption id="sync-table-caption" style="display: none;">Pazienti con Form Incompleti su REDCap</caption>
+            <thead>
+              <tr>
+                <th>Record ID</th>
+                <th>Nominativo</th>
+                <th>Data Nascita</th>
+                <th>Form Mancanti / Incompleti</th>
+                <th>Azioni</th>
+              </tr>
+            </thead>
+            <tbody id="sync-patients-tbody">
+              <tr>
+                <td colspan="5" style="text-align: center; color: var(--text-muted); padding: 2rem;">
+                  Caricamento pazienti con form incompleti...
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <!-- PANEL 6: RECORD REDCAP -->
+    <section role="tabpanel" id="panel-redcap" aria-labelledby="tab-btn-redcap" hidden tabindex="0">
+      <div class="card">
+        <div class="card-header">
+          <div>
+            <h2 class="card-title">Database Pazienti REDCap Valduce</h2>
+            <p class="card-subtitle">Consultazione diretta dei record memorizzati nel progetto SenoNetwork</p>
+          </div>
+          <button type="button" class="btn btn-secondary btn-sm" id="btn-refresh-redcap-records">
+            Aggiorna Lista
+          </button>
+        </div>
+
+        <div class="table-wrapper" tabindex="0" role="region" aria-labelledby="redcap-table-caption">
+          <table>
+            <caption id="redcap-table-caption" style="display: none;">Record REDCap SenoNetwork</caption>
+            <thead>
+              <tr>
+                <th>Record ID</th>
+                <th>Paziente</th>
+                <th>Data Nascita</th>
+                <th>Form Completati (su 8)</th>
+                <th>Azioni</th>
+              </tr>
+            </thead>
+            <tbody id="redcap-records-tbody">
+              <tr>
+                <td colspan="5" style="text-align: center; color: var(--text-muted); padding: 2rem;">
+                  Caricamento record REDCap...
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+  </main>
+
+  <!-- Modal Impostazioni API Key -->
+  <div class="modal-overlay" id="modal-settings" hidden>
+    <div class="modal-dialog">
+      <div class="card-header">
+        <h3 class="card-title">⚙️ Configurazione Chiave API</h3>
+        <button type="button" class="btn btn-secondary btn-sm" id="btn-close-settings">✕</button>
+      </div>
+      <p style="font-size: 0.8125rem; color: var(--text-muted); margin-bottom: 1rem;">
+        Se il backend è configurato con <code>SENONETWORK_API_KEY</code>, inserisci la chiave per autorizzare le chiamate REST e le sessioni SSE in tempo reale.
+      </p>
+      <div class="form-group">
+        <label class="form-label" for="settings-api-key-input">Chiave API (Header X-API-Key)</label>
+        <input type="password" class="form-input" id="settings-api-key-input" placeholder="Incolla la chiave API...">
+      </div>
+      <div style="display: flex; justify-content: flex-end; gap: 0.5rem; margin-top: 1.25rem;">
+        <button type="button" class="btn btn-secondary" id="btn-cancel-settings">Annulla</button>
+        <button type="button" class="btn btn-primary" id="btn-save-settings">Salva Chiave</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Modal Batch Process -->
+  <div class="modal-overlay" id="modal-batch" hidden>
+    <div class="modal-dialog">
+      <div class="card-header">
+        <h3 class="card-title">📦 Elaborazione Batch Coorte</h3>
+        <button type="button" class="btn btn-secondary btn-sm" id="btn-close-batch">✕</button>
+      </div>
+      <p style="font-size: 0.8125rem; color: var(--text-muted); margin-bottom: 1rem;">
+        Esegue la pipeline di estrazione IA su un gruppo di pazienti estratti dall'ultimo foglio CUP.
+      </p>
+      <div class="form-group">
+        <label class="form-label" for="batch-limit-input">Numero Massimo Pazienti da Elaborare</label>
+        <input type="number" class="form-input" id="batch-limit-input" value="5" min="1" max="100">
+      </div>
+      <div style="display: flex; justify-content: flex-end; gap: 0.5rem; margin-top: 1.25rem;">
+        <button type="button" class="btn btn-secondary" id="btn-cancel-batch">Annulla</button>
+        <button type="button" class="btn btn-primary" id="btn-start-batch-confirm">Avvia Batch</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="/static/js/app.js"></script>
+</body>
+</html>

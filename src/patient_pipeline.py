@@ -5,7 +5,7 @@ import json
 import logging
 from pathlib import Path
 import time
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Callable, Dict, List, Optional, Union
 import urllib.parse
 from pydantic import BaseModel, Field
 import requests
@@ -155,10 +155,13 @@ class PatientPipeline:
         pdf_paths: Optional[List[Union[str, Path]]] = None,
         auto_upload: bool = True,
         output_dir: Optional[Path] = None,
-        webhook_url: Optional[str] = None
+        webhook_url: Optional[str] = None,
+        progress_callback: Optional[Callable[[str, int, Optional[Dict[str, Any]]], None]] = None
     ) -> PatientPipelineResult:
         """Executes the complete pipeline for a single patient."""
         start_time = time.time()
+        if progress_callback:
+            progress_callback(f"Inizializzazione pipeline per paziente {name or ''} {surname or patient_id}...", 5, None)
 
         # Mantenimento o generazione automatica del record_id numerico di REDCap:
         # Se il paziente esiste già su REDCap con un record_id, lo mantiene per evitare duplicati.
@@ -205,8 +208,12 @@ class PatientPipeline:
         download_dir = self.settings.downloads_dir / patient_id
         if pdf_paths:
             pdfs_to_process = [Path(p) for p in pdf_paths]
+            if progress_callback:
+                progress_callback(f"Caricati {len(pdfs_to_process)} referti PDF per {patient_id}.", 15, None)
         else:
             logger.info(f"1. Estrazione PDF da API .NET per paziente {patient_id}...")
+            if progress_callback:
+                progress_callback(f"Download referti da Priamo .NET per {patient_id}...", 10, None)
             pdfs_to_process = self.dotnet_client.download_all_patient_pdfs(
                 patient_id=patient_id,
                 destination_dir=download_dir,
@@ -217,6 +224,8 @@ class PatientPipeline:
 
         total_pdfs = len(pdfs_to_process)
         logger.info(f"-> Trovati {total_pdfs} PDF di referti per il paziente {patient_id}.")
+        if progress_callback:
+            progress_callback(f"Trovati {total_pdfs} referti PDF per {patient_id}.", 20, None)
         if total_pdfs == 0:
             logger.warning(f"-> Nessun PDF di referto associato al paziente {patient_id}. Salto l'estrazione clinica IA.")
         else:
@@ -247,6 +256,9 @@ class PatientPipeline:
             logger.info(f"2.[{idx}/{total_pdfs}] Elaborazione IA su referto: {pdf_path.name}")
             t_doc_start = time.time()
             file_hash = None
+            pct_base = 20 + int(((idx - 1) / max(total_pdfs, 1)) * 65)
+            if progress_callback:
+                progress_callback(f"[{idx}/{total_pdfs}] Analisi referto: {pdf_path.name}...", pct_base, None)
             try:
                 if pdf_path.exists():
                     file_hash = compute_file_hash(pdf_path)
@@ -364,11 +376,22 @@ class PatientPipeline:
                     )
                 )
 
+            if progress_callback and doc_results:
+                last_doc = doc_results[-1]
+                pct_doc_done = 20 + int((idx / max(total_pdfs, 1)) * 65)
+                progress_callback(
+                    f"[{idx}/{total_pdfs}] Referto '{pdf_path.name}' completato: {last_doc.fields_extracted_count} campi ({last_doc.classified_form}).",
+                    pct_doc_done,
+                    last_doc.model_dump()
+                )
+
         # Step 3: Caricamento su REDCap
         upload_status = "skipped"
         upload_response = None
 
         if auto_upload and patient_records_to_upload:
+            if progress_callback:
+                progress_callback(f"Consolidamento e caricamento dati su REDCap per {patient_id}...", 90, None)
             merged_to_upload = REDCapService.merge_flat_records(patient_records_to_upload)
             logger.info(
                 f"3. Caricamento dati estratti su REDCap ({len(patient_records_to_upload)} record estratti "
@@ -398,6 +421,13 @@ class PatientPipeline:
             redcap_upload_response=upload_response,
             total_duration_sec=round(time.time() - start_time, 2)
         )
+
+        if progress_callback:
+            progress_callback(
+                f"Pipeline completata per {patient_id}: {result.successful_pdfs}/{result.total_pdfs} referti elaborati.",
+                100,
+                {"patient_id": patient_id, "forms_populated": result.forms_populated, "upload_status": upload_status}
+            )
 
         with open(summary_file, "w", encoding="utf-8") as f:
             f.write(result.model_dump_json(indent=2))

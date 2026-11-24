@@ -77,11 +77,17 @@ def override_settings():
 # 1. Health & Root Redirect
 # ---------------------------------------------------------------------------
 
-def test_root_redirect(client):
-    """GET / should redirect to /docs."""
-    resp = client.get("/", follow_redirects=False)
-    assert resp.status_code in (301, 302, 307)
-    assert resp.headers["location"] == "/docs"
+def test_root_serves_dashboard(client):
+    """GET / and /dashboard should serve the SenoNetwork Web Dashboard."""
+    resp = client.get("/")
+    assert resp.status_code == 200
+    assert "text/html" in resp.headers["content-type"]
+    assert "SenoNetwork" in resp.text
+
+    resp_dash = client.get("/dashboard")
+    assert resp_dash.status_code == 200
+    assert "text/html" in resp_dash.headers["content-type"]
+    assert "SenoNetwork" in resp_dash.text
 
 
 def test_health_check(client):
