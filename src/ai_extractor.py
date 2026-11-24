@@ -30,7 +30,9 @@ class AIExtractor(Protocol):
         fields: List[REDCapField],
         pdf_path: str = "",
         record_id: Optional[str] = None,
-        form_name: Optional[str] = None
+        form_name: Optional[str] = None,
+        mark_form_complete: bool = True,
+        form_completion_status: str = "2"
     ) -> ExtractionResult:
         """Extracts structured clinical data according to REDCap fields."""
         ...
@@ -122,7 +124,9 @@ class BaseAIExtractor(ABC):
         fields: List[REDCapField],
         pdf_path: str = "",
         record_id: Optional[str] = None,
-        form_name: Optional[str] = None
+        form_name: Optional[str] = None,
+        mark_form_complete: bool = True,
+        form_completion_status: str = "2"
     ) -> ExtractionResult:
         """Executes full structured clinical data extraction pipeline with schema enforcement."""
         start_time = time.time()
@@ -158,7 +162,8 @@ class BaseAIExtractor(ABC):
                 fields=fields,
                 record_id=record_id,
                 form_name=form_name,
-                mark_form_complete=has_clinical_data
+                mark_form_complete=(mark_form_complete and has_clinical_data),
+                form_completion_status=form_completion_status
             )
             result.redcap_record = normalized_record
             result.status = "success"

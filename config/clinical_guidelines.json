@@ -89,13 +89,20 @@
     },
     "dati_del_paziente": {
       "title": "Dati Anagrafici e Prima Visita",
-      "description": "Anagrafica paziente, data prima visita senologica o discussione multidisciplinare.",
+      "description": "Anagrafica paziente, comorbidità anamnestiche, familiarità, data prima visita senologica o discussione multidisciplinare.",
       "general_guidelines": [
         "Estrai i dati anagrafici e demografici primari.",
+        "Estrai con accuratezza le comorbidità anamnestiche (diabete, ipoglicemia, ipertensione, tiroide, menopausa, familiarità) presenti in relazioni cliniche e visite oncologiche/chirurgiche.",
         "Estrai la data della prima visita senologica o discussione multidisciplinare."
       ],
       "field_guidelines": {
-        "first_visit_date": "Data della prima visita senologica o discussione multidisciplinare in formato YYYY-MM-DD."
+        "first_visit_date": "Data della prima visita senologica o discussione multidisciplinare in formato YYYY-MM-DD.",
+        "diabetes": "Presenza di diabete mellito (tipo 1 o 2), intolleranza glicidica, ipoglicemia clinica ricorrente o terapia con ipoglicemizzanti orali o insulina: 1=Sì, 0=No, 9=Ignoto.",
+        "hypertension": "Presenza di ipertensione arteriosa o terapia antiipertensiva: 1=Sì, 0=No, 9=Ignoto.",
+        "hypo_hyperthyroidism": "Presenza di patologie tiroidee (ipotiroidismo, ipertiroidismo, tiroidite cronica, assunzione di Eutirox/levotiroxina): 1=Sì, 0=No, 9=Ignoto.",
+        "other_comorbidities": "Presenza di altre comorbidità rilevanti nell'anamnesi (es. ipercolesterolemia, dislipidemia, fratture patologiche, patologie respiratorie o renali): 1=Sì, 0=No, 9=Ignoto.",
+        "menstrual_status": "Stato ormonale della paziente: 1=Fertile, 2=Gravidanza, 3=Menopausa (anche se indicata età es. menopausa 55aa), 4=Terapia ormonale sostitutiva, 9=Ignoto.",
+        "familiarity_for_breast_cancer": "Familiarità per carcinoma mammario/ovarico: 1=Sì (parenti affetti), 0=No (es. 'negativa per npl mamm/ovaio'), 9=Ignoto."
       }
     },
     "chemioterapia": {
@@ -108,7 +115,10 @@
       "field_guidelines": {
         "primary_chemotherapy": "Esecuzione chemioterapia primaria (neoadiuvante): 1=Sì, 0=No, 2=No per rifiuto paziente.",
         "adjuvant_chemotherapy_administered": "Esecuzione chemioterapia adiuvante: 1=Sì, 0=No, 2=No per rifiuto paziente.",
-        "adjuvant_therapy_with_biological_drugs": "Esecuzione terapia adiuvante con farmaci biologici (es. Trastuzumab/Herceptin): 1=Sì, 0=No, 2=No per rifiuto paziente."
+        "adjuvant_therapy_with_biological_drugs": "Esecuzione terapia adiuvante con farmaci biologici (es. Trastuzumab/Herceptin): 1=Sì, 0=No, 2=No per rifiuto paziente.",
+        "adjuvant_endocrine_therapy": "Trattamento ormonale adiuvante (antiestrogeno): 1=Sì, 0=No, 2=No per rifiuto paziente, 9=Ignoto.",
+        "aromatase_inhibitor_ai": "Inibitori dell'Aromatasi (I.A.) ormonoterapia adiuvante: 1=Letrozolo, 2=Anastrozolo, 3=Exemestane, 4=Altro, 0=No.",
+        "tamoxifen_adj": "Tamoxifene ormonoterapia adiuvante: 1=Sì, 0=No, 9=Ignoto."
       }
     },
     "radioterapia": {

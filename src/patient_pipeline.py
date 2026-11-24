@@ -257,21 +257,21 @@ class PatientPipeline:
                 # 2.1 Estrazione testo
                 report_text = PDFExtractor.extract_text(pdf_path)
 
-                # 2.2 Classificazione automatica del form REDCap di destinazione
-                classified_form = FormClassifier.classify_report(
+                # 2.2 Rilevazione dei form REDCap di destinazione (primario ed eventuali secondari)
+                target_forms = FormClassifier.classify_report_targets(
                     text=report_text,
                     hint=pdf_path.name,
                     settings=self.settings
                 )
-                logger.info(f"-> Referto '{pdf_path.name}' classificato per il form REDCap: '{classified_form}'")
+                logger.info(f"-> Referto '{pdf_path.name}' classificato per i form REDCap: {target_forms}")
 
                 # Se il documento è non senologico o da saltare, non invochiamo l'IA
-                if classified_form in ("skip", "irrelevant", "unknown"):
-                    logger.info(f"-> Salto referto '{pdf_path.name}' (classificato come '{classified_form}').")
+                if not target_forms or all(f in ("skip", "irrelevant", "unknown") for f in target_forms):
+                    logger.info(f"-> Salto referto '{pdf_path.name}' (nessun form senologico target).")
                     doc_results.append(
                         DocumentProcessingResult(
                             filename=pdf_path.name,
-                            classified_form=classified_form,
+                            classified_form=target_forms[0] if target_forms else "skip",
                             fields_extracted_count=0,
                             duration_sec=round(time.time() - t_doc_start, 2),
                             status="skipped",
@@ -281,63 +281,74 @@ class PatientPipeline:
                     )
                     continue
 
-                # 2.3 Estrazione strutturata dei campi del form
-                target_fields = self.get_fields_for_form(classified_form)
-                logger.info(
-                    f"-> Invio prompt al motore IA per estrazione di {len(target_fields)} campi "
-                    f"sul form '{classified_form}' (backend: {self.settings.ai_backend})..."
-                )
-                extraction_res = self.ai_extractor.extract_from_text(
-                    report_text=report_text,
-                    fields=target_fields,
-                    pdf_path=str(pdf_path),
-                    record_id=patient_id,
-                    form_name=classified_form
-                )
+                # 2.3 Estrazione strutturata iterativa per ciascun form target (Multi-Pass)
+                doc_extracted_record: Dict[str, Any] = {}
+                doc_total_clinical_count = 0
+                doc_status = "success"
+                doc_error = None
+                doc_date = PDFExtractor.extract_document_date(pdf_path, report_text)
 
-                if extraction_res.status == "success":
-                    record = extraction_res.redcap_record
-                    record["record_id"] = str(patient_id)
-                    doc_date = PDFExtractor.extract_document_date(pdf_path, report_text)
-                    record["_document_date"] = doc_date
+                valid_target_forms = [f for f in target_forms if f not in ("skip", "irrelevant", "unknown")]
+                for form_idx, target_form in enumerate(valid_target_forms):
+                    is_primary = (form_idx == 0)
+                    target_fields = self.get_fields_for_form(target_form)
+                    logger.info(
+                        f"-> [{form_idx + 1}/{len(valid_target_forms)}] Estrazione IA di {len(target_fields)} campi "
+                        f"per '{target_form}' ({'primario' if is_primary else 'secondario'})..."
+                    )
 
-                    # Conta i campi clinici effettivamente estratti ed esclude record_id e _complete
-                    clinical_fields = [
-                        k for k, v in extraction_res.extracted_data.items()
-                        if k != "record_id" and v not in ("", None, "0", [], {})
-                    ]
-                    extracted_count = len(clinical_fields)
+                    extraction_res = self.ai_extractor.extract_from_text(
+                        report_text=report_text,
+                        fields=target_fields,
+                        pdf_path=str(pdf_path),
+                        record_id=patient_id,
+                        form_name=target_form,
+                        mark_form_complete=is_primary,
+                        form_completion_status="2" if is_primary else "1"
+                    )
 
-                    if extracted_count > 0:
-                        patient_records_to_upload.append(record)
-                        forms_populated.add(classified_form)
-                        logger.info(f"-> Estratti {extracted_count} campi clinici per '{classified_form}'. Accodato per upload.")
+                    if extraction_res.status == "success":
+                        record = extraction_res.redcap_record
+                        record["record_id"] = str(patient_id)
+                        record["_document_date"] = doc_date
+
+                        clinical_fields = [
+                            k for k, v in extraction_res.extracted_data.items()
+                            if k != "record_id" and v not in ("", None, "0", [], {})
+                        ]
+                        extracted_count = len(clinical_fields)
+
+                        if extracted_count > 0:
+                            patient_records_to_upload.append(record)
+                            forms_populated.add(target_form)
+                            doc_total_clinical_count += extracted_count
+                            doc_extracted_record.update({k: v for k, v in record.items() if not k.startswith("_")})
+                            logger.info(
+                                f"-> Estratti {extracted_count} campi clinici per '{target_form}'. Accodato per upload."
+                            )
+                        else:
+                            logger.info(
+                                f"-> Nessun campo clinico utile estratto da '{pdf_path.name}' per '{target_form}'."
+                            )
                     else:
-                        logger.info(f"-> Nessun campo clinico utile estratto da '{pdf_path.name}' per '{classified_form}'. Record vuoto non accodato.")
+                        doc_status = "error"
+                        doc_error = extraction_res.error_message
+                        logger.warning(
+                            f"-> Estrazione non riuscita per '{target_form}' su '{pdf_path.name}': {extraction_res.error_message}"
+                        )
 
-                    doc_results.append(
-                        DocumentProcessingResult(
-                            filename=pdf_path.name,
-                            classified_form=classified_form,
-                            fields_extracted_count=extracted_count,
-                            duration_sec=round(time.time() - t_doc_start, 2),
-                            status="success",
-                            extracted_record=record if extracted_count > 0 else {},
-                            file_sha256=file_hash
-                        )
+                doc_results.append(
+                    DocumentProcessingResult(
+                        filename=pdf_path.name,
+                        classified_form=", ".join(valid_target_forms),
+                        fields_extracted_count=doc_total_clinical_count,
+                        duration_sec=round(time.time() - t_doc_start, 2),
+                        status=doc_status if doc_total_clinical_count > 0 or doc_status == "success" else "error",
+                        error=doc_error,
+                        extracted_record=doc_extracted_record,
+                        file_sha256=file_hash
                     )
-                else:
-                    doc_results.append(
-                        DocumentProcessingResult(
-                            filename=pdf_path.name,
-                            classified_form=classified_form,
-                            fields_extracted_count=0,
-                            duration_sec=round(time.time() - t_doc_start, 2),
-                            status="error",
-                            error=extraction_res.error_message,
-                            file_sha256=file_hash
-                        )
-                    )
+                )
 
             except Exception as e:
                 logger.error(f"Errore elaborazione PDF {pdf_path.name}: {e}")

@@ -305,6 +305,8 @@ class FormClassifier:
                 return "anatomia_patologica"
             if any(r in lower_hint for r in ["mammo", "eco", "rmn", "mri", "marcatura"]):
                 return "radiologia"
+            if any(o in lower_hint for o in ["oncolog", "chemioter"]):
+                return "chemioterapia"
             if "visita" in lower_hint:
                 if "diagnostica per immagini" in lower_text or "mammografia" in lower_text or "eco mammaria" in lower_text:
                     return "radiologia"
@@ -366,7 +368,18 @@ class FormClassifier:
             return "radioterapia"
 
         # Chemioterapia / Oncologia
-        if "chemioterapia" in lower_text or "schema ac" in lower_text or "trastuzumab" in lower_text or "letrozolo" in lower_text:
+        if (
+            "chemioterapia" in lower_text
+            or "schema ac" in lower_text
+            or "trastuzumab" in lower_text
+            or "letrozolo" in lower_text
+            or "anastrozolo" in lower_text
+            or "tamoxifene" in lower_text
+            or "antiestrogeno" in lower_text
+            or "visita oncologica" in lower_text
+            or "u.o.s. di oncologia" in lower_text
+            or "u.o.c. di ematologia e oncologia" in lower_text
+        ):
             return "chemioterapia"
 
         # Recidiva
@@ -436,3 +449,108 @@ class FormClassifier:
             return "radiologia"
 
         return "skip"
+
+    @staticmethod
+    def classify_report_targets(
+        text: str,
+        hint: Optional[str] = None,
+        settings: Optional[Settings] = None,
+        ollama_url: Optional[str] = None,
+        ollama_model: Optional[str] = None
+    ) -> List[str]:
+        """Determines all target REDCap forms for a report (primary and optional secondary forms).
+
+        Composite medical documents (e.g. oncology visits, surgical discharge letters,
+        multidisciplinary visits) often contain information across multiple clinical domains:
+        - Oncology visit: primary 'chemioterapia' + secondary 'dati_del_paziente' (comorbidities,
+          diabetes, hypoglycemia, hypertension, thyroid) + optional 'radioterapia' (if radiation doses/gy mentioned).
+        - Surgical discharge / visit: primary 'struttura_della_lesione' + secondary 'dati_del_paziente'.
+        - Multidisciplinary visit: primary 'dati_del_paziente' + secondary 'radiologia' / 'anatomia_patologica_preoperatoria' / 'chemioterapia'.
+
+        Returns:
+            List of target form names (e.g. ['chemioterapia', 'dati_del_paziente']).
+            If irrelevant or non-senological, returns ['skip'].
+        """
+        primary = FormClassifier.classify_report(
+            text=text,
+            hint=hint,
+            settings=settings,
+            ollama_url=ollama_url,
+            ollama_model=ollama_model
+        )
+        if primary in ("skip", "irrelevant", "unknown"):
+            return [primary]
+
+        targets = [primary]
+        lower_text = text.lower()
+        lower_hint = hint.lower() if hint else ""
+
+        is_oncology = any(k in lower_hint for k in ["oncolog", "chemioter"]) or any(k in lower_text for k in [
+            "visita oncologica", "u.o.s. di oncologia", "u.o.c. di ematologia e oncologia",
+            "antiestrogeno", "chemioterapia", "anastrozolo", "letrozolo", "tamoxifene",
+            "trastuzumab"
+        ])
+
+        is_surgery_or_discharge = (
+            primary == "struttura_della_lesione"
+            or any(k in lower_hint for k in ["dimissione", "verbale_operatorio", "intervento"])
+            or any(k in lower_text for k in ["lettera di dimissione", "verbale operatorio", "decorso post-operatorio"])
+        )
+
+        is_multidisciplinary = "multidisciplinare" in lower_hint or any(k in lower_text for k in [
+            "visita multidisciplinare", "meeting multidisciplinare", "riunione multidisciplinare"
+        ])
+
+        has_anamnesis_or_comorbidity = any(k in lower_text for k in [
+            "anamnesi", "comorbidit", "pat remota", "pat. remota", "fisiologica",
+            "diabete", "ipoglicem", "ipertens", "tiroid", "eutirox", "cardiopat",
+            "menopausa", "familiarit", "brca"
+        ])
+
+        has_chemo_or_endocrine = any(k in lower_text for k in [
+            "chemioterapia", "anastrozolo", "letrozolo", "tamoxifene", "trastuzumab",
+            "antiestrogeno", "ormonoterapia", "schema ac", "taxani", "adiuvante"
+        ])
+
+        has_radiotherapy = (
+            "radioterapia" in lower_text
+            and any(k in lower_text for k in ["gray", "gy", "imrt", "irradiazione", "tot 48gy", "sib"])
+        )
+
+        has_biopsy_summary = any(k in lower_text for k in [
+            "tru-cut", "core biopsy", "agobiopsia", "agoaspirato", "citologico c"
+        ])
+
+        # Rule 1: Oncology visit / report
+        if is_oncology:
+            if "chemioterapia" not in targets:
+                targets.append("chemioterapia")
+            if has_anamnesis_or_comorbidity and "dati_del_paziente" not in targets:
+                targets.append("dati_del_paziente")
+            if has_radiotherapy and "radioterapia" not in targets:
+                targets.append("radioterapia")
+
+        # Rule 2: Surgery / Discharge summary
+        elif is_surgery_or_discharge:
+            if has_anamnesis_or_comorbidity and "dati_del_paziente" not in targets:
+                targets.append("dati_del_paziente")
+
+        # Rule 3: Multidisciplinary visit
+        elif is_multidisciplinary:
+            if "dati_del_paziente" not in targets:
+                targets.insert(0, "dati_del_paziente")
+            if has_chemo_or_endocrine and "chemioterapia" not in targets:
+                targets.append("chemioterapia")
+            if any(k in lower_text for k in ["mammografia", "ecografia", "birads", "bi-rads"]) and "radiologia" not in targets:
+                targets.append("radiologia")
+            if has_biopsy_summary and "anatomia_patologica_preoperatoria" not in targets:
+                targets.append("anatomia_patologica_preoperatoria")
+
+        # Rule 4: General medical visit (dati_del_paziente) with therapies mentioned
+        elif primary == "dati_del_paziente":
+            if has_chemo_or_endocrine and "chemioterapia" not in targets:
+                targets.append("chemioterapia")
+            if has_radiotherapy and "radioterapia" not in targets:
+                targets.append("radioterapia")
+
+        return targets

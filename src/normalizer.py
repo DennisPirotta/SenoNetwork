@@ -14,7 +14,8 @@ class REDCapNormalizer:
         record_id: Optional[str] = None,
         default_record_id_field: str = "record_id",
         form_name: Optional[str] = None,
-        mark_form_complete: bool = True
+        mark_form_complete: bool = True,
+        form_completion_status: str = "2"
     ) -> Dict[str, Any]:
         """Converts extracted key-value dictionary into a valid REDCap record dictionary.
 
@@ -24,7 +25,8 @@ class REDCapNormalizer:
             record_id: Optional specific record ID.
             default_record_id_field: Name of the primary key field (usually 'record_id').
             form_name: Optional instrument name to set <form_name>_complete status.
-            mark_form_complete: If True, sets <form_name>_complete to '2' (Complete).
+            mark_form_complete: If True, sets <form_name>_complete to form_completion_status.
+            form_completion_status: Form completion code: '0' (Incomplete), '1' (Unverified), '2' (Complete).
 
         Returns:
             Flat dictionary ready for REDCap API or CSV import.
@@ -118,7 +120,7 @@ class REDCapNormalizer:
             if k not in (default_record_id_field, f"{form_name}_complete") and not (k.endswith("___0") and v == "0")
         )
         if form_name and mark_form_complete and has_clinical_values:
-            record[f"{form_name}_complete"] = "2"
+            record[f"{form_name}_complete"] = str(form_completion_status)
 
         return record
 
