@@ -87,6 +87,45 @@ def test_classify_report_targets_multidisciplinary_composite():
     assert "anatomia_patologica_preoperatoria" in targets
 
 
+def test_classify_report_targets_multidisciplinary_postop_histology():
+    """Tests multidisciplinary meeting reports matching 'Lettera Multidisciplinare.odt' schema.
+    When 'INTERVENTO ESEGUITO' and 'ESAME ISTOLOGICO DEFINITIVO' are populated,
+    the patient underwent surgery and post-op histology is available.
+    Therefore, targets must include both 'struttura_della_lesione' and 'anatomia_patologica'.
+    """
+    text_mdm_postop = """
+    GRUPPO MULTIDISCIPLINARE BREAST UNIT
+    Nome Cognome: Rossi Maria, Data Nascita: 1965-04-12
+    ANAMNESI PATOLOGICA REMOTA: Ipertensione arteriosa
+    FAMILIARITA'/FATTORI DI RISCHIO: Negativa npl mammaria. Menopausa a 52 anni.
+
+    DIAGNOSI PREOPERATORIA
+    Mammografia clinica: lesione nodulare sospetta.
+    Microbiopsia con tru-cut: B5, ER 90%, PgR 80%, Ki-67 15%, HER2 negativo.
+
+    MEETING MULTIDISCIPLINARE in data 10/01/2026: indicata chirurgia conservativa.
+
+    INTERVENTO ESEGUITO
+    In data 20/01/2026 è stato eseguito intervento di quadrantectomia supero-esterna destra e biopsia del linfonodo sentinella.
+
+    ESAME ISTOLOGICO DEFINITIVO
+    pT 1c G 2 N 0(sn)
+    ER 95% PR 85% Ki67 18% Her2 score 1+
+    margini chirurgici indenni (> 5 mm).
+
+    MEETING MULTIDISCIPLINARE DATA 05/02/2026: indicata radioterapia adiuvante + ormonoterapia.
+    """
+    targets = FormClassifier.classify_report_targets(
+        text=text_mdm_postop,
+        hint="2026_LETTERA_MULTIDISCIPLINARE.pdf"
+    )
+    assert "dati_del_paziente" in targets
+    assert "radiologia" in targets
+    assert "anatomia_patologica_preoperatoria" in targets
+    assert "struttura_della_lesione" in targets
+    assert "anatomia_patologica" in targets
+
+
 def test_normalizer_form_completion_status():
     field = REDCapField(
         field_name="diabetes",

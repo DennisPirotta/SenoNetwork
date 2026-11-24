@@ -502,7 +502,8 @@ class FormClassifier:
         )
 
         is_multidisciplinary = "multidisciplinare" in lower_hint or any(k in lower_text for k in [
-            "visita multidisciplinare", "meeting multidisciplinare", "riunione multidisciplinare"
+            "visita multidisciplinare", "meeting multidisciplinare", "riunione multidisciplinare",
+            "gruppo multidisciplinare", "breast unit"
         ])
 
         has_anamnesis_or_comorbidity = any(k in lower_text for k in [
@@ -522,8 +523,26 @@ class FormClassifier:
         )
 
         has_biopsy_summary = any(k in lower_text for k in [
-            "tru-cut", "core biopsy", "agobiopsia", "agoaspirato", "citologico c"
+            "tru-cut", "core biopsy", "agobiopsia", "agoaspirato", "citologico c", "vab", "b5"
         ])
+
+        has_surgery_section = any(k in lower_text for k in [
+            "intervento eseguito", "stato eseguito intervento di", "tipo di intervento",
+            "quadrantectomia", "mastectomia", "linfonodo sentinella", "dissezione ascellare"
+        ])
+
+        has_postop_histology = (
+            any(k in lower_text for k in [
+                "esame istologico definitivo",
+                "istologico definitivo",
+                "istologia definitiva",
+                "esame istopatologico definitivo",
+            ])
+            or (
+                any(k in lower_text for k in ["pezzo operatorio", "quadrantectomia", "mastectomia"])
+                and any(k in lower_text for k in ["pt1", "pt2", "pt3", "pt4", "ptis", "pn0", "pn1", "pn2", "pn3", "margini"])
+            )
+        )
 
         # Rule 1: Oncology visit / report
         if is_oncology:
@@ -549,6 +568,14 @@ class FormClassifier:
                 targets.append("radiologia")
             if has_biopsy_summary and "anatomia_patologica_preoperatoria" not in targets:
                 targets.append("anatomia_patologica_preoperatoria")
+            # Sezione intervento chirurgico eseguito
+            if has_surgery_section and "struttura_della_lesione" not in targets:
+                targets.append("struttura_della_lesione")
+            # Sezione istologico definitivo popolata: il paziente è stato operato ed è presente il referto post-operatorio
+            if has_postop_histology and "anatomia_patologica" not in targets:
+                targets.append("anatomia_patologica")
+            if has_radiotherapy and "radioterapia" not in targets:
+                targets.append("radioterapia")
 
         # Rule 4: General medical visit (dati_del_paziente) with therapies mentioned
         elif primary == "dati_del_paziente":

@@ -8,7 +8,8 @@
       "general_guidelines": [
         "Distingui chiaramente tra esame citologico (agoaspirato/FNA: classificazione C1-C5) e microistologico (core biopsy Tru-cut o VABB: classificazione B1-B5).",
         "Per core biopsy (Tru-cut / VABB), assegna rigorosamente la categoria B (B1=non diagnostico, B2=benigno, B3=dubbio a incerto potenziale di malignità, B4=sospetto di malignità, B5=positivo per carcinoma).",
-        "Se result_cb non è '4' o '5' (non è B4/B5), i campi histological_type_b4_b5, istotype, nuclear_grade e i recettori biologici DEVONO essere rigorosamente null."
+        "Se result_cb non è '4' o '5' (non è B4/B5), i campi histological_type_b4_b5, istotype, nuclear_grade e i recettori biologici DEVONO essere rigorosamente null.",
+        "Nei verbali del Gruppo Multidisciplinare (Breast Unit), estrai in questo form esclusivamente i dati della sezione 'DIAGNOSI PREOPERATORIA' (microbiopsia con Tru-cut, VAB, categoria B5, grading pre-operatorio e recettori ER, PgR, Ki-67, HER2 su biopsia). Non estrarre assolutamente i dati della sezione 'ESAME ISTOLOGICO DEFINITIVO', che afferiscono al form post-operatorio anatomia_patologica."
       ],
       "field_guidelines": {
         "result_cb": "Estrai l'esito della core biopsy (agobiopsia / Tru-cut / VAAB / VABB): 0=Non eseguito, 1=B1 (Inadeguato/Normale), 2=B2 (Benigno: fibroadenoma, mastopatia, adenosi), 3=B3 (Dubbio / lesione a incerto potenziale di malignità: LIN, FEA, papilloma, cicatrice sclerosante, tumore filloide benigno), 4=B4 (Sospetto di malignità), 5=B5 (Positivo per carcinoma: in situ o invasivo). Assegna la sola cifra corrispondente alla classe B.",
@@ -31,6 +32,7 @@
       "title": "Anatomia Patologica Definitiva (Pezzo Operatorio Chirurgico)",
       "description": "Referto istologico definitivo post-operatorio del pezzo asportato (tumorectomia, quadrantectomia, mastectomia, linfonodo sentinella, dissezione ascellare).",
       "general_guidelines": [
+        "Nei referti e verbali del Gruppo Multidisciplinare (Breast Unit), quando la sezione 'ESAME ISTOLOGICO DEFINITIVO' è presente e popolata, significa che il paziente è stato sottoposto a chirurgia mammaria ed è disponibile l'esito post-operatorio: estrai qui tutti i parametri definitivi sul pezzo operatorio (stadiazione pT, stadiazione linfonodale N/pN, grading G, assetto biologico ER, PR, Ki67, HER2 e stato dei margini chirurgici). Non estrarre i dati della sezione 'DIAGNOSI PREOPERATORIA' (che contiene solo la microbiopsia pre-operatoria).",
         "Estrai la diagnosi istologica definitiva sul pezzo operatorio, le dimensioni del tumore (mm), la stadiazione pT e pN, il grading istologico (G1, G2, G3) e l'assetto recettoriale definitivo.",
         "Non confondere l'esame istologico definitivo con la biopsia pre-operatoria o con l'esame estemporaneo intraoperatorio al congelatore.",
         "Per il linfonodo sentinella con metodica OSNA, estrai il conteggio copie CK19 e assegna l'esito corretto (negativo, micrometastasi, macrometastasi)."
@@ -56,6 +58,7 @@
       "description": "Intervento chirurgico mammaria e ascellare (visita chirurgica, cartella operatoria, dimissione).",
       "general_guidelines": [
         "Collega sempre i referti di Chirurgia Senologica a questo form.",
+        "Nei verbali del Gruppo Multidisciplinare (Breast Unit), se è presente la sezione 'INTERVENTO ESEGUITO' ('In data ... è stato eseguito intervento di...'), estrai la data dell'intervento e il tipo di procedura chirurgica mammaria (es. quadrantectomia, mastectomia) ed eventuale biopsia del linfonodo sentinella o dissezione ascellare.",
         "Estrai la data dell'intervento, la tipologia di chirurgia conservativa vs mastectomia e gli atti chirurgici ascellari (SLNB vs dissezione)."
       ],
       "field_guidelines": {
@@ -92,6 +95,7 @@
       "description": "Anagrafica paziente, comorbidità anamnestiche, familiarità, data prima visita senologica o discussione multidisciplinare.",
       "general_guidelines": [
         "Estrai i dati anagrafici e demografici primari.",
+        "Nei verbali del Gruppo Multidisciplinare (Breast Unit), estrai l'anamnesi patologica remota, la familiarità/fattori di rischio (neoplasia mammaria/ovaio, parità G P, allattamento, menopausa, fumo) e la data del meeting multidisciplinare come first_visit_date.",
         "Estrai con accuratezza le comorbidità anamnestiche (diabete, ipoglicemia, ipertensione, tiroide, menopausa, familiarità) presenti in relazioni cliniche e visite oncologiche/chirurgiche.",
         "Estrai la data della prima visita senologica o discussione multidisciplinare."
       ],
