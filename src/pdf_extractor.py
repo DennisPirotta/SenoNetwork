@@ -86,13 +86,13 @@ class PDFExtractor:
         path = Path(pdf_path)
         doc_text = text if text is not None else (PDFExtractor.extract_text(path) if path.is_file() else "")
 
-        # 1. Search for explicit date labels in Italian medical reports
-        patterns = [
-            r'(?:data\s*ref(?:erto)?|data\s*acc(?:ettazione)?|data\s*esame|eseguito\s*il|data\s*visita|referto\s*del|data\s*:|in\s*data|del|l[iì])\s*[:\s]*(\d{1,2}[./\-]\d{1,2}[./\-]\d{4})',
-            r'(\d{1,2}[./\-]\d{1,2}[./\-]\d{4})\s*alle\s*ore',
-            r'firmato\s*digitalmente[^\n]*?il\s*(\d{1,2}[./\-]\d{1,2}[./\-]\d{4})'
+        # 1. Search for explicit date labels in Italian medical reports (highest priority)
+        explicit_patterns = [
+            r'(?:data\s*ref(?:erto)?|data\s*acc(?:ettazione)?|data\s*esame|data\s*prelievo|eseguito\s*il|data\s*visita|data\s*:)\s*[:\s]*(\d{1,2}[./\-]\d{1,2}[./\-]((?:19|20)\d{2}))',
+            r'firmato\s*digitalmente[^\n]*?il\s*(\d{1,2}[./\-]\d{1,2}[./\-]((?:19|20)\d{2}))',
+            r'(\d{1,2}[./\-]\d{1,2}[./\-]((?:19|20)\d{2}))\s*alle\s*ore',
         ]
-        for pat in patterns:
+        for pat in explicit_patterns:
             m = re.search(pat, doc_text, re.IGNORECASE)
             if m:
                 raw = m.group(1).replace('/', '-').replace('.', '-')
@@ -102,8 +102,22 @@ class PDFExtractor:
                     if len(y) == 4 and 1 <= int(mth) <= 12 and 1 <= int(d) <= 31:
                         return f"{y}-{int(mth):02d}-{int(d):02d}"
 
-        # 2. Any recent date in text (2020-2030)
-        for m in re.finditer(r'\b(\d{1,2})[./\-](\d{1,2})[./\-](202\d)\b', doc_text):
+        # 2. Secondary contextual date markers (e.g. "referto del", "del", "li")
+        secondary_patterns = [
+            r'(?:referto\s*del|in\s*data|del|l[iì])\s*[:\s]*(\d{1,2}[./\-]\d{1,2}[./\-]((?:19|20)\d{2}))',
+        ]
+        for pat in secondary_patterns:
+            m = re.search(pat, doc_text, re.IGNORECASE)
+            if m:
+                raw = m.group(1).replace('/', '-').replace('.', '-')
+                parts = raw.split('-')
+                if len(parts) == 3:
+                    d, mth, y = parts
+                    if len(y) == 4 and 1 <= int(mth) <= 12 and 1 <= int(d) <= 31:
+                        return f"{y}-{int(mth):02d}-{int(d):02d}"
+
+        # 3. Any standard date in text (1900-2099)
+        for m in re.finditer(r'\b(\d{1,2})[./\-](\d{1,2})[./\-]((?:19|20)\d{2})\b', doc_text):
             d, mth, y = m.group(1), m.group(2), m.group(3)
             if 1 <= int(mth) <= 12 and 1 <= int(d) <= 31:
                 return f"{y}-{int(mth):02d}-{int(d):02d}"

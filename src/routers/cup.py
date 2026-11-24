@@ -418,7 +418,7 @@ def export_cup_patients(
         )
     elif format == "xlsx":
         buf = io.BytesIO()
-        with pd.ExcelWriter(buf, engine="calamine") as writer:
+        with pd.ExcelWriter(buf, engine="openpyxl") as writer:
             df.to_excel(writer, index=False, sheet_name="Pazienti")
         buf.seek(0)
         return StreamingResponse(

@@ -384,27 +384,30 @@ class REDCapService:
 
         Returns the native REDCap 'record_id' if found, preserving the original project
         primary key and avoiding accidental creation of duplicate patient records.
+        Strictly requires date_of_birth to match to prevent dangerous cross-contamination of homonyms.
         If numeric_only is True, ignores legacy slug IDs and returns only numeric record_ids.
         """
-        if not name or not surname:
+        if not name or not surname or not date_of_birth:
             return None
 
         clean_name = name.strip().lower()
         clean_surname = surname.strip().lower()
         dob_str = ""
-        if date_of_birth:
-            if isinstance(date_of_birth, date):
-                dob_str = date_of_birth.strftime("%Y-%m-%d")
-            else:
-                s = str(date_of_birth).strip()
-                for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%Y/%m/%d", "%d-%m-%Y"):
-                    try:
-                        dob_str = datetime.strptime(s[:10], fmt).strftime("%Y-%m-%d")
-                        break
-                    except ValueError:
-                        continue
-                if not dob_str:
-                    dob_str = s
+        if isinstance(date_of_birth, date):
+            dob_str = date_of_birth.strftime("%Y-%m-%d")
+        else:
+            s = str(date_of_birth).strip()
+            for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%Y/%m/%d", "%d-%m-%Y"):
+                try:
+                    dob_str = datetime.strptime(s[:10], fmt).strftime("%Y-%m-%d")
+                    break
+                except ValueError:
+                    continue
+            if not dob_str:
+                dob_str = s
+
+        if not dob_str:
+            return None
 
         try:
             records = self.export_records_from_api(
@@ -416,11 +419,10 @@ class REDCapService:
                 r_dob = str(r.get("date_of_birth") or "").strip()
                 rid = str(r.get("record_id") or "").strip()
 
-                if r_name == clean_name and r_surname == clean_surname:
-                    if not dob_str or not r_dob or r_dob == dob_str:
-                        if numeric_only and not rid.isdigit():
-                            continue
-                        return rid
+                if r_name == clean_name and r_surname == clean_surname and r_dob and r_dob == dob_str:
+                    if numeric_only and not rid.isdigit():
+                        continue
+                    return rid
         except Exception as e:
             logger.warning(f"Errore ricerca record_id su REDCap tramite anagrafica: {e}")
 
@@ -457,8 +459,12 @@ class REDCapService:
                     if rid and str(rid).isdigit():
                         numeric_ids.append(int(rid))
                 candidate_num = max(numeric_ids) + 1 if numeric_ids else 1
-            except Exception:
-                candidate_num = 1
+            except Exception as e:
+                logger.error(f"Errore critico nel calcolo del prossimo record_id da REDCap: {e}")
+                raise RuntimeError(
+                    "Impossibile generare record_id REDCap: chiamata API generateNextRecordName "
+                    f"e recupero degli ID esistenti falliti ({e})."
+                ) from e
 
         # Assicura che l'ID non collida con ID già allocati in questa sessione
         while str(candidate_num) in self._allocated_record_ids:

@@ -120,7 +120,7 @@ class PriamoClient:
         self.username = username or cfg.priamo_username or os.getenv("PRIAMO_USERNAME", "")
         self.password = password or cfg.priamo_password or os.getenv("PRIAMO_PASSWORD", "")
         self.max_workers = max_workers or getattr(cfg, "priamo_max_workers", 8)
-        self._auth_lock = threading.Lock()
+        self._auth_lock = threading.RLock()
         self.cf_client_id = (
             cf_client_id
             or getattr(cfg, "priamo_cloudflared_client_id", None)
@@ -169,8 +169,8 @@ class PriamoClient:
         kwargs.setdefault("timeout", 15)
         response = self.session.request(method, url, **kwargs)
 
-        # Handle session expiry and re-authenticate
-        if response.status_code in (401, 403):
+        # Handle session expiry and re-authenticate (avoid recursive calls if failing on login page)
+        if response.status_code in (401, 403) and url != self.login_page_url:
             logger.warning("Sessione Priamo scaduta o non autorizzata, ri-autenticazione in corso...")
             self.authenticate(force=True)
             response = self.session.request(method, url, **kwargs)

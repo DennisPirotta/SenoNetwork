@@ -127,12 +127,15 @@ class DotNetApiClient:
             except Exception:
                 pass
 
-        # Treat identifier directly as idAnagPaz1
-        return PriamoPatient(
-            patient_id=identifier,
-            name="Paziente",
-            surname=identifier
-        )
+        # If identifier is numeric and represents a known Priamo patient ID (> 2 digits)
+        if identifier.isdigit() and len(identifier) > 2:
+            return PriamoPatient(
+                patient_id=identifier,
+                name="Paziente",
+                surname=identifier
+            )
+
+        return None
 
     def verify_patient_in_priamo(
         self,
@@ -236,13 +239,15 @@ class DotNetApiClient:
                     if pdfs:
                         return pdfs
 
-        # Also check if files in data/input_pdf contain any candidate_id in their filename
+        # Also check if files in data/input_pdf contain candidate_id with token boundary matching
+        # (prevents loose substring matching where digit '1' matched 'referto_01' or 'SENO1142')
         input_pdf_dir = Path("data/input_pdf")
         if input_pdf_dir.exists():
             for cid in candidate_ids:
+                cid_pattern = re.compile(rf"(?:^|[_\-\s]){re.escape(cid.lower())}(?:[_\-\s]|$)", re.IGNORECASE)
                 matched = [
                     p for p in sorted(list(input_pdf_dir.glob("*.pdf")) + list(input_pdf_dir.glob("*.PDF")))
-                    if cid.lower() in p.stem.lower()
+                    if cid_pattern.search(p.stem) or cid.lower() == p.stem.lower()
                 ]
                 if matched:
                     return matched

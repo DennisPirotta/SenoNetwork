@@ -2,8 +2,10 @@
 
 import json
 from pathlib import Path
+import time
 from typing import Any, Dict, List, Optional
-from fastapi import APIRouter, Depends, HTTPException, Query
+import uuid
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 
 from src.config import Settings, get_settings
@@ -112,14 +114,12 @@ def sync_check_updates_sync(
 
 @router.post("/api/sync/check-updates-async", dependencies=[Depends(verify_api_key)], response_model=AsyncTaskResponse)
 def sync_check_updates_async(
-    background_tasks: Any,
+    background_tasks: BackgroundTasks,
     req: Optional[SyncTriggerRequest] = None,
     sync_service: RedCapSyncService = Depends(get_sync_service)
 ) -> AsyncTaskResponse:
     """Accoda il sync in background e ritorna immediatamente un task_id."""
     from src.routers.pipeline import _tasks_store
-    import uuid
-    import time
 
     params = req or SyncTriggerRequest()
     task_id = str(uuid.uuid4())

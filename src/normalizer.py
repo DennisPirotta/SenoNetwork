@@ -1,7 +1,10 @@
 import difflib
+import logging
 import re
 from typing import Any, Dict, List, Optional
 from src.models import REDCapField
+
+logger = logging.getLogger(__name__)
 
 
 class REDCapNormalizer:
@@ -165,6 +168,26 @@ class REDCapNormalizer:
         # Convert unquoted integer comparisons (e.g. == 1 -> == '1')
         expr = re.sub(r"([=!<>]=?\s*)(\d+)(?!\w|\'|\")", r'\1"\2"', expr)
 
+        # Convert inequality comparisons with numeric operands to float comparison
+        # (e.g. '100' > '50' -> (100.0 > 50.0) instead of lexical string comparison where '100' < '50')
+        def replace_inequality(m):
+            left = m.group(1).strip("'\"")
+            op = m.group(2)
+            right = m.group(3).strip("'\"")
+            try:
+                left_f = float(left)
+                right_f = float(right)
+                return f"({left_f} {op} {right_f})"
+            except (ValueError, TypeError):
+                # If either operand cannot be cast to float in an inequality, condition is not satisfied
+                return "False"
+
+        expr = re.sub(
+            r"(\'[^\']*\'|\"[^\"]*\"|-?\d+(?:\.\d+)?)\s*(<=|>=|<|>)\s*(\'[^\']*\'|\"[^\"]*\"|-?\d+(?:\.\d+)?)",
+            replace_inequality,
+            expr
+        )
+
         try:
             res = eval(expr, {"__builtins__": {}}, {})
             return bool(res)
@@ -210,20 +233,27 @@ class REDCapNormalizer:
         if best_code is not None and best_ratio >= 0.80:
             return best_code
 
-        # Fallback to raw string
-        return str_val
+        # Fallback: return empty string instead of raw unmapped text to prevent REDCap API batch rejection
+        logger.debug(f"Valore '{str_val}' non corrisponde ad alcuna scelta valida in REDCap. Valore azzerato.")
+        return ""
 
     @staticmethod
     def _normalize_boolean(val: Any) -> str:
-        """Normalizes boolean-like values to '1' (Yes/True) or '0' (No/False)."""
+        """Normalizes boolean-like values to '1' (Yes/True) or '0' (No/False).
+        Ambiguous, undetermined, or empty clinical findings return '' to avoid falsifying clinical records.
+        """
+        if val is None:
+            return ""
         if isinstance(val, bool):
             return "1" if val else "0"
         str_val = str(val).strip().lower()
+        if str_val in {"", "none", "null", "n.d.", "nd", "non pervenuto", "non disponibile", "non valutabile", "non determinabile", "dubbio", "sconosciuto", "inconcludente", "non eseguito"}:
+            return ""
         if str_val in {"1", "si", "sì", "yes", "true", "vero", "presente", "positivo"}:
             return "1"
         if str_val in {"0", "no", "false", "falso", "assente", "negativo"}:
             return "0"
-        return "0"
+        return ""
 
     @staticmethod
     def _normalize_checkbox_selection(val: Any, choices: Dict[str, str]) -> List[str]:

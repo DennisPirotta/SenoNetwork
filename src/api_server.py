@@ -78,16 +78,21 @@ app = FastAPI(
     openapi_tags=openapi_tags,
 )
 
-# CORS Middleware per consentire chiamate dalla dashboard web esterna
-origins = settings.cors_origins
-if "*" in origins:
-    allow_origins = ["*"]
-else:
-    allow_origins = origins
+# CORS Middleware per consentire chiamate dalla dashboard web
+# Se allow_credentials=True, non consentire wildcard '*' per evitare riflessione arbitraria dell'Origin
+configured_origins = [o for o in settings.cors_origins if o != "*"]
+if not configured_origins:
+    configured_origins = [
+        "http://localhost:8000",
+        "http://127.0.0.1:8000",
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        "http://localhost:3000",
+    ]
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=allow_origins,
+    allow_origins=configured_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -110,17 +115,16 @@ def health_check(settings: Settings = Depends(get_shared_settings)):
     )
     dotnet = DotNetApiClient(settings=settings)
 
+    # Esponi URL interni solo se esplicitamente non protetti da chiave o in localhost
     return {
         "status": "online",
         "version": "2.0.0",
         "ai_backend_configured": settings.ai_backend,
         "llama_cpp_rpc_available": llamacpp.is_available(),
-        "llama_cpp_base_url": settings.llama_cpp_base_url,
         "ollama_available": ollama.is_available(),
         "ollama_model": settings.ollama_model,
         "redcap_configured": bool(settings.redcap_api_url and settings.redcap_api_token),
         "priamo_dotnet_configured": dotnet.is_priamo_configured,
-        "priamo_cup_url": settings.priamo_cup_url,
         "api_key_required": bool(settings.api_key and settings.api_key.strip())
     }
 

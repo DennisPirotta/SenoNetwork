@@ -4,6 +4,7 @@ import ipaddress
 import json
 import logging
 from pathlib import Path
+import re
 import time
 from typing import Any, Callable, Dict, List, Optional, Union
 import urllib.parse
@@ -163,6 +164,13 @@ class PatientPipeline:
         if progress_callback:
             progress_callback(f"Inizializzazione pipeline per paziente {name or ''} {surname or patient_id}...", 5, None)
 
+        # Sanitizzazione rigorosa di patient_id per prevenire Path Traversal
+        raw_id = str(patient_id or "").strip()
+        safe_patient_id = re.sub(r"[^a-zA-Z0-9_\-]", "_", Path(raw_id).name).strip("_")
+        if not safe_patient_id:
+            safe_patient_id = "patient_unknown"
+        patient_id = safe_patient_id
+
         # Mantenimento o generazione automatica del record_id numerico di REDCap:
         # Se il paziente esiste già su REDCap con un record_id, lo mantiene per evitare duplicati.
         # Se l'identificatore è lo slug nome-cognome-dob, genera automaticamente il prossimo record_id numerico da REDCap.
@@ -316,7 +324,7 @@ class PatientPipeline:
                         record_id=patient_id,
                         form_name=target_form,
                         mark_form_complete=is_primary,
-                        form_completion_status="2" if is_primary else "1"
+                        form_completion_status="1" if is_primary else "0"
                     )
 
                     if extraction_res.status == "success":
@@ -326,7 +334,7 @@ class PatientPipeline:
 
                         clinical_fields = [
                             k for k, v in extraction_res.extracted_data.items()
-                            if k != "record_id" and v not in ("", None, "0", [], {})
+                            if k != "record_id" and v not in ("", None, [], {}) and not (k.endswith("___0") and v == "0")
                         ]
                         extracted_count = len(clinical_fields)
 

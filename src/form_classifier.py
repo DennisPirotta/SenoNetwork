@@ -328,23 +328,27 @@ class FormClassifier:
         ) and ("diagnosi istopatologica" not in lower_text and "frustoli" not in lower_text):
             return "struttura_della_lesione"
 
-        # 3.2 Istologico definitivo post-operatorio e biologia molecolare / OSNA
+        # 3.2 Biopsia / Citologia pre-operatoria (Core Biopsy, agobioptici, frustoli, FNA)
+        # Valutata prima dell'istologico definitivo post-operatorio per evitare che termini come
+        # "frustoli agobioptici" attivino erroneamente "pt" o "diagnosi istopatologica"
         if (
-            ("pezzo operatorio" in lower_text or "quadrantectomia" in lower_text or "mastectomia" in lower_text or "istologico definitivo" in lower_text or "diagnosi istopatologica" in lower_text)
-            and ("margini" in lower_text or "pt" in lower_text or "pn" in lower_text or "linfonodo sentinella" in lower_text or "ptis" in lower_text)
+            ("frustoli" in lower_text or "agobioptici" in lower_text or "core biopsy" in lower_text or "agobiopsia" in lower_text)
+            or ("agoaspirato" in lower_text and ("fna" in lower_text or "citologico" in lower_text or any(f"c{i}" in lower_text for i in range(1, 6))))
+            or "esame citologico da agoaspirat" in lower_text
+            or bool(re.search(r"\b(b[1-5]|c[1-5])\b", lower_text))
+        ):
+            return "anatomia_patologica_preoperatoria"
+
+        # 3.3 Istologico definitivo post-operatorio e biologia molecolare / OSNA
+        has_postop_surgery = any(t in lower_text for t in ("pezzo operatorio", "quadrantectomia", "mastectomia", "istologico definitivo", "resezione chirurgica"))
+        has_tnm_margins = bool(re.search(r"\b(pt[0-4is]|pn[0-3]|linfonodo sentinella|margini di resezione|margini)\b", lower_text))
+        if (
+            (has_postop_surgery and has_tnm_margins)
             or "recettori degli estrogeni" in lower_text
             or "metodica osna" in lower_text
             or "stadiazione istopatologica" in lower_text
         ):
             return "anatomia_patologica"
-
-        # 3.3 Biopsia / Citologia pre-operatoria
-        if (
-            ("frustoli" in lower_text or "agobioptici" in lower_text or "core biopsy" in lower_text or "agobiopsia" in lower_text)
-            or ("agoaspirato" in lower_text and ("fna" in lower_text or "citologico" in lower_text or "c1" in lower_text or "c2" in lower_text or "c3" in lower_text or "c4" in lower_text or "c5" in lower_text))
-            or "esame citologico da agoaspirat" in lower_text
-        ):
-            return "anatomia_patologica_preoperatoria"
 
         # 3.4 Radiologia
         if (

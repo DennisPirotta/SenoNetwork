@@ -366,7 +366,7 @@ def get_task_status(task_id: str) -> Dict[str, Any]:
     return _tasks_store[task_id]
 
 
-@router.get("/api/tasks/{task_id}/events")
+@router.get("/api/tasks/{task_id}/events", dependencies=[Depends(verify_api_key)])
 async def stream_task_events(task_id: str):
     """Stream Server-Sent Events (SSE) per monitorare l'avanzamento in tempo reale sulla dashboard."""
     if task_id not in _tasks_store:

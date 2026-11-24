@@ -168,7 +168,6 @@ class Settings(BaseSettings):
             "http://127.0.0.1:8000",
             "http://127.0.0.1:5173",
             "http://localhost:8080",
-            "*"
         ],
         description="Elenco delle origini consentite dal middleware CORS per chiamate da browser"
     )
