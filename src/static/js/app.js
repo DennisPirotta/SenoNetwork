@@ -53,10 +53,15 @@ class APIClient {
   static getHealth() { return this.request("/health"); }
   static getDashboardOverview() { return this.request("/api/dashboard/overview"); }
   static getCupFiles() { return this.request("/api/cup/files"); }
-  static downloadLatestCup() { return this.request("/api/cup/download-latest", { method: "POST" }); }
+  static downloadLatestCup(payload = {}) { return this.request("/api/cup/download-latest", { method: "POST", body: payload }); }
   static getCupPatients(params = {}) {
-    const q = new URLSearchParams(params).toString();
-    return this.request(`/api/cup/patients?${q}`);
+    const q = new URLSearchParams();
+    Object.entries(params).forEach(([k, v]) => {
+      if (v !== undefined && v !== null && v !== "") {
+        q.append(k, v);
+      }
+    });
+    return this.request(`/api/cup/patients?${q.toString()}`);
   }
   static processPatientAsync(payload) {
     return this.request("/api/pipeline/process-patient-async", { method: "POST", body: payload });
@@ -219,28 +224,125 @@ class CupController {
   static currentPage = 1;
   static pageSize = 20;
   static currentFile = "";
+  static filesList = [];
 
   static async loadFiles() {
     try {
       const res = await APIClient.getCupFiles();
-      const select = document.getElementById("cup-file-select");
-      select.innerHTML = "";
+      const files = Array.isArray(res) ? res : (res.files || []);
+      this.filesList = files;
 
-      if (res.files && res.files.length > 0) {
-        res.files.forEach(f => {
-          const opt = document.createElement("option");
-          opt.value = f.name;
-          opt.textContent = `${f.name} (${f.records_estimate || '?'} pazienti)`;
-          select.appendChild(opt);
+      const select = document.getElementById("cup-file-select");
+      if (select) select.innerHTML = "";
+
+      const countEl = document.getElementById("cup-files-count");
+      if (countEl) countEl.textContent = files.length;
+
+      if (files.length > 0) {
+        if (!this.currentFile || !files.some(f => f.name === this.currentFile)) {
+          this.currentFile = files[0].name;
+        }
+
+        files.forEach(f => {
+          if (select) {
+            const opt = document.createElement("option");
+            opt.value = f.name;
+            const countStr = f.total_patients ?? f.records_estimate;
+            const countDisplay = countStr !== undefined && countStr !== null ? ` (${countStr} pazienti)` : '';
+            const sizeDisplay = f.size_formatted ? ` - ${f.size_formatted}` : '';
+            opt.textContent = `${f.name}${countDisplay}${sizeDisplay}`;
+            if (f.name === this.currentFile) {
+              opt.selected = true;
+            }
+            select.appendChild(opt);
+          }
         });
-        this.currentFile = res.files[0].name;
       } else {
-        select.innerHTML = '<option value="">Nessun foglio CUP trovato in data/cup/</option>';
+        if (select) {
+          select.innerHTML = '<option value="">Nessun foglio CUP trovato in data/cup/</option>';
+        }
+        this.currentFile = "";
       }
+
+      this.renderFilesTable(files);
       this.loadPatients();
     } catch (err) {
       console.error("Errore caricamento file CUP:", err);
+      const filesTbody = document.getElementById("cup-files-tbody");
+      if (filesTbody) {
+        filesTbody.innerHTML = `<tr><td colspan="6" style="text-align: center; color: var(--status-danger); padding: 1rem;">Errore caricamento file: ${err.message}</td></tr>`;
+      }
     }
+  }
+
+  static renderFilesTable(files) {
+    const tbody = document.getElementById("cup-files-tbody");
+    if (!tbody) return;
+    tbody.innerHTML = "";
+
+    if (!files || files.length === 0) {
+      tbody.innerHTML = '<tr><td colspan="6" style="text-align: center; color: var(--text-muted); padding: 1.5rem;">Nessun file Excel archiviato in data/cup/. Clicca su "Scarica da Priamo CUP" per scaricare il foglio YTD.</td></tr>';
+      return;
+    }
+
+    const apiKey = APIClient.getApiKey();
+    const authParam = apiKey ? `?api_key=${encodeURIComponent(apiKey)}` : '';
+
+    files.forEach(f => {
+      const isSelected = f.name === this.currentFile;
+      const tr = document.createElement("tr");
+      if (isSelected) {
+        tr.style.backgroundColor = "rgba(14, 116, 144, 0.08)";
+      }
+
+      const count = f.total_patients ?? f.records_estimate ?? '-';
+      const modified = f.modified_at || (f.modified_timestamp ? new Date(f.modified_timestamp * 1000).toLocaleString('it-IT') : '-');
+      const size = f.size_formatted || `${(f.size_bytes / 1024).toFixed(1)} KB`;
+      const statusBadge = isSelected
+        ? '<span class="badge badge-success">✓ Attivo</span>'
+        : '<span class="badge badge-neutral">Archiviato</span>';
+
+      const downloadRawUrl = `/api/cup/files/${encodeURIComponent(f.name)}/download${authParam}`;
+      const exportCsvUrl = `/api/cup/export?format=csv&file_name=${encodeURIComponent(f.name)}${apiKey ? `&api_key=${encodeURIComponent(apiKey)}` : ''}`;
+
+      tr.innerHTML = `
+        <td style="font-weight: ${isSelected ? '700' : '500'};">
+          <span style="margin-right: 0.375rem;">📊</span><code>${f.name}</code>
+        </td>
+        <td style="font-size: 0.8125rem;">${modified}</td>
+        <td style="font-size: 0.8125rem;">${size}</td>
+        <td><span class="badge badge-info">${count} pazienti</span></td>
+        <td>${statusBadge}</td>
+        <td>
+          <div style="display: flex; gap: 0.375rem; flex-wrap: wrap;">
+            <button type="button" class="btn btn-secondary btn-sm btn-select-file" data-file="${f.name}">
+              ${isSelected ? '✓ Selezionato' : '👁️ Seleziona'}
+            </button>
+            <a href="${downloadRawUrl}" class="btn btn-secondary btn-sm" download title="Scarica file originale XLSX" style="text-decoration: none;">
+              ⬇️ .xlsx
+            </a>
+            <a href="${exportCsvUrl}" class="btn btn-secondary btn-sm" download title="Esporta dati in CSV" style="text-decoration: none;">
+              Esporta CSV
+            </a>
+          </div>
+        </td>
+      `;
+      tbody.appendChild(tr);
+    });
+
+    tbody.querySelectorAll(".btn-select-file").forEach(btn => {
+      btn.addEventListener("click", () => {
+        const file = btn.getAttribute("data-file");
+        if (file) {
+          this.currentFile = file;
+          const select = document.getElementById("cup-file-select");
+          if (select) select.value = file;
+          this.currentPage = 1;
+          this.renderFilesTable(this.filesList);
+          this.loadPatients();
+        }
+      });
+    });
   }
 
   static async loadPatients() {
@@ -249,14 +351,14 @@ class CupController {
 
     const search = document.getElementById("cup-search-input").value.trim();
     const select = document.getElementById("cup-file-select");
-    const file = select ? select.value : "";
+    const file = select && select.value ? select.value : this.currentFile;
 
     try {
       const res = await APIClient.getCupPatients({
         page: this.currentPage,
         page_size: this.pageSize,
         search: search || undefined,
-        cup_file: file || undefined
+        file_name: file || undefined
       });
 
       this.renderTable(res);
@@ -272,6 +374,7 @@ class CupController {
     const patients = res.items || [];
     if (patients.length === 0) {
       tbody.innerHTML = '<tr><td colspan="7" style="text-align: center; color: var(--text-muted); padding: 2rem;">Nessun paziente trovato per i criteri selezionati.</td></tr>';
+      document.getElementById("cup-pagination-info").textContent = "Nessun paziente trovato";
       return;
     }
 
@@ -284,10 +387,14 @@ class CupController {
       const idStr = p.priamo_id ? `Priamo: ${p.priamo_id}` : (p.id_anagrafica_paziente ? `MEF: ${p.id_anagrafica_paziente}` : '-');
       const comune = p.comune_nascita || '-';
 
+      const hasLocal = p.has_local_state;
       const inRedcap = p.in_redcap;
-      const statusBadge = inRedcap
-        ? '<span class="badge badge-success">✓ In REDCap</span>'
-        : '<span class="badge badge-neutral">Da Elaborare</span>';
+      let statusBadge = '<span class="badge badge-neutral">Da Elaborare</span>';
+      if (inRedcap) {
+        statusBadge = '<span class="badge badge-success">✓ In REDCap</span>';
+      } else if (hasLocal) {
+        statusBadge = '<span class="badge badge-info">✓ In Locale</span>';
+      }
 
       tr.innerHTML = `
         <td style="font-weight: 600;">${fullName}</td>
@@ -349,10 +456,12 @@ class CupController {
     });
 
     // Pagination info
-    const total = res.total || 0;
+    const total = res.total_items ?? res.total ?? 0;
     const start = (this.currentPage - 1) * this.pageSize + 1;
     const end = Math.min(start + patients.length - 1, total);
-    document.getElementById("cup-pagination-info").textContent = `Visualizzazione ${start}-${end} di ${total} pazienti`;
+    const totalPages = res.total_pages || Math.max(1, Math.ceil(total / this.pageSize));
+    document.getElementById("cup-pagination-info").textContent =
+      `Visualizzazione ${start}-${end} di ${total} pazienti (Pagina ${this.currentPage} di ${totalPages})`;
   }
 }
 
@@ -795,13 +904,19 @@ document.addEventListener("DOMContentLoaded", () => {
   // Overview quick buttons
   document.getElementById("btn-refresh-overview").addEventListener("click", () => OverviewController.load());
   document.getElementById("btn-quick-cup-download").addEventListener("click", async () => {
+    const btn = document.getElementById("btn-quick-cup-download");
+    const origText = btn.innerHTML;
     try {
-      alert("Avvio download da Priamo CUP...");
+      btn.disabled = true;
+      btn.innerHTML = "⏳ Download in corso...";
       const res = await APIClient.downloadLatestCup();
-      alert(`Download completato: ${res.file_name || 'Successo'}`);
+      alert(`Download completato con successo!\nFile: ${res.file_name || 'YTD'}\nPazienti rilevati: ${res.total_unique_patients || 0}`);
       OverviewController.load();
     } catch (err) {
-      alert(`Errore download CUP: ${err.message}`);
+      alert(`Errore download Priamo CUP:\n${err.message}`);
+    } finally {
+      btn.disabled = false;
+      btn.innerHTML = origText;
     }
   });
   document.getElementById("btn-quick-run-audit").addEventListener("click", () => {
@@ -822,8 +937,10 @@ document.addEventListener("DOMContentLoaded", () => {
       CupController.loadPatients();
     }
   });
-  document.getElementById("cup-file-select").addEventListener("change", () => {
+  document.getElementById("cup-file-select").addEventListener("change", (e) => {
+    CupController.currentFile = e.target.value;
     CupController.currentPage = 1;
+    CupController.renderFilesTable(CupController.filesList);
     CupController.loadPatients();
   });
   document.getElementById("btn-cup-prev").addEventListener("click", () => {
@@ -837,19 +954,36 @@ document.addEventListener("DOMContentLoaded", () => {
     CupController.loadPatients();
   });
   document.getElementById("btn-cup-download-remote").addEventListener("click", async () => {
+    const btn = document.getElementById("btn-cup-download-remote");
+    const origText = btn.innerHTML;
     try {
+      btn.disabled = true;
+      btn.innerHTML = "⏳ Download in corso...";
       const res = await APIClient.downloadLatestCup();
-      alert(`Download completato: ${res.file_name}`);
-      CupController.loadFiles();
+      alert(`Download completato con successo!\nFile: ${res.file_name}\nPazienti rilevati: ${res.total_unique_patients || 0}`);
+      await CupController.loadFiles();
     } catch (err) {
-      alert(`Errore download: ${err.message}`);
+      alert(`Errore durante il download da Priamo CUP:\n${err.message}`);
+    } finally {
+      btn.disabled = false;
+      btn.innerHTML = origText;
     }
   });
   document.getElementById("btn-cup-export-csv").addEventListener("click", () => {
-    window.open("/api/cup/export?format=csv", "_blank");
+    const file = CupController.currentFile || "";
+    const apiKey = APIClient.getApiKey();
+    const query = new URLSearchParams({ format: "csv" });
+    if (file) query.append("file_name", file);
+    if (apiKey) query.append("api_key", apiKey);
+    window.open(`/api/cup/export?${query.toString()}`, "_blank");
   });
   document.getElementById("btn-cup-export-json").addEventListener("click", () => {
-    window.open("/api/cup/export?format=json", "_blank");
+    const file = CupController.currentFile || "";
+    const apiKey = APIClient.getApiKey();
+    const query = new URLSearchParams({ format: "json" });
+    if (file) query.append("file_name", file);
+    if (apiKey) query.append("api_key", apiKey);
+    window.open(`/api/cup/export?${query.toString()}`, "_blank");
   });
 
   // Audit triggers

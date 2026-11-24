@@ -95,3 +95,78 @@ def test_granular_sse_stream_events(client):
     assert "progress_pct" in payload
     assert "events_log" in payload
     assert "processed_documents" in payload
+
+
+def test_cup_download_latest_endpoint(client, tmp_path):
+    mock_file = tmp_path / "fogli_lavoro_unita_37002_YTD_20260101_20261124.xlsx"
+    # Create a small valid excel or copy existing
+    existing = list(Path("data/cup").glob("*.xlsx"))
+    assert len(existing) > 0, "Almeno un file CUP deve esistere in data/cup"
+    import shutil
+    shutil.copy(existing[0], mock_file)
+
+    with patch("src.routers.cup.PriamoCupClient") as MockClientClass:
+        mock_instance = MagicMock()
+        mock_instance.download_updated_worksheets.return_value = mock_file
+        MockClientClass.return_value = mock_instance
+
+        # Call POST /api/cup/download-latest with no body
+        resp = client.post("/api/cup/download-latest")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["status"] == "success"
+        assert data["file_name"] == mock_file.name
+        assert "total_unique_patients" in data
+        assert "size_formatted" in data
+        assert mock_instance.download_updated_worksheets.called
+        assert mock_instance.download_updated_worksheets.call_args[1]["ytd"] is True
+
+
+def test_cup_files_enriched_and_raw_download(client):
+    resp = client.get("/api/cup/files")
+    assert resp.status_code == 200
+    files = resp.json()
+    assert isinstance(files, list)
+    assert len(files) > 0
+
+    first = files[0]
+    assert "name" in first
+    assert "size_bytes" in first
+    assert "size_formatted" in first
+    assert "modified_at" in first
+    assert "total_patients" in first
+    assert "records_estimate" in first
+
+    # Test downloading the raw xlsx file
+    download_resp = client.get(f"/api/cup/files/{first['name']}/download")
+    assert download_resp.status_code == 200
+    assert "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" in download_resp.headers["content-type"]
+    assert f'filename="{first["name"]}"' in download_resp.headers["content-disposition"]
+
+
+def test_cup_patients_compatibility_and_local_state(client):
+    # Test with cup_file query alias
+    files_resp = client.get("/api/cup/files")
+    first_file = files_resp.json()[0]["name"]
+
+    resp = client.get(f"/api/cup/patients?cup_file={first_file}&page=1&page_size=5")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["file_name"] == first_file
+    assert "total_items" in data
+    assert "total" in data
+    assert data["total"] == data["total_items"]
+    assert len(data["items"]) <= 5
+    if data["items"]:
+        first_patient = data["items"][0]
+        assert "has_local_state" in first_patient
+        assert isinstance(first_patient["has_local_state"], bool)
+
+
+def test_dashboard_html_contains_cup_files_table(client):
+    resp = client.get("/")
+    assert resp.status_code == 200
+    html = resp.text
+    assert "cup-files-tbody" in html
+    assert "cup-files-count" in html
+    assert "Fogli di Lavoro Archiviati" in html

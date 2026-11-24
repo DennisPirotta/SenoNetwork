@@ -168,14 +168,46 @@
           </div>
         </div>
 
+        <!-- Fogli di Lavoro Archiviati (.xlsx) -->
+        <div style="margin-bottom: 1.5rem; background: var(--surface-secondary); padding: 1rem; border-radius: 8px; border: 1px solid var(--border-color);">
+          <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.75rem;">
+            <h3 style="font-size: 0.9375rem; font-weight: 600; margin: 0; display: flex; align-items: center; gap: 0.5rem;">
+              📁 Fogli di Lavoro Archiviati (<span id="cup-files-count">0</span> file in <code>data/cup/</code>)
+            </h3>
+            <span style="font-size: 0.75rem; color: var(--text-muted);">Clicca "Seleziona" per caricare l'anagrafica del file</span>
+          </div>
+          <div class="table-wrapper" tabindex="0" role="region" aria-labelledby="cup-files-caption" style="max-height: 220px; overflow-y: auto;">
+            <table>
+              <caption id="cup-files-caption" style="display: none;">Elenco Fogli di Lavoro CUP Archiviati</caption>
+              <thead>
+                <tr>
+                  <th>Nome File Excel</th>
+                  <th>Data Modifica</th>
+                  <th>Dimensione</th>
+                  <th>Pazienti Rilevati</th>
+                  <th>Stato</th>
+                  <th>Azioni File</th>
+                </tr>
+              </thead>
+              <tbody id="cup-files-tbody">
+                <tr>
+                  <td colspan="6" style="text-align: center; color: var(--text-muted); padding: 1rem;">
+                    Caricamento fogli in corso...
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+
         <!-- Search and Filters Bar -->
         <div class="form-row" style="margin-bottom: 1rem;">
           <div style="flex: 2;">
-            <label class="form-label" for="cup-search-input">Cerca Paziente</label>
+            <label class="form-label" for="cup-search-input">Cerca Paziente nel Foglio Attivo</label>
             <input type="text" class="form-input" id="cup-search-input" placeholder="Cerca per Nome, Cognome, CF, ID MEF o Priamo...">
           </div>
           <div style="flex: 1;">
-            <label class="form-label" for="cup-file-select">Foglio di Lavoro</label>
+            <label class="form-label" for="cup-file-select">Foglio Selezionato</label>
             <select class="form-select" id="cup-file-select">
               <option value="">Caricamento file...</option>
             </select>

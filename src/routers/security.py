@@ -2,7 +2,7 @@
 
 import secrets
 from typing import Optional
-from fastapi import APIRouter, Depends, HTTPException, Security, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Security, status
 from fastapi.security import APIKeyHeader
 from src.config import Settings, get_settings
 
@@ -19,33 +19,36 @@ def generate_api_key(prefix: str = "sn_") -> str:
 
 def verify_api_key(
     header_key: Optional[str] = Security(api_key_header),
+    query_key: Optional[str] = Query(None, alias="api_key"),
     settings: Settings = Depends(get_settings)
 ) -> Optional[str]:
     """Validates the incoming API key against the configured settings.
 
     If `settings.api_key` is not configured (None or empty), authentication is bypassed
     to facilitate open local development.
-    If `settings.api_key` is configured, requests must provide matching header `X-API-Key`.
+    If `settings.api_key` is configured, requests must provide matching header `X-API-Key`
+    or query parameter `api_key`.
     """
     configured_key = settings.api_key
     if not configured_key or not configured_key.strip():
         # Open access in local development
         return None
 
-    if not header_key:
+    incoming_key = header_key or query_key
+    if not incoming_key:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail=f"Autenticazione richiesta: specificare l'header '{API_KEY_HEADER_NAME}'."
+            detail=f"Autenticazione richiesta: specificare l'header '{API_KEY_HEADER_NAME}' o il parametro '?api_key='."
         )
 
     # Constant time comparison to prevent timing attacks
-    if not secrets.compare_digest(header_key.strip(), configured_key.strip()):
+    if not secrets.compare_digest(incoming_key.strip(), configured_key.strip()):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="API Key non valida. Accesso negato."
         )
 
-    return header_key
+    return incoming_key
 
 
 @router.post("/api/security/generate-key")
