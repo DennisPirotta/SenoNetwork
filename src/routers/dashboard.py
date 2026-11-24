@@ -1,7 +1,8 @@
 """Dashboard Overview & KPI endpoint."""
 
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict
 from fastapi import APIRouter, Depends
 from src.config import Settings, get_settings
 from src.ai_extractor import LlamaCppExtractor, OllamaExtractor
@@ -18,7 +19,7 @@ def get_dashboard_overview(
 ) -> Dict[str, Any]:
     """Provides high-level KPI metrics, health checks, and recent activity for the web dashboard."""
 
-    # 1. Health check of external services
+    # 1. Health check of external services (concurrently probed)
     ollama = OllamaExtractor(base_url=settings.ollama_base_url)
     llamacpp = LlamaCppExtractor(
         base_url=settings.llama_cpp_base_url,
@@ -27,26 +28,33 @@ def get_dashboard_overview(
     )
     dotnet = DotNetApiClient(settings=settings)
 
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        fut_llama = pool.submit(llamacpp.is_available)
+        fut_ollama = pool.submit(ollama.is_available)
+        llama_ok = fut_llama.result()
+        ollama_ok = fut_ollama.result()
+
     health = {
         "status": "online",
         "ai_backend_configured": settings.ai_backend,
-        "llama_cpp_rpc_available": llamacpp.is_available(),
-        "llama_cpp_base_url": settings.llama_cpp_base_url,
-        "ollama_available": ollama.is_available(),
+        "llama_cpp_rpc_available": llama_ok,
+        "ollama_available": ollama_ok,
         "ollama_model": settings.ollama_model,
         "redcap_configured": bool(settings.redcap_api_url and settings.redcap_api_token),
         "priamo_dotnet_configured": dotnet.is_priamo_configured,
-        "priamo_cup_url": settings.priamo_cup_url,
     }
 
     # 2. PriamoCUP files and patients KPI
-    cup_dir = Path("data/cup")
+    cup_dir = Path(settings.cup_dir)
     cup_files = []
     latest_cup_file = None
-    cup_patients_count = 0
 
     if cup_dir.exists():
-        cup_files = sorted(list(cup_dir.glob("*.xlsx")) + list(cup_dir.glob("*.xls")), key=lambda f: f.stat().st_mtime, reverse=True)
+        cup_files = sorted(
+            list(cup_dir.glob("*.xlsx")) + list(cup_dir.glob("*.xls")),
+            key=lambda f: f.stat().st_mtime,
+            reverse=True
+        )
         if cup_files:
             latest = cup_files[0]
             latest_cup_file = {
@@ -70,8 +78,10 @@ def get_dashboard_overview(
             redcap_summary = {"records_count": 0, "status": "error", "error": str(e)}
 
     # 4. Local files count
-    downloads_count = len(list(Path("data/downloads").rglob("*.pdf"))) if Path("data/downloads").exists() else 0
-    state_files_count = len(list(Path("data/state").glob("*_state.json"))) if Path("data/state").exists() else 0
+    downloads_dir = Path(settings.downloads_dir)
+    state_dir = Path(settings.state_dir)
+    downloads_count = len(list(downloads_dir.rglob("*.pdf"))) if downloads_dir.exists() else 0
+    state_files_count = len(list(state_dir.glob("*_state.json"))) if state_dir.exists() else 0
 
     return {
         "health": health,

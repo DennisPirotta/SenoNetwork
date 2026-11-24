@@ -25,7 +25,6 @@ from src.audit_service import (
     RedCapDataAuditor
 )
 from src.config import Settings
-from src.redcap_service import REDCapService
 
 load_dotenv()
 
@@ -34,7 +33,6 @@ try:
     from rich.console import Console
     from rich.panel import Panel
     from rich.table import Table
-    from rich import print as rprint
     HAS_RICH = True
 except ImportError:
     HAS_RICH = False

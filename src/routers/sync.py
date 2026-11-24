@@ -1,7 +1,6 @@
 """REDCap Reconciliation & Sync API Router."""
 
 import json
-from pathlib import Path
 import time
 from typing import Any, Dict, List, Optional
 import uuid
@@ -9,7 +8,14 @@ from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 
 from src.config import Settings, get_settings
-from src.sync_service import RedCapSyncService, SyncSummaryReport
+from src.sync_service import RedCapSyncService
+from src.routers.pipeline import (
+    _get_llm_semaphore,
+    _get_patient_lock,
+    append_task_event,
+    register_task,
+    update_task,
+)
 from src.routers.security import verify_api_key
 
 router = APIRouter(tags=["REDCap Sync"])
@@ -28,8 +34,13 @@ class SyncTriggerRequest(BaseModel):
     auto_upload: bool = Field(default=True, description="Carica automaticamente aggiornamenti su REDCap")
     dry_run: bool = Field(default=False, description="Simulazione senza scritture")
     force_reprocess: bool = Field(default=False, description="Forza rielaborazione dei PDF già registrati")
-    limit: Optional[int] = Field(default=None, description="Limite massimo pazienti")
+    limit: Optional[int] = Field(default=None, ge=1, le=5000, description="Limite massimo pazienti")
     only_incomplete: bool = Field(default=True, description="Esamina solo pazienti con form incompleti")
+    overwrite_mode: Optional[str] = Field(
+        default=None,
+        pattern="^(fill_missing|overwrite)$",
+        description="Modalità aggiornamento REDCap ('fill_missing' o 'overwrite')"
+    )
 
 
 class AsyncTaskResponse(BaseModel):
@@ -44,39 +55,73 @@ def _run_background_sync(
     sync_service: RedCapSyncService,
     req: SyncTriggerRequest
 ):
-    from src.routers.pipeline import _tasks_store
-    _tasks_store[task_id]["status"] = "processing"
-    _tasks_store[task_id]["started_at"] = time.time()
+    update_task(
+        task_id,
+        status="processing",
+        started_at=time.time(),
+        progress_pct=10,
+        current_step=f"Avvio riconciliazione REDCap per {req.patient_id or 'coorte incompleta'}...",
+        events_log=[],
+    )
+    append_task_event(
+        task_id,
+        10,
+        f"Sync REDCap avviato ({'dry-run' if req.dry_run else 'live'})...",
+        {
+            "time": time.strftime("%H:%M:%S"),
+            "message": f"Sync REDCap avviato per {req.patient_id or 'tutti i pazienti incompleti'}",
+            "pct": 10,
+            "extra": None,
+        },
+    )
     try:
         if req.patient_id:
-            res = sync_service.check_and_update_patient(
-                patient_id=req.patient_id,
-                name=req.name,
-                surname=req.surname,
-                dob=req.date_of_birth,
-                target_forms=req.target_forms,
-                auto_upload=req.auto_upload and not req.dry_run,
-                dry_run=req.dry_run,
-                force_reprocess=req.force_reprocess
+            with _get_patient_lock(req.patient_id), _get_llm_semaphore(getattr(sync_service, "settings", None)):
+                res = sync_service.check_and_update_patient(
+                    patient_id=req.patient_id,
+                    name=req.name,
+                    surname=req.surname,
+                    dob=req.date_of_birth,
+                    target_forms=req.target_forms,
+                    auto_upload=req.auto_upload and not req.dry_run,
+                    dry_run=req.dry_run,
+                    force_reprocess=req.force_reprocess,
+                    overwrite_mode=req.overwrite_mode,
+                )
+            update_task(
+                task_id,
+                status="completed",
+                progress_pct=100,
+                current_step=f"Sync completato per {req.patient_id}: {res.status} ({res.field_updates_count} campi).",
+                result=res.model_dump(),
+                items_done=1,
             )
-            _tasks_store[task_id]["status"] = "completed"
-            _tasks_store[task_id]["result"] = res.model_dump()
         else:
-            report = sync_service.sync_all(
-                target_forms=req.target_forms,
-                auto_upload=req.auto_upload and not req.dry_run,
-                dry_run=req.dry_run,
-                force_reprocess=req.force_reprocess,
-                limit=req.limit,
-                only_incomplete=req.only_incomplete
+            with _get_llm_semaphore(getattr(sync_service, "settings", None)):
+                report = sync_service.sync_all(
+                    target_forms=req.target_forms,
+                    auto_upload=req.auto_upload and not req.dry_run,
+                    dry_run=req.dry_run,
+                    force_reprocess=req.force_reprocess,
+                    limit=req.limit,
+                    only_incomplete=req.only_incomplete,
+                    overwrite_mode=req.overwrite_mode,
+                )
+            update_task(
+                task_id,
+                status="completed",
+                progress_pct=100,
+                current_step=(
+                    f"Sync globale completato: {report.patients_updated}/{report.patients_inspected} pazienti aggiornati."
+                ),
+                result=report.model_dump(),
+                items_done=report.patients_inspected,
+                items_total=max(1, report.patients_inspected),
             )
-            _tasks_store[task_id]["status"] = "completed"
-            _tasks_store[task_id]["result"] = report.model_dump()
     except Exception as e:
-        _tasks_store[task_id]["status"] = "failed"
-        _tasks_store[task_id]["error"] = str(e)
+        update_task(task_id, status="failed", error=str(e), current_step=f"Errore sync: {e}")
     finally:
-        _tasks_store[task_id]["finished_at"] = time.time()
+        update_task(task_id, finished_at=time.time())
 
 
 @router.post("/api/sync/check-updates", dependencies=[Depends(verify_api_key)])
@@ -89,25 +134,29 @@ def sync_check_updates_sync(
     params = req or SyncTriggerRequest()
     try:
         if params.patient_id:
-            return sync_service.check_and_update_patient(
-                patient_id=params.patient_id,
-                name=params.name,
-                surname=params.surname,
-                dob=params.date_of_birth,
-                target_forms=params.target_forms,
-                auto_upload=params.auto_upload and not params.dry_run,
-                dry_run=params.dry_run,
-                force_reprocess=params.force_reprocess
-            )
+            with _get_patient_lock(params.patient_id), _get_llm_semaphore(getattr(sync_service, "settings", None)):
+                return sync_service.check_and_update_patient(
+                    patient_id=params.patient_id,
+                    name=params.name,
+                    surname=params.surname,
+                    dob=params.date_of_birth,
+                    target_forms=params.target_forms,
+                    auto_upload=params.auto_upload and not params.dry_run,
+                    dry_run=params.dry_run,
+                    force_reprocess=params.force_reprocess,
+                    overwrite_mode=params.overwrite_mode,
+                )
         else:
-            return sync_service.sync_all(
-                target_forms=params.target_forms,
-                auto_upload=params.auto_upload and not params.dry_run,
-                dry_run=params.dry_run,
-                force_reprocess=params.force_reprocess,
-                limit=params.limit,
-                only_incomplete=params.only_incomplete
-            )
+            with _get_llm_semaphore(getattr(sync_service, "settings", None)):
+                return sync_service.sync_all(
+                    target_forms=params.target_forms,
+                    auto_upload=params.auto_upload and not params.dry_run,
+                    dry_run=params.dry_run,
+                    force_reprocess=params.force_reprocess,
+                    limit=params.limit,
+                    only_incomplete=params.only_incomplete,
+                    overwrite_mode=params.overwrite_mode,
+                )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Errore esecuzione sync: {e}")
 
@@ -119,25 +168,29 @@ def sync_check_updates_async(
     sync_service: RedCapSyncService = Depends(get_sync_service)
 ) -> AsyncTaskResponse:
     """Accoda il sync in background e ritorna immediatamente un task_id."""
-    from src.routers.pipeline import _tasks_store
-
     params = req or SyncTriggerRequest()
     task_id = str(uuid.uuid4())
     p_id = params.patient_id or "all_patients"
 
-    _tasks_store[task_id] = {
-        "task_id": task_id,
-        "patient_id": p_id,
-        "type": "sync",
-        "status": "queued",
-        "progress_pct": 0,
-        "current_step": "Sync in coda...",
-        "created_at": time.time(),
-        "started_at": None,
-        "finished_at": None,
-        "result": None,
-        "error": None
-    }
+    register_task(
+        task_id,
+        {
+            "task_id": task_id,
+            "patient_id": p_id,
+            "type": "sync",
+            "status": "queued",
+            "progress_pct": 0,
+            "current_step": "Sync in coda...",
+            "items_total": 1,
+            "items_done": 0,
+            "events_log": [],
+            "created_at": time.time(),
+            "started_at": None,
+            "finished_at": None,
+            "result": None,
+            "error": None
+        }
+    )
 
     background_tasks.add_task(
         _run_background_sync,

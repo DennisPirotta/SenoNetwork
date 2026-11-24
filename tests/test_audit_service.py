@@ -119,45 +119,49 @@ def test_audit_temporal_chronological_anomalies(mock_settings):
 
 
 def test_audit_false_complete_detection(mock_settings):
-    """Tests detection of forms marked as complete ('2') but with empty fields."""
+    """Tests per-form detection of forms marked as complete ('2') when their own form fields are empty."""
     mock_records = [
         {
             "record_id": "PZ-FALSE-COMPLETE",
-            "radiologia_complete": "2"  # Marked complete but zero fields populated!
+            "name": "Maria",
+            "surname": "Rossi",
+            "dati_del_paziente_complete": "2",
+            "radiologia_complete": "2",  # Radiologia itself has zero fields even though demographics exist
         }
     ]
 
     auditor = RedCapDataAuditor(settings=mock_settings)
     report = auditor.run_audit(records=mock_records)
 
-    status_issues = [i for i in report.issues if i.category == IssueCategory.STATUS_MISMATCH]
+    status_issues = [i for i in report.issues if i.category == IssueCategory.STATUS_MISMATCH and i.form_name == "radiologia"]
     assert len(status_issues) >= 1
     assert any("privo di dati clinici effettivi" in i.description for i in status_issues)
 
 
 def test_audit_missing_core_pathology_fields(mock_settings):
-    """Tests detection of missing pT, pN, and grade when post-op pathology is present."""
-    mock_records = [
-        {
-            "record_id": "PZ-PATH-INCOMPLETE",
-            "anatomia_patologica_complete": "2",
-            "histopathological_diagnosis_of_operative_specimen": "3",  # Invasivo
-            "pt": "",  # Missing pT
-            "pn": "",  # Missing pN
-            "grade": "",  # Missing Grade
-            "invasive_histological_type": ""  # Missing istotype
-        }
-    ]
+    """Tests detection of missing pT, pN, and grade when post-op pathology ('3' micro or '4' invasive) is present."""
+    for diag_code in ("3", "4"):
+        mock_records = [
+            {
+                "record_id": f"PZ-PATH-{diag_code}",
+                "anatomia_patologica_complete": "2",
+                "histopathological_diagnosis_of_operative_specimen": diag_code,
+                "pt": "",
+                "pn": "",
+                "grade": "",
+                "invasive_histological_type": "",
+            }
+        ]
 
-    auditor = RedCapDataAuditor(settings=mock_settings)
-    report = auditor.run_audit(records=mock_records)
+        auditor = RedCapDataAuditor(settings=mock_settings)
+        report = auditor.run_audit(records=mock_records)
 
-    missing_fields = [i for i in report.issues if i.category == IssueCategory.MISSING_MANDATORY_FIELD]
-    field_names = [i.field_name for i in missing_fields]
-    assert "pt" in field_names
-    assert "pn" in field_names
-    assert "grade" in field_names
-    assert "invasive_histological_type" in field_names
+        missing_fields = [i for i in report.issues if i.category == IssueCategory.MISSING_MANDATORY_FIELD]
+        field_names = [i.field_name for i in missing_fields]
+        assert "pt" in field_names
+        assert "pn" in field_names
+        assert "grade" in field_names
+        assert "invasive_histological_type" in field_names
 
 
 def test_audit_positive_margins_warning(mock_settings):
@@ -220,24 +224,62 @@ def test_audit_markdown_and_export_reports(mock_settings, tmp_path):
 
 
 def test_api_server_audit_report_endpoint(mock_settings):
-    """Directly tests the FastAPI get_audit_data_quality_report endpoint."""
-    with patch("src.api_server.RedCapDataAuditor.run_audit") as mock_audit:
-        with patch("src.api_server.RedCapDataAuditor.export_reports") as mock_export:
+    """Tests FastAPI audit endpoints (/api/audit/report, /anomalies, /completion-matrix)."""
+    from fastapi.testclient import TestClient
+    from src.api_server import app
+    from src.audit_service import PatientAuditIssue
+    from src.config import get_settings
+
+    with patch("src.audit_service.RedCapDataAuditor.run_audit") as mock_audit:
+        with patch("src.audit_service.RedCapDataAuditor.export_reports") as mock_export:
             mock_report = RedCapAuditReport(
                 timestamp="2026-11-06T10:00:00",
                 total_records=5,
                 global_completeness_score=85.0,
                 total_issues_count=1,
-                critical_issues_count=0,
-                warning_issues_count=1,
+                critical_issues_count=1,
+                warning_issues_count=0,
                 info_issues_count=0,
                 forms_stats=[],
                 clinical_profile=CohortClinicalProfile(),
-                issues=[]
+                issues=[
+                    PatientAuditIssue(
+                        patient_id="PZ-10",
+                        severity=IssueSeverity.CRITICAL,
+                        category=IssueCategory.TEMPORAL_ANOMALY,
+                        description="Data incongruente",
+                        suggested_action="Verifica",
+                    )
+                ],
             )
             mock_audit.return_value = mock_report
-            res = get_audit_data_quality_report(patient_id="PZ-10", settings=mock_settings)
+            # Direct call with default export=False should NOT write files to disk
+            res = get_audit_data_quality_report(patient_id="PZ-10", export=False, settings=mock_settings)
             assert res.total_records == 5
             assert res.global_completeness_score == 85.0
             mock_audit.assert_called_with(patient_id="PZ-10")
+            assert not mock_export.called
+
+            # Explicit export=True writes report files
+            get_audit_data_quality_report(patient_id="PZ-10", export=True, settings=mock_settings)
             assert mock_export.called
+
+            # Test /api/audit/anomalies and /api/audit/completion-matrix via HTTP
+            app.dependency_overrides[get_settings] = lambda: mock_settings
+            try:
+                client = TestClient(app)
+                resp_anom = client.get("/api/audit/anomalies?severity=critical&category=temporal_anomaly")
+                assert resp_anom.status_code == 200
+                anoms = resp_anom.json()
+                assert len(anoms) == 1
+                assert anoms[0]["patient_id"] == "PZ-10"
+
+                with patch(
+                    "src.audit_service.RedCapDataAuditor.build_completion_matrix",
+                    return_value={"total_patients": 1, "form_statistics": {}, "patient_matrix": [{"record_id": "PZ-10"}]},
+                ):
+                    resp_mat = client.get("/api/audit/completion-matrix")
+                    assert resp_mat.status_code == 200
+                    assert resp_mat.json()["total_patients"] == 1
+            finally:
+                app.dependency_overrides.pop(get_settings, None)

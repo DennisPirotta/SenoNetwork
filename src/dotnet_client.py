@@ -7,7 +7,8 @@ from typing import Any, Dict, List, Optional, Union
 import requests
 
 from src.config import Settings, get_settings
-from src.priamo_client import PriamoClient, PriamoDocument, PriamoPatient
+from src.priamo_client import PriamoClient, PriamoPatient
+from src.utils import sanitize_identifier
 
 logger = logging.getLogger(__name__)
 
@@ -53,44 +54,43 @@ class DotNetApiClient:
         destination_dir: Optional[Path] = None,
         name: Optional[str] = None,
         surname: Optional[str] = None,
-        date_of_birth: Optional[Union[date, str]] = None
+        date_of_birth: Optional[Union[date, str]] = None,
+        codice_fiscale: Optional[str] = None,
+        priamo_id: Optional[str] = None,
     ) -> List[Path]:
         """Downloads all PDFs available for a patient.
-        Tries Priamo .NET first, then generic REST API, then local folder.
+        Tries Priamo .NET first, then generic REST API, then local folder (only if Priamo/REST unconfigured).
         """
-        dest_dir = destination_dir or (self.settings.downloads_dir / patient_id)
+        safe_pid = sanitize_identifier(patient_id)
+        dest_dir = destination_dir or (self.settings.downloads_dir / safe_pid)
         dest_dir.mkdir(parents=True, exist_ok=True)
 
         # 1. Priamo .NET API
         if self.is_priamo_configured:
-            try:
-                # If demographics are provided, search patient on Priamo
-                if name and surname and date_of_birth:
-                    patient = self.priamo.search_patient(name, surname, date_of_birth)
-                else:
-                    # Treat patient_id as Priamo ID or try slug parsing
-                    patient = self._resolve_patient(patient_id)
+            if name and surname and date_of_birth:
+                patient = self.priamo.search_patient(
+                    name, surname, date_of_birth, codice_fiscale=codice_fiscale
+                )
+            else:
+                patient = self._resolve_patient(safe_pid, priamo_id=priamo_id)
 
-                if patient:
-                    docs = self.priamo.fetch_all_patient_reports(patient, dest_dir)
-                    paths = [d.local_path for d in docs if d.local_path and d.local_path.exists()]
-                    if paths:
-                        logger.info(f"Scaricati {len(paths)} referti PDF da Priamo per {patient_id}")
-                        return paths
-            except Exception as e:
-                logger.error(f"Errore download da Priamo per {patient_id}: {e}")
+            if not patient:
+                logger.warning(f"Paziente {safe_pid} non risolto su Priamo: nessun download eseguito.")
+                return []
+
+            docs = self.priamo.fetch_all_patient_reports(patient, dest_dir)
+            paths = [d.local_path for d in docs if d.local_path and d.local_path.exists()]
+            logger.info(f"Scaricati {len(paths)} referti PDF da Priamo per {safe_pid}")
+            return paths
 
         # 2. Generic REST API
         if self.is_generic_api_configured:
-            try:
-                return self._download_from_generic_api(patient_id, dest_dir)
-            except Exception as e:
-                logger.error(f"Errore download da generic .NET API per {patient_id}: {e}")
+            return self._download_from_generic_api(safe_pid, dest_dir)
 
-        # 3. Local fallback mock / pre-downloaded files
-        logger.info(f"Ricerca file locali per paziente {patient_id}...")
+        # 3. Local fallback mock / pre-downloaded files (only when remote HIS APIs are unconfigured)
+        logger.info(f"Ricerca file locali per paziente {safe_pid}...")
         return self._get_local_documents_mock(
-            patient_id=patient_id,
+            patient_id=safe_pid,
             name=name,
             surname=surname,
             date_of_birth=date_of_birth
@@ -112,12 +112,21 @@ class DotNetApiClient:
         )
         return [{"id": p.stem, "document_id": p.stem, "filename": p.name, "path": str(p)} for p in pdfs]
 
-    def _resolve_patient(self, identifier: str) -> Optional[PriamoPatient]:
-        """Attempts to resolve a patient identifier into a PriamoPatient object."""
+    def _resolve_patient(self, identifier: str, priamo_id: Optional[str] = None) -> Optional[PriamoPatient]:
+        """Attempts to resolve an explicit Priamo ID or demographic slug into a PriamoPatient object.
+
+        Never treats an arbitrary numeric REDCap record_id as an internal Priamo progressivoPaz1.
+        """
+        if priamo_id and str(priamo_id).strip().isdigit():
+            return PriamoPatient(
+                patient_id=str(priamo_id).strip(),
+                name="Paziente",
+                surname=str(priamo_id).strip()
+            )
+
         # Check if identifier is a slug: 'name-surname-YYYY-MM-DD'
         parts = identifier.split("-")
         if len(parts) >= 5:
-            # Assuming 'name-surname-YYYY-MM-DD'
             dob_str = f"{parts[-3]}-{parts[-2]}-{parts[-1]}"
             try:
                 dob = date.fromisoformat(dob_str)
@@ -126,14 +135,6 @@ class DotNetApiClient:
                 return self.priamo.search_patient(name, surname, dob)
             except Exception:
                 pass
-
-        # If identifier is numeric and represents a known Priamo patient ID (> 2 digits)
-        if identifier.isdigit() and len(identifier) > 2:
-            return PriamoPatient(
-                patient_id=identifier,
-                name="Paziente",
-                surname=identifier
-            )
 
         return None
 
@@ -176,8 +177,9 @@ class DotNetApiClient:
             return []
 
         def _download_single(doc: Dict[str, Any]) -> Optional[Path]:
-            doc_id = str(doc.get("id") or doc.get("document_id"))
-            fname = doc.get("filename") or f"{doc_id}.pdf"
+            doc_id = sanitize_identifier(str(doc.get("id") or doc.get("document_id") or "doc"))
+            raw_fname = doc.get("filename") or f"{doc_id}.pdf"
+            fname = Path(str(raw_fname)).name or f"{doc_id}.pdf"
             dest = destination_dir / fname
             dl_url = f"{self.base_url}/patients/{patient_id}/documents/{doc_id}/download"
             try:
@@ -213,7 +215,7 @@ class DotNetApiClient:
         Preserves REDCap's native patient_id/record_id, while also checking candidate slug
         subfolders if demographics are known.
         """
-        candidate_ids = [str(patient_id)]
+        candidate_ids = [sanitize_identifier(patient_id)]
         if name and surname:
             dob_str = ""
             if date_of_birth:
@@ -224,12 +226,15 @@ class DotNetApiClient:
                 candidate_ids.append(clean_slug)
 
         for cid in candidate_ids:
+            safe_cid = sanitize_identifier(cid, default="")
+            if not safe_cid:
+                continue
             search_dirs = [
-                Path("data/patient_repository") / cid,
-                self.settings.downloads_dir / cid,
+                Path("data/patient_repository") / safe_cid,
+                self.settings.downloads_dir / safe_cid,
             ]
             if self.settings.priamo_files_dir:
-                search_dirs.insert(0, Path(self.settings.priamo_files_dir) / cid)
+                search_dirs.insert(0, Path(self.settings.priamo_files_dir) / safe_cid)
 
             for sdir in search_dirs:
                 if sdir and sdir.exists() and sdir.is_dir():
@@ -281,8 +286,9 @@ class DotNetApiClient:
             raise FileNotFoundError(f"File Excel non trovato: {path}")
 
         # Controllo prioritario formato PriamoCUP (intestazioni PAZ_COGNOME, PAZ_NOME a riga 0)
+        excel_engine = "calamine" if path.suffix.lower() == ".xls" else "openpyxl"
         try:
-            sample_df = pd.read_excel(path, nrows=5)
+            sample_df = pd.read_excel(path, nrows=5, engine=excel_engine)
             cols_upper = [str(c).strip().upper() for c in sample_df.columns]
             if "PAZ_COGNOME" in cols_upper and "PAZ_NOME" in cols_upper:
                 from scripts.extract_patients_from_shared_file import estrai_pazienti_da_fogli_cup
@@ -313,7 +319,7 @@ class DotNetApiClient:
         except Exception as ex:
             logger.debug(f"Controllo formato PriamoCUP: {ex}")
 
-        df = pd.read_excel(path, dtype=str, header=header_row)
+        df = pd.read_excel(path, dtype=str, header=header_row, engine=excel_engine)
         patients = []
         seen = set()
 

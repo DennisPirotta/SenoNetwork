@@ -14,13 +14,11 @@ from src.api_server import (
     sync_check_updates_sync
 )
 from src.config import Settings
-from src.models import ExtractionResult, REDCapField
+from src.models import ExtractionResult
 from src.redcap_service import REDCapService
 from src.sync_service import (
-    FieldUpdateDetail,
     PatientSyncResult,
     RedCapSyncService,
-    SyncSummaryReport
 )
 
 
@@ -289,7 +287,7 @@ def test_sync_patient_post_operative_histology_update(tmp_path, mock_settings):
 
     # Mock PDFExtractor and FormClassifier
     with patch("src.sync_service.PDFExtractor.extract_text", return_value="Carcinoma duttale infiltrante pezzo operatorio"):
-        with patch("src.sync_service.FormClassifier.classify_report", return_value="anatomia_patologica"):
+        with patch("src.sync_service.FormClassifier.classify_report_targets", return_value=["anatomia_patologica"]):
             # Execute sync
             result = sync_svc.check_and_update_patient(
                 patient_id=patient_id,
@@ -301,7 +299,7 @@ def test_sync_patient_post_operative_histology_update(tmp_path, mock_settings):
     # 5. Assertions
     assert result.status == "updated"
     assert "anatomia_patologica" in result.forms_updated
-    assert result.field_updates_count >= 5  # invasive_histological_type, grade, pt, pn, anatomia_patologica_complete
+    assert result.field_updates_count == 4  # invasive_histological_type, grade, pt, pn
 
     # Verify REDCap import was called with the updated fields
     assert mock_redcap_svc.import_records_to_api.called
@@ -311,7 +309,7 @@ def test_sync_patient_post_operative_histology_update(tmp_path, mock_settings):
     assert imported_payload["grade"] == "2"
     assert imported_payload["pt"] == "1c"
     assert imported_payload["pn"] == "0"
-    assert imported_payload["anatomia_patologica_complete"] == "2"
+    assert imported_payload["anatomia_patologica_complete"] == "1"
 
     # Verify state file was created and contains the updated form
     state_file = mock_settings.state_dir / f"{patient_id}_state.json"
@@ -358,7 +356,7 @@ def test_sync_patient_dry_run_no_redcap_upload(tmp_path, mock_settings):
     )
 
     with patch("src.sync_service.PDFExtractor.extract_text", return_value="Pezzo operatorio"):
-        with patch("src.sync_service.FormClassifier.classify_report", return_value="anatomia_patologica"):
+        with patch("src.sync_service.FormClassifier.classify_report_targets", return_value=["anatomia_patologica"]):
             res = sync_svc.check_and_update_patient(
                 patient_id=patient_id,
                 target_forms=["anatomia_patologica"],
@@ -370,6 +368,70 @@ def test_sync_patient_dry_run_no_redcap_upload(tmp_path, mock_settings):
     assert res.field_updates_count > 0
     # Must NOT call import_records_to_api
     assert not mock_redcap_svc.import_records_to_api.called
+
+
+def test_sync_fill_missing_preserves_existing_values_and_deduplicates_state(tmp_path, mock_settings):
+    """Ensures fill_missing mode never overwrites populated fields and state file deduplicates by sha256."""
+    patient_id = "test-fill-missing"
+    existing_record = {
+        "record_id": patient_id,
+        "name": "Elena",
+        "surname": "Santi",
+        "anatomia_patologica_complete": "1",
+        "grade": "1",  # Already populated -> must NOT be overwritten in fill_missing mode
+        "pt": "",      # Empty -> should be enriched
+    }
+
+    mock_redcap_svc = MagicMock(spec=REDCapService)
+    mock_redcap_svc.get_record.return_value = existing_record
+
+    pdf_file = tmp_path / "histology.pdf"
+    pdf_file.write_bytes(b"%PDF-1.4 Mock Identical")
+
+    mock_dotnet = MagicMock()
+    mock_dotnet.download_all_patient_pdfs.return_value = [pdf_file]
+
+    mock_ai = MagicMock(spec=BaseAIExtractor)
+    mock_ai.extract_from_text.return_value = ExtractionResult(
+        pdf_path=str(pdf_file),
+        record_id=patient_id,
+        extracted_data={"grade": "3", "pt": "2"},
+        redcap_record={"record_id": patient_id, "grade": "3", "pt": "2", "anatomia_patologica_complete": "1"},
+        status="success"
+    )
+
+    sync_svc = RedCapSyncService(
+        settings=mock_settings,
+        redcap_service=mock_redcap_svc,
+        dotnet_client=mock_dotnet,
+        ai_extractor=mock_ai
+    )
+
+    with patch("src.sync_service.PDFExtractor.extract_text", return_value="Pezzo operatorio"):
+        with patch("src.sync_service.FormClassifier.classify_report_targets", return_value=["anatomia_patologica"]):
+            res = sync_svc.check_and_update_patient(
+                patient_id=patient_id,
+                target_forms=["anatomia_patologica"],
+                auto_upload=True,
+                dry_run=False,
+                overwrite_mode="fill_missing",
+            )
+            # Run a second time with force_reprocess=True -> state files list must still deduplicate by sha256
+            sync_svc.check_and_update_patient(
+                patient_id=patient_id,
+                target_forms=["anatomia_patologica"],
+                auto_upload=False,
+                dry_run=False,
+                force_reprocess=True,
+                overwrite_mode="fill_missing",
+            )
+
+    imported_payload = mock_redcap_svc.import_records_to_api.call_args[0][0][0]
+    assert "grade" not in imported_payload
+    assert imported_payload["pt"] == "2"
+    assert res.field_updates_count >= 1
+    state_content = json.loads((mock_settings.state_dir / f"{patient_id}_state.json").read_text(encoding="utf-8"))
+    assert len(state_content["files"]) == 1
 
 
 def test_sync_all_summary_report(tmp_path, mock_settings):

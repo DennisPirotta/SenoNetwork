@@ -1,4 +1,4 @@
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 from src.models import REDCapField
 
 
@@ -10,7 +10,8 @@ class SchemaBuilder:
         fields: List[REDCapField],
         enforce_all_required: bool = True,
         form_name: Optional[str] = None,
-        guidelines_mgr: Optional[Any] = None
+        guidelines_mgr: Optional[Any] = None,
+        include_record_id: bool = True,
     ) -> Dict[str, Any]:
         """Generates a JSON Schema compatible with Ollama and llama.cpp structured outputs (`format`/`json_schema`).
 
@@ -38,6 +39,8 @@ class SchemaBuilder:
         for field in fields:
             if not field.is_extractable:
                 continue
+            if not include_record_id and field.field_name == "record_id":
+                continue
 
             field_desc = field.field_label.strip().replace("\n", " ")
             if field.branching_logic:
@@ -52,7 +55,7 @@ class SchemaBuilder:
             # Dropdown / Radio single choice
             if field.field_type in {"dropdown", "radio"}:
                 choices = field.parse_choices()
-                choices_str = ", ".join([f"'{c}'={lbl[:20]}" for c, lbl in list(choices.items())[:10]])
+                choices_str = ", ".join([f"'{c}'={lbl[:35]}" for c, lbl in choices.items()])
                 allowed_codes = list(choices.keys())
                 properties[field.field_name] = {
                     "type": ["string", "null"],
@@ -79,7 +82,7 @@ class SchemaBuilder:
             # Checkbox multiple choice
             elif field.field_type == "checkbox":
                 choices = field.parse_choices()
-                choices_str = ", ".join([f"'{c}'={lbl[:18]}" for c, lbl in list(choices.items())[:8]])
+                choices_str = ", ".join([f"'{c}'={lbl[:35]}" for c, lbl in choices.items()])
                 properties[field.field_name] = {
                     "type": ["array", "null"],
                     "items": {
@@ -136,7 +139,8 @@ class SchemaBuilder:
     def build_prompt_guidelines(
         fields: List[REDCapField],
         form_name: Optional[str] = None,
-        guidelines_mgr: Optional[Any] = None
+        guidelines_mgr: Optional[Any] = None,
+        include_record_id: bool = True,
     ) -> str:
         """Constructs concise, high-density field guidelines in Italian for prompt context.
         Optimized to fit within prompt token budgets while clearly communicating allowed codes
@@ -149,6 +153,11 @@ class SchemaBuilder:
             except Exception:
                 guidelines_mgr = None
 
+        record_id_instr = (
+            "- Per record_id: se nel referto è presente un ID paziente o cartella, estrailo, altrimenti null.\n"
+            if include_record_id
+            else ""
+        )
         lines = []
         lines.append("### CAMPI DA ESTRARRE SECONDO I METADATA REDCAP:")
         lines.append(
@@ -156,7 +165,7 @@ class SchemaBuilder:
             "- Estrai SOLO i dati clinici esplicitamente menzionati nel referto (imposta a null i campi non citati).\n"
             "- Per radio/dropdown/yesno/truefalse: usa ESCLUSIVAMENTE la stringa del CODICE indicato tra parentesi quadre (es. \"1\", \"2\"). Non restituire testo descrittivo.\n"
             "- Per checkbox (multipli): restituisci un array JSON con i SOLI codici delle opzioni accertate nel referto.\n"
-            "- Per record_id: se nel referto è presente un ID paziente o cartella, estrailo, altrimenti null.\n"
+            f"{record_id_instr}"
             "- REGOLE DI DIPENDENZA E VISIBILITÀ (BRANCHING LOGIC): Se un campo indica [DIPENDE DA: ...], può avere un valore SOLO SE la condizione sul campo padre è pienamente verificata nel referto. Se la condizione non è verificata o il campo padre ha un valore diverso, il campo dipendente DEVE RIGOROSAMENTE ESSERE null (non inserire valori dummy come '0' o '9', altrimenti REDCap solleverà errori bloccanti di campo nascosto con valore).\n"
         )
 
@@ -187,14 +196,16 @@ class SchemaBuilder:
         for f in fields:
             if not f.is_extractable:
                 continue
+            if not include_record_id and f.field_name == "record_id":
+                continue
 
             if f.form_name and f.form_name != current_form:
                 current_form = f.form_name
                 lines.append(f"\n[Strumento / Form: {current_form}]")
 
             label = (f.field_label or f.field_name).strip().replace("\n", " ")
-            if len(label) > 55:
-                label = label[:52] + "..."
+            if len(label) > 80:
+                label = label[:77] + "..."
 
             if f.branching_logic:
                 clean_dep = f.branching_logic.strip().replace("\r\n", " ").replace("\n", " ")
@@ -207,20 +218,20 @@ class SchemaBuilder:
             if f.field_type in {"dropdown", "radio", "yesno", "truefalse"}:
                 choices = f.parse_choices()
                 ch_items = []
-                for k, v in list(choices.items())[:10]:
+                for k, v in choices.items():
                     clean_v = v.split(" - ")[-1].strip() if " - " in v else v.strip()
-                    if len(clean_v) > 18:
-                        clean_v = clean_v[:16] + ".."
+                    if len(clean_v) > 36:
+                        clean_v = clean_v[:34] + ".."
                     ch_items.append(f'"{k}"={clean_v}')
                 line = f"- `{f.field_name}` ({f.field_type}): {label} [{', '.join(ch_items)}]"
 
             elif f.field_type == "checkbox":
                 choices = f.parse_choices()
                 ch_items = []
-                for k, v in list(choices.items())[:8]:
+                for k, v in choices.items():
                     clean_v = v.split(" - ")[-1].strip() if " - " in v else v.strip()
-                    if len(clean_v) > 16:
-                        clean_v = clean_v[:14] + ".."
+                    if len(clean_v) > 36:
+                        clean_v = clean_v[:34] + ".."
                     ch_items.append(f'"{k}"={clean_v}')
                 line = f"- `{f.field_name}` ({f.field_type}): {label} [{', '.join(ch_items)}]"
 

@@ -15,25 +15,23 @@ Identifica ed evidenzia automaticamente i problemi comuni dei tunnel/reverse-pro
 
 Utilizzo:
     python3 scripts/test_priamo_auth.py
-    python3 scripts/test_priamo_auth.py --url https://priamo.miodominio.com -u 90092 -p 'TuaPass'
+    python3 scripts/test_priamo_auth.py --url https://priamo.miodominio.com -u TUO_USERNAME -p 'TuaPass'
     python3 scripts/test_priamo_auth.py --verbose
 """
 
 import argparse
 import http.cookies
-import json
 import os
 import re
 import sys
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 from urllib.parse import urljoin, urlparse
 
 try:
     import requests
     from requests import Response, Session
-    from requests.adapters import HTTPAdapter
     import urllib3
     urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 except ImportError:
@@ -792,7 +790,7 @@ def main():
         print(f"{Colors.RED}[ERRORE] Credenziali o URL mancanti!{Colors.RESET}")
         print("Specificali tramite argomenti CLI (--url, -l, -p) oppure nel file .env:")
         print("  PRIAMO_API_URL=https://priamo.miodominio.com")
-        print("  PRIAMO_USERNAME=90092")
+        print("  PRIAMO_USERNAME=TUO_USERNAME")
         print("  PRIAMO_PASSWORD=...")
         sys.exit(1)
 

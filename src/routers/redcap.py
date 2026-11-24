@@ -7,6 +7,7 @@ from src.config import Settings, get_settings
 import src.redcap_service as redcap_service
 from src.redcap_service import REDCapService
 from src.routers.security import verify_api_key
+from src.utils import sanitize_identifier
 
 router = APIRouter(tags=["REDCap Records"])
 
@@ -46,7 +47,7 @@ def get_all_records(
 @router.get("/api/redcap/records/summary", dependencies=[Depends(verify_api_key)])
 def get_records_summary(
     redcap_svc: REDCapService = Depends(get_redcap_service)
-) -> Dict[str, Any]:
+) -> List[Dict[str, Any]]:
     """Restituisce un riepilogo aggregato dei record e dei tassi di completamento dei form su REDCap."""
     try:
         return redcap_svc.get_records_summary()
@@ -60,16 +61,18 @@ def get_single_record(
     redcap_svc: REDCapService = Depends(get_redcap_service)
 ) -> Dict[str, Any]:
     """Recupera tutti i dati clinici e i campi registrati per un singolo record_id su REDCap."""
+    clean_id = sanitize_identifier(record_id, default="")
+    if not clean_id or clean_id != str(record_id).strip():
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="record_id non valido.")
     try:
-        records = redcap_svc.list_all_records(include_demographics=True, include_completion_status=True)
-        matched = [r for r in records if str(r.get("record_id")) == str(record_id)]
-        if not matched:
-            raise HTTPException(status_code=404, detail=f"Record '{record_id}' non trovato su REDCap.")
-        return matched[0]
+        record = redcap_svc.get_record(clean_id)
+        if not record:
+            raise HTTPException(status_code=404, detail=f"Record '{clean_id}' non trovato su REDCap.")
+        return record
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Errore recupero record '{record_id}': {e}")
+        raise HTTPException(status_code=500, detail=f"Errore recupero record '{clean_id}': {e}")
 
 
 @router.delete("/api/redcap/records/{record_id}", dependencies=[Depends(verify_api_key)])
@@ -79,28 +82,32 @@ def delete_single_record(
     settings: Settings = Depends(get_settings)
 ) -> Dict[str, Any]:
     """Elimina un singolo record da REDCap specificando il suo record_id."""
+    clean_id = sanitize_identifier(record_id, default="")
+    if not clean_id or clean_id != str(record_id).strip():
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="record_id non valido.")
+    delete_token = settings.redcap_delete_token or settings.redcap_api_token
     try:
         count = redcap_service.delete_redcap_records(
-            record_id=record_id,
+            record_id=clean_id,
             clean_local_state=clean_local_state,
             api_url=settings.redcap_api_url,
-            api_token=settings.redcap_api_token
+            api_token=delete_token
         )
         if count == 0:
-            raise HTTPException(status_code=404, detail=f"Record '{record_id}' non trovato o non eliminato da REDCap.")
+            raise HTTPException(status_code=404, detail=f"Record '{clean_id}' non trovato o non eliminato da REDCap.")
 
         return {
             "status": "deleted",
-            "record_id": record_id,
+            "record_id": clean_id,
             "deleted_count": count,
-            "message": f"Record '{record_id}' eliminato con successo da REDCap."
+            "message": f"Record '{clean_id}' eliminato con successo da REDCap."
         }
     except PermissionError as pe:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(pe))
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Errore eliminazione record '{record_id}': {e}")
+        raise HTTPException(status_code=500, detail=f"Errore eliminazione record '{clean_id}': {e}")
 
 
 @router.delete("/api/redcap/records", dependencies=[Depends(verify_api_key)])
@@ -109,20 +116,27 @@ def delete_all_records(
     clean_local_state: bool = Query(False, description="Rimuove anche i file di tracking locale in data/state"),
     settings: Settings = Depends(get_settings)
 ) -> Dict[str, Any]:
-    """Elimina TUTTI i record attualmente presenti nel progetto REDCap (richiede ?confirm=true)."""
+    """Elimina TUTTI i record attualmente presenti nel progetto REDCap (richiede ?confirm=true e ALLOW_MASS_DELETE=true)."""
+    if not settings.allow_mass_delete:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Eliminazione massiva REDCap disabilitata via API (impostare ALLOW_MASS_DELETE=true in .env)."
+        )
+
     if not confirm:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Operazione ad alto rischio: per eliminare tutti i record è obbligatorio specificare il parametro ?confirm=true."
         )
 
+    delete_token = settings.redcap_delete_token or settings.redcap_api_token
     try:
         count = redcap_service.delete_redcap_records(
             all_records=True,
             confirm=True,
             clean_local_state=clean_local_state,
             api_url=settings.redcap_api_url,
-            api_token=settings.redcap_api_token
+            api_token=delete_token
         )
         return {
             "status": "deleted",

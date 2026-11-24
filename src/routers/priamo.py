@@ -25,8 +25,8 @@ class VerifyCohortRequest(BaseModel):
         description="Lista di pazienti da verificare. Se omessa, carica automaticamente i pazienti dall'ultimo foglio CUP."
     )
     cup_file_name: Optional[str] = Field(default=None, description="Nome file CUP alternativo da cui caricare i pazienti")
-    limit: Optional[int] = Field(default=None, description="Numero massimo di pazienti da verificare")
-    max_workers: int = Field(default=4, description="Numero di thread concorrenti per la verifica")
+    limit: Optional[int] = Field(default=None, ge=1, le=5000, description="Numero massimo di pazienti da verificare")
+    max_workers: int = Field(default=4, ge=1, le=16, description="Numero di thread concorrenti per la verifica")
 
 
 @router.post("/api/priamo/verify-patient", dependencies=[Depends(verify_api_key)])
@@ -92,7 +92,7 @@ def verify_cohort(
     source_desc = "payload"
 
     if not cohort:
-        target_file = _find_target_cup_file(req.cup_file_name)
+        target_file = _find_target_cup_file(req.cup_file_name, cup_dir=settings.cup_dir)
         pzs = estrai_pazienti_univoci(target_file, only_complete=True)
         cohort = [
             {
@@ -112,14 +112,18 @@ def verify_cohort(
 
     try:
         results = dotnet.verify_patients_cohort(cohort, max_workers=req.max_workers)
-        found_count = sum(1 for r in results if r.get("status") == "TROVATO")
-        not_found_count = sum(1 for r in results if r.get("status") == "NON_TROVATO")
+        found_count = sum(1 for r in results if r.get("status") == "found")
+        not_found_count = sum(1 for r in results if r.get("status") == "not_found")
+        incomplete_count = sum(1 for r in results if r.get("status") == "incomplete")
+        error_count = sum(1 for r in results if r.get("status") == "error")
 
         return {
             "source": source_desc,
             "total_tested": len(results),
             "found_count": found_count,
             "not_found_count": not_found_count,
+            "incomplete_count": incomplete_count,
+            "error_count": error_count,
             "results": results
         }
     except Exception as e:

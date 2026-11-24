@@ -37,7 +37,6 @@ Pipeline clinica per estrazione dati da referti medici PDF (senologia) tramite I
 | | `scripts/audit_redcap_data.py` | CLI dashboard e generatore report su incongruenze, mancanze e panoramica generale dati REDCap. |
 | | `scripts/run_periodic_redcap_sync.py` | CLI runner / daemon schedulabile per audit periodico e aggiornamento dati clinici su REDCap. |
 | | `scripts/test_remote_llamacpp.py` | Diagnostica e benchmarking server llama.cpp remoto/RPC (latenza, GBNF schema, estrazione clinica). |
-| | `scripts/start_llama_rpc_cluster.sh` | Bash script per avvio cluster distribuito llama.cpp su 2 GPU via RPC. |
 | | `scripts/create_sample_data.py` | Generatore referti sintetici PDF A4 per test. |
 | | `scripts/inspect_redcap_project.py` | Utility di test e dump metadata live da REDCap API. |
 | | `scripts/generate_redcap_summary.py`| Generatore documentazione markdown struttura REDCap (`docs/REDCAP_STRUCTURE.md`). |
@@ -183,19 +182,17 @@ Pipeline clinica per estrazione dati da referti medici PDF (senologia) tramite I
 ### `src/pipeline.py`
 - **`ExtractionPipeline`**: Orchestratore batch generico per cartelle o liste di file PDF. Tipizzato con `AIExtractor`. Esporta in JSON (`export_to_json`) e CSV REDCap (`export_to_redcap_csv`).
 
-### `src/api_server.py`
-- Microservizio FastAPI (`main.py --serve --port 8000`):
-  - Dependency Injection con `Depends(get_pipeline)` e `Depends(get_shared_settings)`.
-  - `GET /health`: Stato di llama.cpp RPC, Ollama, REDCap e Priamo .NET.
-  - `POST /api/patient/{id}/process`: Trigger sincrono da applicazione .NET.
-  - `POST /api/patient/{id}/process-async`: Trigger asincrono (`BackgroundTasks`) con restituzione immediata di `task_id`.
-  - `GET /api/tasks/{task_id}`: Polling stato ed esito elaborazione background.
-  - `POST /api/patient/{id}/upload-pdfs`: Upload multipart di PDF direttamente da applicazione .NET.
-  - `POST /api/batch/excel`: Elaborazione batch di coorte da file Excel configurato in `Settings`.
-  - `GET /api/redcap/records`: Elenco completo dei record presenti su REDCap con filtri.
-  - `GET /api/redcap/records/summary`: Panoramica aggregata di avanzamento e form completati.
-  - `DELETE /api/redcap/records/{record_id}`: Eliminazione singolo record paziente con opzione `clean_local_state`.
-  - `DELETE /api/redcap/records?confirm=true`: Eliminazione massiva di tutti i record da REDCap protetta da `confirm=true`.
+### `src/api_server.py` e `src/routers/*`
+- Microservizio FastAPI (`main.py --serve --port 8000`) strutturato per router modulari:
+  - `GET /health` & `GET /api/dashboard/overview`: Stato concorrente di llama.cpp RPC, Ollama, REDCap e Priamo .NET + metriche locali.
+  - `POST /api/security/generate-key` & `POST /api/security/sse-token`: Generazione API key protetta e token SSE a breve scadenza (`?sse_token=`).
+  - `POST /api/cup/download`, `POST /api/cup/download-latest`, `GET /api/cup/files`, `GET /api/cup/patients`, `GET /api/cup/export`: Gestione fogli di lavoro PriamoCUP e matching REDCap.
+  - `POST /api/priamo/verify-patient` & `POST /api/priamo/verify-cohort`: Verifica anagrafica certificata e coorte su HIS Priamo.
+  - `POST /api/pipeline/process-patient`, `POST /api/patient/{id}/process`, `POST /api/pipeline/process-patient-async`, `POST /api/pipeline/process-batch-async`: Pipeline paziente singola e batch con per-patient mutex e semaforo concorrenza LLM.
+  - `GET /api/tasks/{task_id}` & `GET /api/tasks/{task_id}/events`: Polling stato ed eventi Server-Sent Events (SSE) thread-safe con TTL eviction.
+  - `GET /api/audit/report`, `GET /api/audit/anomalies`, `GET /api/audit/completion-matrix`: Audit qualità dati, anomalie e matrice completamento.
+  - `POST /api/sync/check-updates`, `POST /api/sync/check-updates-async`, `GET /api/sync/incomplete-patients`: Riconciliazione periodica e diff sicuro su REDCap.
+  - `GET /api/redcap/records`, `GET /api/redcap/records/summary`, `GET /api/redcap/records/{record_id}`, `DELETE /api/redcap/records/{record_id}`, `DELETE /api/redcap/records`: Gestione record REDCap (eliminazione massiva disabilitata di default tramite `allow_mass_delete`).
 
 ### `src/cli.py` & `main.py`
 - Entrypoint CLI:
@@ -226,5 +223,4 @@ Pipeline clinica per estrazione dati da referti medici PDF (senologia) tramite I
 - **Worker GPU 0**: `CUDA_VISIBLE_DEVICES=0 rpc-server -H 127.0.0.1 -p 50052`
 - **Worker GPU 1**: `CUDA_VISIBLE_DEVICES=1 rpc-server -H 127.0.0.1 -p 50053`
 - **Master Server**: `llama-server -m <model.gguf> --rpc 127.0.0.1:50052,127.0.0.1:50053 --host 0.0.0.0 --port 8080 -c 8192 --n-gpu-layers 999`
-- **Script launcher**: `./scripts/start_llama_rpc_cluster.sh <model.gguf>`
 - **Fallback status**: Se offline, `get_ai_extractor()` usa `OllamaExtractor` (`127.0.0.1:11434`). Quando il cluster è online su `:8080`, commuta a `LlamaCppExtractor` senza modifiche al codice.

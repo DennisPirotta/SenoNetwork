@@ -1,16 +1,15 @@
 """PriamoCUP Worksheets and Patients API Router."""
 
-from datetime import date, datetime
+from datetime import datetime
 import io
 import json
 import logging
 import math
 from pathlib import Path
-import re
+import threading
 import time
 from typing import Any, Dict, List, Optional, Tuple
-import unicodedata
-from fastapi import APIRouter, Body, Depends, HTTPException, Query, Response, status
+from fastapi import APIRouter, Body, Depends, HTTPException, Query, status
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field
 import pandas as pd
@@ -23,16 +22,16 @@ from src.priamo_cup_client import (
     UNITA_SENOLOGIA,
     PriamoCupClient,
 )
-from scripts.extract_patients_from_shared_file import (
-    Paziente,
-    estrai_pazienti_da_fogli_cup,
-    estrai_pazienti_univoci,
-)
+from scripts.extract_patients_from_shared_file import estrai_pazienti_univoci
 from src.routers.security import verify_api_key
+from src.utils import normalize_person_name, sanitize_identifier
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["Priamo CUP"])
+
+_CACHE_LOCK = threading.Lock()
+MAX_CUP_CACHE_ENTRIES = 64
 
 # Cache in-memory per il conteggio dei pazienti nei file CUP: (file_name, mtime) -> count
 _CUP_FILE_CACHE: Dict[Tuple[str, float], int] = {}
@@ -40,18 +39,11 @@ _CUP_FILE_CACHE: Dict[Tuple[str, float], int] = {}
 # Cache in-memory per la corrispondenza dei record REDCap: TTL 60s
 _REDCAP_LOOKUP_CACHE: Dict[str, Any] = {
     "timestamp": 0.0,
+    "by_cf": {},
     "by_demographics": {},
-    "by_name": {},
+    "ambiguous_demographics": set(),
     "by_id": {},
 }
-
-
-def _normalize_name(s: Optional[str]) -> str:
-    """Normalizza un nome/cognome per confronto robusto senza accenti e caratteri speciali."""
-    if not s:
-        return ""
-    norm = unicodedata.normalize("NFKD", str(s)).encode("ASCII", "ignore").decode("utf-8")
-    return re.sub(r"[^a-z0-9]", "", norm.lower())
 
 
 def _normalize_dob(dob: Any) -> str:
@@ -73,24 +65,33 @@ def _get_redcap_lookup(settings: Settings, force_refresh: bool = False) -> Dict[
     """Recupera l'elenco dei record REDCap per il matching con i pazienti CUP, con cache a 60 secondi."""
     global _REDCAP_LOOKUP_CACHE
     now = time.time()
-    if not force_refresh and (now - _REDCAP_LOOKUP_CACHE["timestamp"]) < 60 and _REDCAP_LOOKUP_CACHE["timestamp"] > 0:
-        return _REDCAP_LOOKUP_CACHE
+    with _CACHE_LOCK:
+        if (
+            not force_refresh
+            and _REDCAP_LOOKUP_CACHE["timestamp"] > 0
+            and (now - _REDCAP_LOOKUP_CACHE["timestamp"]) < 60
+        ):
+            return _REDCAP_LOOKUP_CACHE
 
     if not settings.redcap_api_url or not settings.redcap_api_token:
-        return _REDCAP_LOOKUP_CACHE
+        with _CACHE_LOCK:
+            return _REDCAP_LOOKUP_CACHE
 
     try:
         svc = REDCapService(api_url=settings.redcap_api_url, api_token=settings.redcap_api_token)
         summary = svc.get_records_summary()
+        by_cf: Dict[str, Dict[str, Any]] = {}
         by_demo: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
-        by_name: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
+        ambiguous_demo: set = set()
         by_id: Dict[str, Dict[str, Any]] = {}
 
         for rec in summary:
             rid = str(rec.get("record_id", "")).strip()
-            name_norm = _normalize_name(rec.get("name"))
-            sur_norm = _normalize_name(rec.get("surname"))
+            name_norm = normalize_person_name(rec.get("name"))
+            sur_norm = normalize_person_name(rec.get("surname"))
             dob_norm = _normalize_dob(rec.get("date_of_birth"))
+            raw_rec = rec.get("raw_record") or {}
+            cf_norm = str(rec.get("codice_fiscale") or raw_rec.get("codice_fiscale") or "").strip().upper()
             forms_completed = rec.get("forms_completed_count", 0)
 
             rec_info = {
@@ -102,26 +103,41 @@ def _get_redcap_lookup(settings: Settings, force_refresh: bool = False) -> Dict[
             if rid:
                 by_id[rid.lower()] = rec_info
 
-            if sur_norm and name_norm:
-                if dob_norm:
-                    by_demo[(sur_norm, name_norm, dob_norm)] = rec_info
-                by_name.setdefault((sur_norm, name_norm), []).append(rec_info)
+            if cf_norm:
+                by_cf[cf_norm] = rec_info
 
-        _REDCAP_LOOKUP_CACHE = {
+            if sur_norm and name_norm and dob_norm:
+                demo_key = (sur_norm, name_norm, dob_norm)
+                if demo_key in by_demo:
+                    ambiguous_demo.add(demo_key)
+                else:
+                    by_demo[demo_key] = rec_info
+
+        for key in ambiguous_demo:
+            by_demo.pop(key, None)
+
+        new_cache = {
             "timestamp": now,
+            "by_cf": by_cf,
             "by_demographics": by_demo,
-            "by_name": by_name,
+            "ambiguous_demographics": ambiguous_demo,
             "by_id": by_id,
         }
+        with _CACHE_LOCK:
+            _REDCAP_LOOKUP_CACHE = new_cache
+            return _REDCAP_LOOKUP_CACHE
     except Exception as e:
         logger.debug(f"Impossibile aggiornare cache record REDCap per CUP: {e}")
-
-    return _REDCAP_LOOKUP_CACHE
+        with _CACHE_LOCK:
+            return _REDCAP_LOOKUP_CACHE
 
 
 def _check_local_state(patient_id: str, state_dir: Path) -> Tuple[bool, bool]:
     """Verifica l'esistenza del file di stato locale e lo status dell'upload su REDCap."""
-    p_path = state_dir / f"{patient_id}_state.json"
+    safe_id = sanitize_identifier(patient_id, default="")
+    if not safe_id:
+        return False, False
+    p_path = Path(state_dir) / f"{safe_id}_state.json"
     if not p_path.exists():
         return False, False
     try:
@@ -145,25 +161,25 @@ class CupDownloadRequest(BaseModel):
     agendas: Optional[List[str]] = Field(default=None, description="Elenco agende (default: 3000, 3003, 3004, 3035, 3036)")
 
 
-def _find_target_cup_file(file_name: Optional[str] = None) -> Path:
-    cup_dir = Path("data/cup")
-    if not cup_dir.exists():
-        raise HTTPException(status_code=404, detail="Nessun foglio di lavoro CUP scaricato trovato (cartella data/cup vuota).")
+def _find_target_cup_file(file_name: Optional[str] = None, cup_dir: Optional[Path] = None) -> Path:
+    resolved_dir = Path(cup_dir or "data/cup")
+    if not resolved_dir.exists():
+        raise HTTPException(status_code=404, detail="Nessun foglio di lavoro CUP scaricato trovato (cartella CUP vuota).")
 
     if file_name and file_name.strip():
         clean_name = Path(file_name.strip()).name
-        target = cup_dir / clean_name
+        target = resolved_dir / clean_name
         if not target.exists():
             raise HTTPException(status_code=404, detail=f"File CUP non trovato: {clean_name}")
         return target
 
     files = sorted(
-        list(cup_dir.glob("*.xlsx")) + list(cup_dir.glob("*.xls")),
+        list(resolved_dir.glob("*.xlsx")) + list(resolved_dir.glob("*.xls")),
         key=lambda f: f.stat().st_mtime,
         reverse=True
     )
     if not files:
-        raise HTTPException(status_code=404, detail="Nessun file Excel CUP trovato in data/cup.")
+        raise HTTPException(status_code=404, detail="Nessun file Excel CUP trovato nella cartella configurata.")
     return files[0]
 
 
@@ -172,11 +188,16 @@ def _get_cup_patient_count(f: Path) -> int:
     try:
         mtime = f.stat().st_mtime
         key = (f.name, mtime)
-        if key in _CUP_FILE_CACHE:
-            return _CUP_FILE_CACHE[key]
+        with _CACHE_LOCK:
+            if key in _CUP_FILE_CACHE:
+                return _CUP_FILE_CACHE[key]
         pts = estrai_pazienti_univoci(f)
         count = len(pts)
-        _CUP_FILE_CACHE[key] = count
+        with _CACHE_LOCK:
+            if len(_CUP_FILE_CACHE) >= MAX_CUP_CACHE_ENTRIES:
+                oldest = next(iter(_CUP_FILE_CACHE))
+                _CUP_FILE_CACHE.pop(oldest, None)
+            _CUP_FILE_CACHE[key] = count
         return count
     except Exception:
         return 0
@@ -208,12 +229,16 @@ def download_cup_worksheets(
             weeks=req.weeks,
             codice_unita=req.unit,
             agende=agendas,
-            output_dir="data/cup",
+            output_dir=str(settings.cup_dir),
         )
 
         # Estrai pazienti per contare i record univoci e aggiorna la cache
         pazienti = estrai_pazienti_univoci(downloaded_file)
-        _CUP_FILE_CACHE[(downloaded_file.name, downloaded_file.stat().st_mtime)] = len(pazienti)
+        with _CACHE_LOCK:
+            if len(_CUP_FILE_CACHE) >= MAX_CUP_CACHE_ENTRIES:
+                oldest = next(iter(_CUP_FILE_CACHE))
+                _CUP_FILE_CACHE.pop(oldest, None)
+            _CUP_FILE_CACHE[(downloaded_file.name, downloaded_file.stat().st_mtime)] = len(pazienti)
 
         size_kb = downloaded_file.stat().st_size / 1024
         size_str = f"{size_kb:.1f} KB" if size_kb < 1024 else f"{(size_kb / 1024):.2f} MB"
@@ -260,9 +285,9 @@ def download_latest_cup_worksheet(
 
 
 @router.get("/api/cup/files", dependencies=[Depends(verify_api_key)])
-def list_cup_files() -> List[Dict[str, Any]]:
-    """Elenca tutti i file Excel di foglio lavoro scaricati e archiviati in data/cup/."""
-    cup_dir = Path("data/cup")
+def list_cup_files(settings: Settings = Depends(get_settings)) -> List[Dict[str, Any]]:
+    """Elenca tutti i file Excel di foglio lavoro scaricati e archiviati nella cartella CUP."""
+    cup_dir = Path(settings.cup_dir)
     if not cup_dir.exists():
         return []
 
@@ -293,9 +318,9 @@ def list_cup_files() -> List[Dict[str, Any]]:
 
 
 @router.get("/api/cup/files/{file_name}/download", dependencies=[Depends(verify_api_key)])
-def download_cup_file_raw(file_name: str):
-    """Permette di scaricare direttamente il file Excel originale archiviato in data/cup/."""
-    target = _find_target_cup_file(file_name)
+def download_cup_file_raw(file_name: str, settings: Settings = Depends(get_settings)):
+    """Permette di scaricare direttamente il file Excel originale archiviato nella cartella CUP."""
+    target = _find_target_cup_file(file_name, cup_dir=settings.cup_dir)
     return FileResponse(
         path=str(target),
         filename=target.name,
@@ -305,7 +330,7 @@ def download_cup_file_raw(file_name: str):
 
 @router.get("/api/cup/patients", dependencies=[Depends(verify_api_key)])
 def get_cup_patients(
-    file_name: Optional[str] = Query(None, description="Nome file specifico in data/cup (se omesso usa il più recente)"),
+    file_name: Optional[str] = Query(None, description="Nome file specifico nella cartella CUP (se omesso usa il più recente)"),
     cup_file: Optional[str] = Query(None, description="Alias per file_name"),
     search: Optional[str] = Query(None, description="Filtro di ricerca testuale (nome, cognome, codice fiscale, slug)"),
     agenda: Optional[str] = Query(None, description="Filtra per codice agenda (es. 3004)"),
@@ -317,7 +342,7 @@ def get_cup_patients(
 ) -> Dict[str, Any]:
     """Restituisce l'elenco dei pazienti univoci estratti dal foglio CUP con filtri, paginazione e verifica stato REDCap."""
     target_name = file_name or cup_file
-    target_file = _find_target_cup_file(target_name)
+    target_file = _find_target_cup_file(target_name, cup_dir=settings.cup_dir)
     pazienti = estrai_pazienti_univoci(target_file, only_complete=only_complete)
 
     # Filtraggio per ricerca testuale
@@ -343,28 +368,30 @@ def get_cup_patients(
 
     # Verifica corrispondenza con REDCap e file di stato locale
     redcap_lookup = _get_redcap_lookup(settings, force_refresh=refresh_redcap)
-    state_dir = Path("data/state")
+    state_dir = Path(settings.state_dir)
     items = []
 
     for p in page_items:
-        sur_norm = _normalize_name(p.cognome)
-        name_norm = _normalize_name(p.nome)
+        sur_norm = normalize_person_name(p.cognome)
+        name_norm = normalize_person_name(p.nome)
         dob_norm = _normalize_dob(p.data_nascita)
+        cf_norm = str(p.codice_fiscale or "").strip().upper()
 
         redcap_match = None
-        # 1. Matching anagrafico completo (cognome, nome, data di nascita)
-        if (sur_norm, name_norm, dob_norm) in redcap_lookup.get("by_demographics", {}):
+        # 1. Matching su Codice Fiscale esatto
+        if cf_norm and cf_norm in redcap_lookup.get("by_cf", {}):
+            redcap_match = redcap_lookup["by_cf"][cf_norm]
+        # 2. Matching anagrafico completo e univoco (cognome, nome, data di nascita)
+        elif (
+            sur_norm
+            and name_norm
+            and dob_norm
+            and (sur_norm, name_norm, dob_norm) in redcap_lookup.get("by_demographics", {})
+        ):
             redcap_match = redcap_lookup["by_demographics"][(sur_norm, name_norm, dob_norm)]
-        # 2. Matching anagrafico su cognome e nome univoci
-        elif (sur_norm, name_norm) in redcap_lookup.get("by_name", {}):
-            candidates = redcap_lookup["by_name"][(sur_norm, name_norm)]
-            if len(candidates) == 1:
-                redcap_match = candidates[0]
-        # 3. Matching su ID (se patient_id o priamo_id coincide con record_id)
+        # 3. Matching esatto su patient_id (solo slug/id applicativo usato direttamente come record_id)
         elif p.patient_id and p.patient_id.lower() in redcap_lookup.get("by_id", {}):
             redcap_match = redcap_lookup["by_id"][p.patient_id.lower()]
-        elif p.priamo_id and str(p.priamo_id).lower() in redcap_lookup.get("by_id", {}):
-            redcap_match = redcap_lookup["by_id"][str(p.priamo_id).lower()]
 
         # 4. Verifica stato locale (su slug del paziente o record_id REDCap)
         has_local, is_local_uploaded = _check_local_state(p.patient_id, state_dir)
@@ -396,11 +423,12 @@ def export_cup_patients(
     file_name: Optional[str] = Query(None, description="Nome file specifico"),
     cup_file: Optional[str] = Query(None, description="Alias per file_name"),
     format: str = Query("csv", pattern="^(csv|xlsx|json)$", description="Formato esportazione: csv, xlsx, json"),
-    only_complete: bool = Query(False)
+    only_complete: bool = Query(False),
+    settings: Settings = Depends(get_settings),
 ):
     """Esporta l'anagrafica dei pazienti univoci in streaming per il download diretto dal browser."""
     target_name = file_name or cup_file
-    target_file = _find_target_cup_file(target_name)
+    target_file = _find_target_cup_file(target_name, cup_dir=settings.cup_dir)
     pazienti = estrai_pazienti_univoci(target_file, only_complete=only_complete)
     rows = [p.to_export_dict() for p in pazienti]
     df = pd.DataFrame(rows)

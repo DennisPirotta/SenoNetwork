@@ -13,44 +13,46 @@ Covers:
 - CLI --generate-key
 """
 
-from pathlib import Path
 from unittest.mock import MagicMock, patch
 import pandas as pd
 import pytest
 from fastapi.testclient import TestClient
 
 from src.api_server import app, main as api_main
-from src.config import Settings, get_settings
+from src.config import get_settings
 from src.patient_pipeline import PatientPipelineResult
 from src.routers.redcap import get_redcap_service
 
 
 @pytest.fixture(autouse=True)
-def ensure_cup_sample_file():
-    """Assicura la presenza di un file Excel di test in data/cup per gli endpoint di test."""
-    cup_dir = Path("data/cup")
+def ensure_cup_sample_file(tmp_path):
+    """Assicura la presenza di un file Excel CUP sintetico in tmp_path senza toccare data/cup."""
+    cup_dir = tmp_path / "cup"
+    state_dir = tmp_path / "state"
     cup_dir.mkdir(parents=True, exist_ok=True)
+    state_dir.mkdir(parents=True, exist_ok=True)
     sample_file = cup_dir / "test_sample_cup.xlsx"
-    created = False
-    if not list(cup_dir.glob("*.xlsx")) and not list(cup_dir.glob("*.xls")):
-        df = pd.DataFrame([{
-            "PAZ_COGNOME": "ROSSI",
-            "PAZ_NOME": "MARIA",
-            "PAZ_DATA_NASCITA": "1975-06-15",
-            "PAZ_CODICE_FISCALE": "RSSMRA75H55C933A",
-            "PAZ_SESSO": "F",
-            "PAZ_COMUNE_NASCITA": "COMO",
-            "PAZ_PROGRESSIVO_PAZ1": "123456",
-            "EROG_CODICE": "3004",
-            "SLOT_DATA": "2026-11-12",
-            "SLOT_ORA": "1130",
-            "PREST_DESCRIZIONE": "Medicazione",
-        }])
-        df.to_excel(sample_file, index=False)
-        created = True
-    yield
-    if created and sample_file.exists():
-        sample_file.unlink()
+    df = pd.DataFrame([{
+        "PAZ_COGNOME": "ROSSI",
+        "PAZ_NOME": "MARIA",
+        "PAZ_DATA_NASCITA": "1975-06-15",
+        "PAZ_CODICE_FISCALE": "RSSMRA75H55C933A",
+        "PAZ_SESSO": "F",
+        "PAZ_COMUNE_NASCITA": "COMO",
+        "PAZ_PROGRESSIVO_PAZ1": "123456",
+        "EROG_CODICE": "3004",
+        "SLOT_DATA": "2026-11-12",
+        "SLOT_ORA": "1130",
+        "PREST_DESCRIZIONE": "Medicazione",
+    }])
+    df.to_excel(sample_file, index=False, engine="openpyxl")
+
+    base_settings = get_settings().model_copy(update={"cup_dir": cup_dir, "state_dir": state_dir})
+    app.dependency_overrides[get_settings] = lambda: base_settings
+    try:
+        yield base_settings
+    finally:
+        app.dependency_overrides.pop(get_settings, None)
 
 
 @pytest.fixture
@@ -60,9 +62,9 @@ def client():
 
 
 @pytest.fixture
-def override_settings():
+def override_settings(ensure_cup_sample_file):
     """Helper fixture to temporarily override app settings."""
-    orig_settings = get_settings()
+    orig_settings = ensure_cup_sample_file
 
     def _override(**kwargs):
         new_settings = orig_settings.model_copy(update=kwargs)
@@ -70,7 +72,7 @@ def override_settings():
         return new_settings
 
     yield _override
-    app.dependency_overrides.pop(get_settings, None)
+    app.dependency_overrides[get_settings] = lambda: orig_settings
 
 
 # ---------------------------------------------------------------------------
@@ -153,14 +155,55 @@ def test_api_key_security_dev_bypass(client, override_settings):
     assert resp.status_code == 200
 
 
-def test_generate_api_key_endpoint(client):
-    """POST /api/security/generate-key returns a valid formatted api key."""
+def test_generate_api_key_endpoint(client, override_settings):
+    """POST /api/security/generate-key works in local dev and enforces X-API-Key when configured."""
+    override_settings(api_key=None)
     resp = client.post("/api/security/generate-key")
     assert resp.status_code == 200
     data = resp.json()
     assert "api_key" in data
     assert data["api_key"].startswith("sn_")
     assert "SENONETWORK_API_KEY=" in data["instructions"]
+
+    secret_key = "sn_test_guard_1234567890"
+    override_settings(api_key=secret_key)
+    resp_unauth = client.post("/api/security/generate-key")
+    assert resp_unauth.status_code == 401
+    resp_auth = client.post("/api/security/generate-key", headers={"X-API-Key": secret_key})
+    assert resp_auth.status_code == 200
+
+
+def test_sse_token_flow_and_non_loopback_fail_closed(client, override_settings):
+    """Verifies short-lived SSE tokens and fail-closed enforcement on non-loopback host without key."""
+    # Non-loopback without API key -> 503 Service Unavailable
+    override_settings(api_key=None, api_host="0.0.0.0", allow_insecure_local_dev=False)
+    resp_fail_closed = client.get("/api/dashboard/overview")
+    assert resp_fail_closed.status_code == 503
+
+    # Short-lived SSE token minted via X-API-Key authenticates SSE stream without leaking master key
+    secret_key = "sn_master_key_for_sse"
+    override_settings(api_key=secret_key, api_host="127.0.0.1")
+    with patch("src.routers.pipeline._background_process_single"):
+        resp_post = client.post(
+            "/api/pipeline/process-patient-async",
+            json={"patient_id": "PZ-SSE-TOK"},
+            headers={"X-API-Key": secret_key},
+        )
+        task_id = resp_post.json()["task_id"]
+
+        resp_tok = client.post("/api/security/sse-token", headers={"X-API-Key": secret_key})
+        assert resp_tok.status_code == 200
+        sse_tok = resp_tok.json()["sse_token"]
+        assert sse_tok.startswith("sse_")
+
+        # Bad sse_token -> 403
+        resp_bad = client.get(f"/api/tasks/{task_id}/events?sse_token=invalid_tok")
+        assert resp_bad.status_code == 403
+
+        # Valid sse_token -> 200 streaming
+        with client.stream("GET", f"/api/tasks/{task_id}/events?sse_token={sse_tok}") as sse_stream:
+            assert sse_stream.status_code == 200
+            assert "text/event-stream" in sse_stream.headers["content-type"]
 
 
 # ---------------------------------------------------------------------------
@@ -369,6 +412,7 @@ def test_redcap_records_list_and_single_mocked(client, override_settings):
 
     mock_svc = MagicMock()
     mock_svc.list_all_records.return_value = fake_records
+    mock_svc.get_record.side_effect = lambda rid: next((r for r in fake_records if r["record_id"] == rid), None)
     app.dependency_overrides[get_redcap_service] = lambda: mock_svc
 
     try:
@@ -390,15 +434,23 @@ def test_redcap_records_list_and_single_mocked(client, override_settings):
 
 
 def test_redcap_delete_endpoints_mocked(client, override_settings):
-    override_settings(api_key=None)
+    override_settings(api_key=None, allow_mass_delete=False, redcap_delete_token="DEL_TOK")
     with patch("src.redcap_service.delete_redcap_records") as mock_del:
         mock_del.return_value = 1
 
-        # Single record delete
+        # Single record delete (uses redcap_delete_token if configured)
         resp_del = client.delete("/api/redcap/records/PZ-01")
         assert resp_del.status_code == 200
         assert resp_del.json()["deleted_count"] == 1
         assert resp_del.json()["record_id"] == "PZ-01"
+        assert mock_del.call_args.kwargs["api_token"] == "DEL_TOK"
+
+        # Mass delete blocked by default when allow_mass_delete=False -> 403
+        resp_blocked = client.delete("/api/redcap/records?confirm=true")
+        assert resp_blocked.status_code == 403
+
+        # Enable allow_mass_delete explicitly
+        override_settings(api_key=None, allow_mass_delete=True, redcap_delete_token=None)
 
         # Mass delete without confirm -> 400
         resp_all_no_confirm = client.delete("/api/redcap/records")

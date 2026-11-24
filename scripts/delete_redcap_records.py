@@ -24,7 +24,7 @@ from dotenv import load_dotenv
 # Add project root to sys.path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from src.config import Settings, get_settings
+from src.config import get_settings
 from src.redcap_service import REDCapService, delete_redcap_records
 
 load_dotenv()
@@ -33,9 +33,7 @@ load_dotenv()
 try:
     from rich.console import Console
     from rich.panel import Panel
-    from rich.prompt import Confirm, Prompt
-    from rich.table import Table
-    from rich import print as rprint
+    from rich.prompt import Prompt
     HAS_RICH = True
 except ImportError:
     HAS_RICH = False
@@ -96,8 +94,9 @@ def main():
     args = parse_args()
     settings = get_settings()
 
-    if not settings.redcap_api_url or not settings.redcap_api_token:
-        print("[ERRORE] REDCAP_API_URL e REDCAP_API_TOKEN devono essere configurati in .env", file=sys.stderr)
+    delete_token = settings.redcap_delete_token or settings.redcap_api_token
+    if not settings.redcap_api_url or not delete_token:
+        print("[ERRORE] REDCAP_API_URL e REDCAP_API_TOKEN (o REDCAP_DELETE_TOKEN) devono essere configurati in .env", file=sys.stderr)
         sys.exit(1)
 
     console = Console() if HAS_RICH else None
@@ -120,7 +119,7 @@ def main():
             print(f"[DRY-RUN] Il record '{target_id}' verrebbe eliminato da REDCap. Nessuna modifica effettuata.")
             return
 
-        service = REDCapService(api_url=settings.redcap_api_url, api_token=settings.redcap_api_token)
+        service = REDCapService(api_url=settings.redcap_api_url, api_token=delete_token)
         try:
             success = service.delete_record(record_id=target_id, arm=args.arm)
             if success:
@@ -146,7 +145,7 @@ def main():
 
     # 2. Eliminazione di TUTTI i record
     if args.all:
-        service = REDCapService(api_url=settings.redcap_api_url, api_token=settings.redcap_api_token)
+        service = REDCapService(api_url=settings.redcap_api_url, api_token=delete_token)
         all_ids = service.get_all_patient_ids()
 
         if not all_ids:

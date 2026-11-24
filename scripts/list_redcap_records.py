@@ -34,7 +34,6 @@ try:
     from rich.console import Console
     from rich.table import Table
     from rich.panel import Panel
-    from rich import print as rprint
     HAS_RICH = True
 except ImportError:
     HAS_RICH = False

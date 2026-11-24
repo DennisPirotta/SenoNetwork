@@ -182,38 +182,73 @@ def test_generate_next_record_name_fails_safely():
 # ==============================================================================
 
 def test_pipeline_patient_id_path_traversal_sanitized(tmp_path):
-    """Verify that patient_id containing directory traversal sequences is sanitized."""
+    """Verify that PatientPipeline.process_patient sanitizes traversal sequences on disk paths."""
     out_dir = tmp_path / "output"
-    pipe = PatientPipeline(settings=Settings(output_dir=out_dir))
+    state_dir = tmp_path / "state"
+    pipe = PatientPipeline(settings=Settings(output_dir=out_dir, state_dir=state_dir))
+    res = pipe.process_patient(patient_id="../../etc/passwd", pdf_paths=[], auto_upload=False)
+    assert ".." not in res.patient_id
+    assert "/" not in res.patient_id
+    assert res.patient_id == "passwd"
+    assert (out_dir / "patients" / "patient_passwd_result.json").exists()
+    assert (state_dir / "passwd_state.json").exists()
 
-    # Test path sanitization logic directly
-    unsafe_id = "../../etc/passwd"
-    import re
-    sanitized = re.sub(r"[^a-zA-Z0-9_\-]", "_", Path(unsafe_id).name).strip("_")
-    assert ".." not in sanitized
-    assert "/" not in sanitized
-    assert sanitized == "passwd"
 
+def test_pipeline_retains_zero_clinical_value(tmp_path):
+    """Verify that extracted clinical fields with value '0' are preserved and uploaded via PatientPipeline."""
+    from src.models import ExtractionResult, REDCapField
 
-def test_pipeline_retains_zero_clinical_value():
-    """Verify that extracted clinical fields with value '0' (e.g. metastasis: '0') are not dropped."""
-    pipe = PatientPipeline(settings=Settings())
-    # Mock extracted fields containing 0
-    extracted = {
-        "record_id": "123",
-        "metastasi": "0",
-        "linfonodi_positivi": "0",
-        "dimensione_mm": "15",
-        "campo_vuoto": "",
-    }
-    # Clinical fields filter
-    clinical = {
-        k: v for k, v in extracted.items()
-        if k != "record_id" and v is not None and str(v).strip() != ""
-    }
-    assert "metastasi" in clinical and clinical["metastasi"] == "0"
-    assert "linfonodi_positivi" in clinical and clinical["linfonodi_positivi"] == "0"
-    assert "campo_vuoto" not in clinical
+    pdf_file = tmp_path / "mammografia.pdf"
+    pdf_file.write_bytes(b"%PDF-1.4")
+
+    mock_redcap = MagicMock(spec=REDCapService)
+    mock_redcap.api_url = "https://mock.redcap/api/"
+    mock_redcap.api_token = "TOKEN"
+    mock_redcap.find_record_id_by_demographics.return_value = "123"
+    mock_redcap.get_record.return_value = None
+    mock_redcap.import_records_to_api.return_value = {"count": 1}
+
+    mock_ai = MagicMock()
+    mock_ai.extract_from_text.return_value = ExtractionResult(
+        pdf_path=str(pdf_file),
+        record_id="123",
+        extracted_data={"metastasi": "0", "dimensione_mm": "15"},
+        redcap_record={
+            "record_id": "123",
+            "metastasi": "0",
+            "dimensione_mm": "15",
+            "radiologia_complete": "1",
+        },
+        status="success",
+    )
+
+    pipe = PatientPipeline(
+        settings=Settings(output_dir=tmp_path / "out", state_dir=tmp_path / "state"),
+        redcap_service=mock_redcap,
+        ai_extractor=mock_ai,
+    )
+    pipe._cached_fields_by_form["radiologia"] = [
+        REDCapField(field_name="record_id", form_name="dati_del_paziente", field_type="text"),
+        REDCapField(field_name="metastasi", form_name="radiologia", field_type="yesno"),
+        REDCapField(field_name="dimensione_mm", form_name="radiologia", field_type="text"),
+    ]
+
+    with patch("src.patient_pipeline.PDFExtractor.extract_text", return_value="Mammografia negativa BI-RADS 1"):
+        with patch("src.patient_pipeline.FormClassifier.classify_report_targets", return_value=["radiologia"]):
+            res = pipe.process_patient(
+                patient_id="123",
+                name="Anna",
+                surname="Verdi",
+                date_of_birth="1970-01-01",
+                pdf_paths=[pdf_file],
+                auto_upload=True,
+            )
+
+    assert res.redcap_upload_status == "uploaded"
+    uploaded = mock_redcap.import_records_to_api.call_args[0][0][0]
+    assert uploaded["metastasi"] == "0"
+    assert uploaded["dimensione_mm"] == "15"
+    assert uploaded["dati_del_paziente_complete"] == "1"
 
 
 # ==============================================================================

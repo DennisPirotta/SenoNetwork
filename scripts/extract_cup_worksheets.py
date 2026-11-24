@@ -27,11 +27,10 @@ Esempi di utilizzo:
 """
 
 import argparse
-from datetime import date, datetime, timedelta
+from datetime import date
 import logging
 from pathlib import Path
 import sys
-from typing import List, Optional
 
 from dotenv import load_dotenv
 import pandas as pd
@@ -42,7 +41,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from src.config import get_settings
 from src.priamo_cup_client import (
     AGENDE_SENOLOGIA,
-    CODICE_STRUTTURA_VALDUCE,
     UNITA_SENOLOGIA,
     PriamoCupClient,
 )
@@ -50,20 +48,12 @@ from scripts.extract_patients_from_shared_file import (
     Paziente,
     display_rich_table,
     estrai_pazienti_da_fogli_cup,
-    estrai_pazienti_univoci,
 )
 
 load_dotenv()
 
 # Rich formatting
-try:
-    from rich.console import Console
-    from rich.panel import Panel
-    from rich.table import Table
-    from rich import print as rprint
-    HAS_RICH = True
-except ImportError:
-    HAS_RICH = False
+HAS_RICH = False
 
 logging.basicConfig(
     level=logging.INFO,

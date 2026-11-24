@@ -15,7 +15,7 @@ Esempi di utilizzo:
 """
 
 import argparse
-from datetime import date, datetime
+from datetime import date
 import logging
 from pathlib import Path
 import re
@@ -35,10 +35,14 @@ try:
     from rich.console import Console
     from rich.panel import Panel
     from rich.table import Table
-    from rich import print as rprint
     HAS_RICH = True
 except ImportError:
     HAS_RICH = False
+
+
+def _excel_engine(path: Path) -> str:
+    """Selects explicit pandas Excel engine to handle .xls without xlrd and suppress warnings."""
+    return "calamine" if path.suffix.lower() == ".xls" else "openpyxl"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -269,7 +273,7 @@ def estrai_pazienti_da_fogli_cup(
         p = Path(filepath_or_df)
         if not p.exists():
             raise FileNotFoundError(f"File foglio lavoro non trovato: {p.resolve()}")
-        df = pd.read_excel(p, sheet_name=sheet_name or 0)
+        df = pd.read_excel(p, sheet_name=sheet_name or 0, engine=_excel_engine(p))
 
     if df.empty:
         return []
@@ -322,7 +326,8 @@ def estrai_pazienti_da_fogli_cup(
 
         app_info = f"{slot_data} {slot_ora} - Agenda {agenda_codice} ({prestazione})".strip()
 
-        dedup_key = (cognome.lower(), (nome or "").lower(), dob_iso)
+        disambiguator = dob_iso or (cf.upper() if cf else (priamo_id or f"row_{excel_row_num}"))
+        dedup_key = (cognome.lower(), (nome or "").lower(), disambiguator)
 
         if dedup_key in pazienti_map:
             p = pazienti_map[dedup_key]
@@ -400,19 +405,20 @@ def estrai_pazienti_univoci(
             raise FileNotFoundError(f"File non trovato: {path}")
 
         path_name = path.name
-        xl = pd.ExcelFile(path)
+        engine = _excel_engine(path)
+        xl = pd.ExcelFile(path, engine=engine)
         target_sheet = sheet_name if sheet_name is not None else ("Foglio1" if "Foglio1" in xl.sheet_names else xl.sheet_names[0])
 
         # Verifica preliminare delle intestazioni per rilevamento automatico formato PriamoCUP
-        df_sample = pd.read_excel(path, sheet_name=target_sheet, nrows=5)
+        df_sample = pd.read_excel(path, sheet_name=target_sheet, nrows=5, engine=engine)
         cols_upper = [str(c).strip().upper() for c in df_sample.columns]
 
         if "PAZ_COGNOME" in cols_upper and "PAZ_NOME" in cols_upper:
             # È un report esportato da PriamoCUP!
-            df_cup = pd.read_excel(path, sheet_name=target_sheet)
+            df_cup = pd.read_excel(path, sheet_name=target_sheet, engine=engine)
             return estrai_pazienti_da_fogli_cup(df_cup, only_complete=only_complete)
 
-        df = pd.read_excel(path, sheet_name=target_sheet, header=None)
+        df = pd.read_excel(path, sheet_name=target_sheet, header=None, engine=engine)
 
     if df.empty:
         logger.warning(f"Il foglio in {path_name} è vuoto.")
@@ -486,11 +492,11 @@ def estrai_pazienti_univoci(
                     notes.append(v_str)
         note_str = " | ".join(notes) if notes else None
 
-        # Chiave di deduplicazione: (cognome_lower, nome_lower, dob)
+        # Chiave di deduplicazione: (cognome_lower, nome_lower, dob o row_id se dob assente)
         dedup_key = (
             cognome.lower(),
             (nome or "").lower(),
-            dob
+            dob if dob is not None else f"row_{excel_row_num}",
         )
 
         if dedup_key in pazienti_map:

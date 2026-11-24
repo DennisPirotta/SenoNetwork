@@ -1,9 +1,11 @@
+from abc import ABC, abstractmethod
+import contextlib
+from datetime import datetime
 import json
 import logging
 import os
 import re
 import time
-from abc import ABC, abstractmethod
 from typing import Any, Dict, List, Optional, Protocol, Tuple, Union, runtime_checkable
 
 import requests
@@ -14,6 +16,15 @@ from src.normalizer import REDCapNormalizer
 from src.schema_builder import SchemaBuilder
 
 logger = logging.getLogger(__name__)
+
+_IT_MONTHS_LIST = [
+    "", "gennaio", "febbraio", "marzo", "aprile", "maggio", "giugno",
+    "luglio", "agosto", "settembre", "ottobre", "novembre", "dicembre",
+]
+_IT_MONTHS_SHORT = [
+    "", "gen", "feb", "mar", "apr", "mag", "giu",
+    "lug", "ago", "set", "ott", "nov", "dic",
+]
 
 
 @runtime_checkable
@@ -32,7 +43,8 @@ class AIExtractor(Protocol):
         record_id: Optional[str] = None,
         form_name: Optional[str] = None,
         mark_form_complete: bool = True,
-        form_completion_status: str = "2"
+        form_completion_status: str = "2",
+        include_unchecked_checkboxes: bool = True,
     ) -> ExtractionResult:
         """Extracts structured clinical data according to REDCap fields."""
         ...
@@ -40,7 +52,7 @@ class AIExtractor(Protocol):
 
 class BaseAIExtractor(ABC):
     """Abstract base class consolidating common extraction logic, prompt construction,
-    retry mechanisms, and response normalization across different LLM backends.
+    retry mechanisms, deterministic validation, and response normalization across LLM backends.
     """
 
     SYSTEM_PROMPT = (
@@ -56,9 +68,13 @@ class BaseAIExtractor(ABC):
         "6. Restituisci ESCLUSIVAMENTE un JSON valido conforme allo schema specificato."
     )
 
-    def __init__(self, timeout_seconds: int = 120, max_retries: int = 2):
+    backend_name: str = "unknown"
+
+    def __init__(self, timeout_seconds: int = 120, max_retries: int = 2, model: str = ""):
         self.timeout_seconds = timeout_seconds
         self.max_retries = max_retries
+        self.model = model
+        self._fallback_used = False
 
     @abstractmethod
     def is_available(self) -> bool:
@@ -79,11 +95,21 @@ class BaseAIExtractor(ABC):
         self,
         fields: List[REDCapField],
         report_text: str,
-        form_name: Optional[str] = None
+        form_name: Optional[str] = None,
+        include_record_id: bool = True,
     ) -> Tuple[str, str, Dict[str, Any]]:
         """Constructs system prompt, user prompt, and JSON Schema with clinical guidelines."""
-        json_schema = SchemaBuilder.build_json_schema(fields, enforce_all_required=True, form_name=form_name)
-        guidelines = SchemaBuilder.build_prompt_guidelines(fields, form_name=form_name)
+        json_schema = SchemaBuilder.build_json_schema(
+            fields,
+            enforce_all_required=True,
+            form_name=form_name,
+            include_record_id=include_record_id,
+        )
+        guidelines = SchemaBuilder.build_prompt_guidelines(
+            fields,
+            form_name=form_name,
+            include_record_id=include_record_id,
+        )
 
         user_prompt = (
             f"Di seguito trovi le linee guida dei campi REDCap da estrarre:\n"
@@ -108,7 +134,7 @@ class BaseAIExtractor(ABC):
             try:
                 raw_response = self._call_llm(system_prompt, user_prompt, json_schema)
                 return parse_json_response(raw_response)
-            except (json.JSONDecodeError, requests.RequestException) as e:
+            except (json.JSONDecodeError, requests.RequestException, KeyError, IndexError, TypeError, ValueError) as e:
                 last_error = e
                 logger.warning(f"Tentativo LLM {attempt}/{self.max_retries} fallito ({e}). Riprovo...")
                 if attempt < self.max_retries:
@@ -118,6 +144,82 @@ class BaseAIExtractor(ABC):
             raise last_error
         raise RuntimeError("Estrazione LLM fallita senza eccezione specifica.")
 
+    @staticmethod
+    def _date_appears_in_text(iso_date: str, report_text: str) -> bool:
+        """Verifies deterministically whether an extracted YYYY-MM-DD date appears in source text."""
+        try:
+            dt = datetime.strptime(iso_date, "%Y-%m-%d")
+        except ValueError:
+            return False
+
+        y, m, d = dt.year, dt.month, dt.day
+        yy = str(y)[2:]
+        candidates = [
+            f"{y:04d}-{m:02d}-{d:02d}",
+            f"{y:04d}/{m:02d}/{d:02d}",
+            f"{d:02d}/{m:02d}/{y:04d}",
+            f"{d:02d}-{m:02d}-{y:04d}",
+            f"{d:02d}.{m:02d}.{y:04d}",
+            f"{d}/{m}/{y:04d}",
+            f"{d}-{m}-{y:04d}",
+            f"{d}.{m}.{y:04d}",
+            f"{d:02d}/{m:02d}/{yy}",
+            f"{d:02d}-{m:02d}-{yy}",
+            f"{d:02d}.{m:02d}.{yy}",
+        ]
+        lower_text = report_text.lower()
+        if any(c in lower_text for c in candidates):
+            return True
+
+        m_long = _IT_MONTHS_LIST[m]
+        m_short = _IT_MONTHS_SHORT[m]
+        textual_pat = rf"\b0?{d}\s+(?:{m_long}|{m_short})\.?\s+{y:04d}\b"
+        return bool(re.search(textual_pat, lower_text))
+
+    @staticmethod
+    def _apply_deterministic_validation(
+        extracted: Dict[str, Any],
+        report_text: str,
+        fields: List[REDCapField],
+    ) -> Tuple[Dict[str, Any], List[str]]:
+        """Applies deterministic post-extraction checks to reject hallucinated dates or out-of-range numbers."""
+        warnings: List[str] = []
+        validated = dict(extracted)
+        field_map = {f.field_name: f for f in fields}
+
+        for k, val in list(validated.items()):
+            if val in (None, "", [], {}):
+                continue
+            f = field_map.get(k)
+            if not f:
+                continue
+
+            vt = (f.text_validation_type_or_show_slider_number or "").lower()
+            # 1. Verify extracted clinical dates actually appear in report text
+            if "date" in vt and k != "date_of_birth":
+                iso = REDCapNormalizer._normalize_date(str(val))
+                if not iso:
+                    warnings.append(f"Campo '{k}': data non valida '{val}' rimossa.")
+                    validated[k] = None
+                elif not BaseAIExtractor._date_appears_in_text(iso, report_text):
+                    warnings.append(f"Campo '{k}': data '{iso}' non riscontrata nel testo del referto (rimossa).")
+                    validated[k] = None
+
+            # 2. Verify percentage fields are within 0..100
+            elif vt in {"integer", "number", "number_1dp", "number_2dp"}:
+                is_pct = ("%" in (f.field_label or "")) or ("positive_cells" in k) or ("ki67" in k)
+                num_str = REDCapNormalizer._normalize_number(
+                    val,
+                    min_val="0" if is_pct else f.text_validation_min,
+                    max_val="100" if is_pct else f.text_validation_max,
+                    integer_only=(vt == "integer"),
+                )
+                if not num_str:
+                    warnings.append(f"Campo '{k}': valore numerico '{val}' fuori range o non valido (rimosso).")
+                    validated[k] = None
+
+        return validated, warnings
+
     def extract_from_text(
         self,
         report_text: str,
@@ -126,11 +228,19 @@ class BaseAIExtractor(ABC):
         record_id: Optional[str] = None,
         form_name: Optional[str] = None,
         mark_form_complete: bool = True,
-        form_completion_status: str = "2"
+        form_completion_status: str = "2",
+        include_unchecked_checkboxes: bool = True,
     ) -> ExtractionResult:
         """Executes full structured clinical data extraction pipeline with schema enforcement."""
         start_time = time.time()
-        result = ExtractionResult(pdf_path=pdf_path, raw_text=report_text, record_id=record_id)
+        result = ExtractionResult(
+            pdf_path=pdf_path,
+            raw_text=report_text,
+            record_id=record_id,
+            ai_backend=self.backend_name,
+            ai_model=self.model or None,
+            fallback_used=self._fallback_used,
+        )
 
         if not report_text.strip():
             result.status = "error"
@@ -139,7 +249,19 @@ class BaseAIExtractor(ABC):
             return result
 
         try:
-            system_prompt, user_prompt, json_schema = self.build_prompts(fields, report_text, form_name=form_name)
+            system_prompt, user_prompt, json_schema = self.build_prompts(
+                fields,
+                report_text,
+                form_name=form_name,
+                include_record_id=(record_id is None),
+            )
+            result.prompt_chars = len(system_prompt) + len(user_prompt)
+            if result.prompt_chars > 24000:
+                logger.warning(
+                    f"Prompt molto esteso ({result.prompt_chars} caratteri) per form '{form_name}': "
+                    "rischio superamento finestra contesto LLM."
+                )
+
             extracted_dict = self._call_llm_with_retry(system_prompt, user_prompt, json_schema)
 
             # C-11: Validate and filter keys to only recognized extractable fields
@@ -147,14 +269,15 @@ class BaseAIExtractor(ABC):
             valid_field_names.add("record_id")
             filtered_dict = {k: v for k, v in extracted_dict.items() if k in valid_field_names}
 
-            result.extracted_data = filtered_dict
-
-            # Determine if at least one meaningful clinical field was extracted (excluding record_id)
-            has_clinical_data = any(
-                v not in (None, "", [], {})
-                for k, v in filtered_dict.items()
-                if k != "record_id"
+            # Deterministic post-extraction sanity verification
+            filtered_dict, val_warnings = self._apply_deterministic_validation(
+                filtered_dict, report_text, fields
             )
+            result.validation_warnings = val_warnings
+            for w in val_warnings:
+                logger.warning(f"Validazione post-estrazione ({form_name}): {w}")
+
+            result.extracted_data = filtered_dict
 
             # Normalize to valid REDCap record format
             normalized_record = REDCapNormalizer.normalize_record(
@@ -162,8 +285,9 @@ class BaseAIExtractor(ABC):
                 fields=fields,
                 record_id=record_id,
                 form_name=form_name,
-                mark_form_complete=(mark_form_complete and has_clinical_data),
-                form_completion_status=form_completion_status
+                mark_form_complete=mark_form_complete,
+                form_completion_status=form_completion_status,
+                include_unchecked_checkboxes=include_unchecked_checkboxes,
             )
             result.redcap_record = normalized_record
             result.status = "success"
@@ -183,10 +307,12 @@ class LlamaCppExtractor(BaseAIExtractor):
     from clinical report text.
     """
 
+    backend_name = "llama_cpp"
+
     def __init__(
         self,
         base_url: str = "http://localhost:8080",
-        api_mode: str = "chat",  # 'chat' (/v1/chat/completions) or 'completion' (/completion)
+        api_mode: str = "chat",
         model: str = "",
         temperature: float = 0.0,
         timeout_seconds: int = 180,
@@ -194,10 +320,9 @@ class LlamaCppExtractor(BaseAIExtractor):
         cf_client_id: Optional[str] = None,
         cf_client_secret: Optional[str] = None,
     ):
-        super().__init__(timeout_seconds=timeout_seconds, max_retries=max_retries)
+        super().__init__(timeout_seconds=timeout_seconds, max_retries=max_retries, model=model or "llama-cpp-rpc")
         self.base_url = base_url.rstrip("/")
         self.api_mode = api_mode.lower()
-        self.model = model or "llama-cpp-rpc"
         self.temperature = temperature
         self.cf_client_id = cf_client_id or os.getenv("AI_CLOUDFLARED_CLIENT_ID", "")
         self.cf_client_secret = cf_client_secret or os.getenv("AI_CLOUDFLARED_CLIENT_SECRET", "")
@@ -209,31 +334,42 @@ class LlamaCppExtractor(BaseAIExtractor):
 
     def is_available(self) -> bool:
         """Checks if the llama.cpp server is active and reachable."""
-        # 1. Check /health
-        try:
-            r = requests.get(f"{self.base_url}/health", headers=self.headers, timeout=5)
-            if r.status_code == 200:
-                return True
-        except Exception:
-            pass
-
-        # 2. Check /v1/models
-        try:
-            r = requests.get(f"{self.base_url}/v1/models", headers=self.headers, timeout=5)
-            if r.status_code == 200:
-                return True
-        except Exception:
-            pass
-
-        # 3. Check /props
-        try:
-            r = requests.get(f"{self.base_url}/props", headers=self.headers, timeout=5)
-            if r.status_code == 200:
-                return True
-        except Exception:
-            pass
-
+        for path in ("/health", "/v1/models", "/props"):
+            try:
+                r = requests.get(f"{self.base_url}{path}", headers=self.headers, timeout=5)
+                if r.status_code == 200:
+                    return True
+            except Exception:
+                pass
         return False
+
+    def _read_stream_or_json(self, response: requests.Response, mode: str) -> str:
+        content_type = response.headers.get("content-type", "").lower()
+        if "text/event-stream" in content_type:
+            collected = []
+            for line in response.iter_lines():
+                if not line:
+                    continue
+                decoded = line.decode("utf-8") if isinstance(line, bytes) else line
+                if decoded.startswith("data: "):
+                    raw_data = decoded[6:].strip()
+                    if raw_data == "[DONE]":
+                        break
+                    try:
+                        chunk = json.loads(raw_data)
+                        if mode == "completion":
+                            c = chunk.get("content", "")
+                        else:
+                            c = chunk.get("choices", [{}])[0].get("delta", {}).get("content", "")
+                        if c:
+                            collected.append(c)
+                    except Exception:
+                        pass
+            return "".join(collected)
+        res_json = response.json()
+        if mode == "completion":
+            return res_json.get("content", "")
+        return res_json["choices"][0]["message"]["content"]
 
     def _call_llm(
         self,
@@ -241,10 +377,7 @@ class LlamaCppExtractor(BaseAIExtractor):
         user_prompt: str,
         json_schema: Dict[str, Any]
     ) -> str:
-        """Communicates with llama.cpp using either /v1/chat/completions or /completion endpoint.
-        Uses HTTP streaming (stream=True) to stream tokens via SSE, bypassing Cloudflare's
-        100-second idle gateway timeout (HTTP 524) while preserving full response text.
-        """
+        """Communicates with llama.cpp using /v1/chat/completions or /completion with streaming SSE."""
         if self.api_mode == "completion":
             endpoint = f"{self.base_url}/completion"
             full_prompt = (
@@ -259,32 +392,11 @@ class LlamaCppExtractor(BaseAIExtractor):
                 "n_predict": 4096,
                 "stream": True
             }
-            response = requests.post(endpoint, json=payload, headers=self.headers, stream=True, timeout=self.timeout_seconds)
-            response.raise_for_status()
-
-            # Support both streaming SSE response and standard JSON (fallback/mock)
-            content_type = response.headers.get("content-type", "").lower()
-            if "text/event-stream" in content_type:
-                collected = []
-                for line in response.iter_lines():
-                    if not line:
-                        continue
-                    decoded = line.decode("utf-8") if isinstance(line, bytes) else line
-                    if decoded.startswith("data: "):
-                        raw_data = decoded[6:].strip()
-                        if raw_data == "[DONE]":
-                            break
-                        try:
-                            chunk = json.loads(raw_data)
-                            c = chunk.get("content", "")
-                            if c:
-                                collected.append(c)
-                        except Exception:
-                            pass
-                return "".join(collected)
-            else:
-                res_json = response.json()
-                return res_json.get("content", "")
+            with contextlib.closing(
+                requests.post(endpoint, json=payload, headers=self.headers, stream=True, timeout=self.timeout_seconds)
+            ) as response:
+                response.raise_for_status()
+                return self._read_stream_or_json(response, "completion")
 
         # OpenAI-compatible /v1/chat/completions
         endpoint = f"{self.base_url}/v1/chat/completions"
@@ -301,42 +413,31 @@ class LlamaCppExtractor(BaseAIExtractor):
             },
             "stream": True
         }
-        response = requests.post(endpoint, json=payload, headers=self.headers, stream=True, timeout=self.timeout_seconds)
-        if response.status_code != 200:
-            # Fallback to general json_object if schema format argument unsupported
+        with contextlib.closing(
+            requests.post(endpoint, json=payload, headers=self.headers, stream=True, timeout=self.timeout_seconds)
+        ) as response:
+            if response.status_code == 200:
+                return self._read_stream_or_json(response, "chat")
+            err_body = response.text[:500]
+            status_code = response.status_code
+
+        # Only retry without schema if server rejected schema formatting (400/422) and not context overflow
+        if status_code in (400, 422) and "context" not in err_body.lower() and "n_ctx" not in err_body.lower():
+            logger.warning(f"llama.cpp ha rifiutato response_format con schema (HTTP {status_code}); fallback a json_object.")
             payload["response_format"] = {"type": "json_object"}
-            response = requests.post(endpoint, json=payload, headers=self.headers, stream=True, timeout=self.timeout_seconds)
+            with contextlib.closing(
+                requests.post(endpoint, json=payload, headers=self.headers, stream=True, timeout=self.timeout_seconds)
+            ) as fallback_resp:
+                fallback_resp.raise_for_status()
+                return self._read_stream_or_json(fallback_resp, "chat")
 
-        response.raise_for_status()
-
-        # Support both streaming SSE response and standard JSON (fallback/mock)
-        content_type = response.headers.get("content-type", "").lower()
-        if "text/event-stream" in content_type:
-            collected = []
-            for line in response.iter_lines():
-                if not line:
-                    continue
-                decoded = line.decode("utf-8") if isinstance(line, bytes) else line
-                if decoded.startswith("data: "):
-                    raw_data = decoded[6:].strip()
-                    if raw_data == "[DONE]":
-                        break
-                    try:
-                        chunk = json.loads(raw_data)
-                        delta = chunk.get("choices", [{}])[0].get("delta", {})
-                        c = delta.get("content", "")
-                        if c:
-                            collected.append(c)
-                    except Exception:
-                        pass
-            return "".join(collected)
-        else:
-            res_json = response.json()
-            return res_json["choices"][0]["message"]["content"]
+        raise requests.HTTPError(f"Errore llama.cpp HTTP {status_code}: {err_body}")
 
 
 class OllamaExtractor(BaseAIExtractor):
     """Uses a local Ollama LLM to extract structured REDCap data from clinical report text."""
+
+    backend_name = "ollama"
 
     def __init__(
         self,
@@ -346,9 +447,8 @@ class OllamaExtractor(BaseAIExtractor):
         timeout_seconds: int = 120,
         max_retries: int = 2
     ):
-        super().__init__(timeout_seconds=timeout_seconds, max_retries=max_retries)
+        super().__init__(timeout_seconds=timeout_seconds, max_retries=max_retries, model=model)
         self.base_url = base_url.rstrip("/")
-        self.model = model
         self.temperature = temperature
 
     def is_available(self) -> bool:
@@ -392,7 +492,8 @@ class OllamaExtractor(BaseAIExtractor):
             }
         }
         response = requests.post(endpoint, json=payload, timeout=self.timeout_seconds)
-        if response.status_code != 200:
+        if response.status_code in (400, 422):
+            logger.warning(f"Ollama ha rifiutato format json_schema (HTTP {response.status_code}); fallback a format='json'.")
             payload["format"] = "json"
             response = requests.post(endpoint, json=payload, timeout=self.timeout_seconds)
 
@@ -449,10 +550,10 @@ def get_ai_extractor(settings: Optional[Settings] = None) -> Union[LlamaCppExtra
             timeout_seconds=cfg.ollama_timeout_seconds
         )
         if ollama_fallback.is_available():
-            logger.info(f"Fallback su Ollama attivo ({cfg.ollama_base_url})")
+            ollama_fallback._fallback_used = True
+            logger.warning(f"Fallback su Ollama attivo ({cfg.ollama_base_url}, model={cfg.ollama_model})")
             return ollama_fallback
 
-        # If neither is responding, return configured extractor anyway
         return extractor
 
     # If backend explicitly set to ollama

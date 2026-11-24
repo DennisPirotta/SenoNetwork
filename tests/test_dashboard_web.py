@@ -1,14 +1,54 @@
 """Unit and Integration tests for SenoNetwork Web Dashboard & Granular SSE Stream."""
 
 import json
-from pathlib import Path
 from unittest.mock import MagicMock, patch
+import pandas as pd
 import pytest
 from fastapi.testclient import TestClient
 
 from src.api_server import app
-from src.patient_pipeline import PatientPipelineResult, DocumentProcessingResult
+from src.config import get_settings
 from src.routers.pipeline import _tasks_store
+
+
+@pytest.fixture(autouse=True)
+def isolated_cup_environment(tmp_path):
+    """Isola cup_dir e state_dir in tmp_path con un file Excel CUP sintetico per tutti i test dashboard."""
+    cup_dir = tmp_path / "cup"
+    state_dir = tmp_path / "state"
+    cup_dir.mkdir(parents=True, exist_ok=True)
+    state_dir.mkdir(parents=True, exist_ok=True)
+
+    sample_file = cup_dir / "fogli_lavoro_unita_37002_test.xlsx"
+    df = pd.DataFrame([
+        {
+            "PAZ_COGNOME": "ROSSI",
+            "PAZ_NOME": "MARIA",
+            "PAZ_DATA_NASCITA": "1975-06-15",
+            "PAZ_CODICE_FISCALE": "RSSMRA75H55C933A",
+            "PAZ_SESSO": "F",
+            "PAZ_COMUNE_NASCITA": "COMO",
+            "PAZ_PROGRESSIVO_PAZ1": "123456",
+            "EROG_CODICE": "3004",
+            "SLOT_DATA": "2026-11-12",
+            "SLOT_ORA": "1130",
+            "PREST_DESCRIZIONE": "Medicazione",
+        }
+    ])
+    df.to_excel(sample_file, index=False, engine="openpyxl")
+
+    base_settings = get_settings().model_copy(update={
+        "api_key": None,
+        "cup_dir": cup_dir,
+        "state_dir": state_dir,
+        "redcap_api_url": "https://mock.redcap/api/",
+        "redcap_api_token": "mock_token",
+    })
+    app.dependency_overrides[get_settings] = lambda: base_settings
+    try:
+        yield {"cup_dir": cup_dir, "state_dir": state_dir, "sample_file": sample_file, "settings": base_settings}
+    finally:
+        app.dependency_overrides.pop(get_settings, None)
 
 
 @pytest.fixture
@@ -97,13 +137,10 @@ def test_granular_sse_stream_events(client):
     assert "processed_documents" in payload
 
 
-def test_cup_download_latest_endpoint(client, tmp_path):
+def test_cup_download_latest_endpoint(client, isolated_cup_environment, tmp_path):
     mock_file = tmp_path / "fogli_lavoro_unita_37002_YTD_20260101_20261124.xlsx"
-    # Create a small valid excel or copy existing
-    existing = list(Path("data/cup").glob("*.xlsx"))
-    assert len(existing) > 0, "Almeno un file CUP deve esistere in data/cup"
     import shutil
-    shutil.copy(existing[0], mock_file)
+    shutil.copy(isolated_cup_environment["sample_file"], mock_file)
 
     with patch("src.routers.cup.PriamoCupClient") as MockClientClass:
         mock_instance = MagicMock()

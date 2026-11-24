@@ -1,9 +1,6 @@
 import json
-import pytest
-from pathlib import Path
-from unittest.mock import MagicMock
 
-from src.clinical_guidelines import ClinicalGuidelinesManager, DEFAULT_CLINICAL_GUIDELINES
+from src.clinical_guidelines import ClinicalGuidelinesManager
 from src.models import REDCapField
 from src.schema_builder import SchemaBuilder
 from src.ai_extractor import BaseAIExtractor

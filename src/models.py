@@ -74,3 +74,8 @@ class ExtractionResult(BaseModel):
     extraction_duration_sec: float = 0.0
     status: str = "success"  # success, error, partial
     error_message: Optional[str] = None
+    ai_backend: Optional[str] = None
+    ai_model: Optional[str] = None
+    fallback_used: bool = False
+    prompt_chars: int = 0
+    validation_warnings: List[str] = Field(default_factory=list)

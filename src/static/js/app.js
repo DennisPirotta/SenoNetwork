@@ -3,6 +3,16 @@
  * Modular ES6+ JavaScript client with EventSource (SSE) real-time pipeline tracking.
  */
 
+function escapeHtml(val) {
+  if (val === null || val === undefined) return "";
+  return String(val)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
 // =============================================================================
 // 1. API Client with API-Key Header Injection
 // =============================================================================
@@ -50,6 +60,38 @@ class APIClient {
     return await res.text();
   }
 
+  static async downloadFile(endpoint, fallbackFilename = "download") {
+    const headers = {};
+    const apiKey = this.getApiKey();
+    if (apiKey) {
+      headers["X-API-Key"] = apiKey;
+    }
+    const res = await fetch(endpoint, { headers });
+    if (!res.ok) {
+      let errMsg = `HTTP Error ${res.status}`;
+      try {
+        const errJson = await res.json();
+        if (errJson.detail) errMsg = errJson.detail;
+      } catch (e) {
+        // ignore parse fallback
+      }
+      throw new Error(errMsg);
+    }
+    const disp = res.headers.get("Content-Disposition") || "";
+    const match = disp.match(/filename="?([^";]+)"?/i);
+    const filename = match ? match[1] : fallbackFilename;
+    const blob = await res.blob();
+    const blobUrl = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = blobUrl;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(blobUrl);
+  }
+
+  static getSseToken() { return this.request("/api/security/sse-token", { method: "POST" }); }
   static getHealth() { return this.request("/health"); }
   static getDashboardOverview() { return this.request("/api/dashboard/overview"); }
   static getCupFiles() { return this.request("/api/cup/files"); }
@@ -70,7 +112,7 @@ class APIClient {
     return this.request("/api/pipeline/process-batch-async", { method: "POST", body: payload });
   }
   static getTaskStatus(taskId) {
-    return this.request(`/api/tasks/${taskId}`);
+    return this.request(`/api/tasks/${encodeURIComponent(taskId)}`);
   }
   static getAuditReport() {
     return this.request("/api/audit/report");
@@ -85,7 +127,7 @@ class APIClient {
     return this.request(`/api/redcap/records?limit=${limit}`);
   }
   static deleteRedCapRecord(recordId) {
-    return this.request(`/api/redcap/records/${recordId}`, { method: "DELETE" });
+    return this.request(`/api/redcap/records/${encodeURIComponent(recordId)}`, { method: "DELETE" });
   }
   static verifyPriamoPatient(payload) {
     return this.request("/api/priamo/verify-patient", { method: "POST", body: payload });
@@ -270,7 +312,7 @@ class CupController {
       console.error("Errore caricamento file CUP:", err);
       const filesTbody = document.getElementById("cup-files-tbody");
       if (filesTbody) {
-        filesTbody.innerHTML = `<tr><td colspan="6" style="text-align: center; color: var(--status-danger); padding: 1rem;">Errore caricamento file: ${err.message}</td></tr>`;
+        filesTbody.innerHTML = `<tr><td colspan="6" style="text-align: center; color: var(--status-danger); padding: 1rem;">Errore caricamento file: ${escapeHtml(err.message)}</td></tr>`;
       }
     }
   }
@@ -285,9 +327,6 @@ class CupController {
       return;
     }
 
-    const apiKey = APIClient.getApiKey();
-    const authParam = apiKey ? `?api_key=${encodeURIComponent(apiKey)}` : '';
-
     files.forEach(f => {
       const isSelected = f.name === this.currentFile;
       const tr = document.createElement("tr");
@@ -301,29 +340,27 @@ class CupController {
       const statusBadge = isSelected
         ? '<span class="badge badge-success">✓ Attivo</span>'
         : '<span class="badge badge-neutral">Archiviato</span>';
-
-      const downloadRawUrl = `/api/cup/files/${encodeURIComponent(f.name)}/download${authParam}`;
-      const exportCsvUrl = `/api/cup/export?format=csv&file_name=${encodeURIComponent(f.name)}${apiKey ? `&api_key=${encodeURIComponent(apiKey)}` : ''}`;
+      const safeName = escapeHtml(f.name);
 
       tr.innerHTML = `
         <td style="font-weight: ${isSelected ? '700' : '500'};">
-          <span style="margin-right: 0.375rem;">📊</span><code>${f.name}</code>
+          <span style="margin-right: 0.375rem;">📊</span><code>${safeName}</code>
         </td>
-        <td style="font-size: 0.8125rem;">${modified}</td>
-        <td style="font-size: 0.8125rem;">${size}</td>
-        <td><span class="badge badge-info">${count} pazienti</span></td>
+        <td style="font-size: 0.8125rem;">${escapeHtml(modified)}</td>
+        <td style="font-size: 0.8125rem;">${escapeHtml(size)}</td>
+        <td><span class="badge badge-info">${escapeHtml(count)} pazienti</span></td>
         <td>${statusBadge}</td>
         <td>
           <div style="display: flex; gap: 0.375rem; flex-wrap: wrap;">
-            <button type="button" class="btn btn-secondary btn-sm btn-select-file" data-file="${f.name}">
+            <button type="button" class="btn btn-secondary btn-sm btn-select-file" data-file="${safeName}">
               ${isSelected ? '✓ Selezionato' : '👁️ Seleziona'}
             </button>
-            <a href="${downloadRawUrl}" class="btn btn-secondary btn-sm" download title="Scarica file originale XLSX" style="text-decoration: none;">
+            <button type="button" class="btn btn-secondary btn-sm btn-download-raw" data-file="${safeName}" title="Scarica file originale XLSX">
               ⬇️ .xlsx
-            </a>
-            <a href="${exportCsvUrl}" class="btn btn-secondary btn-sm" download title="Esporta dati in CSV" style="text-decoration: none;">
+            </button>
+            <button type="button" class="btn btn-secondary btn-sm btn-export-csv" data-file="${safeName}" title="Esporta dati in CSV">
               Esporta CSV
-            </a>
+            </button>
           </div>
         </td>
       `;
@@ -340,6 +377,30 @@ class CupController {
           this.currentPage = 1;
           this.renderFilesTable(this.filesList);
           this.loadPatients();
+        }
+      });
+    });
+
+    tbody.querySelectorAll(".btn-download-raw").forEach(btn => {
+      btn.addEventListener("click", async () => {
+        const file = btn.getAttribute("data-file");
+        if (!file) return;
+        try {
+          await APIClient.downloadFile(`/api/cup/files/${encodeURIComponent(file)}/download`, file);
+        } catch (err) {
+          alert(`Errore download file: ${err.message}`);
+        }
+      });
+    });
+
+    tbody.querySelectorAll(".btn-export-csv").forEach(btn => {
+      btn.addEventListener("click", async () => {
+        const file = btn.getAttribute("data-file");
+        if (!file) return;
+        try {
+          await APIClient.downloadFile(`/api/cup/export?format=csv&file_name=${encodeURIComponent(file)}`, `${file}.csv`);
+        } catch (err) {
+          alert(`Errore esportazione CSV: ${err.message}`);
         }
       });
     });
@@ -363,7 +424,7 @@ class CupController {
 
       this.renderTable(res);
     } catch (err) {
-      tbody.innerHTML = `<tr><td colspan="7" style="text-align: center; color: var(--status-danger); padding: 1.5rem;">Errore caricamento: ${err.message}</td></tr>`;
+      tbody.innerHTML = `<tr><td colspan="7" style="text-align: center; color: var(--status-danger); padding: 1.5rem;">Errore caricamento: ${escapeHtml(err.message)}</td></tr>`;
     }
   }
 
@@ -381,22 +442,23 @@ class CupController {
     patients.forEach(p => {
       const tr = document.createElement("tr");
 
-      const fullName = `${p.cognome || ''} ${p.nome || ''}`.trim() || 'Sconosciuto';
-      const dob = p.data_nascita || '-';
-      const cf = p.codice_fiscale || '-';
-      const idStr = p.priamo_id ? `Priamo: ${p.priamo_id}` : (p.id_anagrafica_paziente ? `MEF: ${p.id_anagrafica_paziente}` : '-');
-      const comune = p.comune_nascita || '-';
+      const fullName = escapeHtml(`${p.cognome || ''} ${p.nome || ''}`.trim() || 'Sconosciuto');
+      const dob = escapeHtml(p.data_nascita || '-');
+      const cf = escapeHtml(p.codice_fiscale || '-');
+      const idStr = escapeHtml(p.priamo_id ? `Priamo: ${p.priamo_id}` : (p.id_anagrafica_paziente ? `MEF: ${p.id_anagrafica_paziente}` : '-'));
+      const comune = escapeHtml(p.comune_nascita || '-');
 
       const hasLocal = p.has_local_state;
       const inRedcap = p.in_redcap;
       const redcapId = p.redcap_record_id;
+      const safeRedcapId = escapeHtml(redcapId || '');
       const formsCount = p.redcap_forms_completed;
 
       let statusBadge = '<span class="badge badge-neutral">Da Elaborare</span>';
       if (inRedcap) {
-        const idLabel = redcapId ? ` #${redcapId}` : '';
-        const formsLabel = (formsCount !== undefined && formsCount !== null) ? ` (${formsCount}/8)` : '';
-        statusBadge = `<span class="badge badge-success" title="Paziente registrato in REDCap (ID: ${redcapId || 'N/D'})">✓ REDCap${idLabel}${formsLabel}</span>`;
+        const idLabel = redcapId ? ` #${safeRedcapId}` : '';
+        const formsLabel = (formsCount !== undefined && formsCount !== null) ? ` (${escapeHtml(formsCount)}/8)` : '';
+        statusBadge = `<span class="badge badge-success" title="Paziente registrato in REDCap (ID: ${safeRedcapId || 'N/D'})">✓ REDCap${idLabel}${formsLabel}</span>`;
       } else if (hasLocal) {
         statusBadge = '<span class="badge badge-info" title="Referti elaborati in locale ma non caricati su REDCap">✓ In Locale</span>';
       }
@@ -410,10 +472,10 @@ class CupController {
         <td>${statusBadge}</td>
         <td>
           <div style="display: flex; gap: 0.375rem;">
-            <button type="button" class="btn btn-primary btn-sm btn-action-pipeline" data-id="${p.patient_id || ''}" data-redcap-id="${redcapId || ''}" data-name="${p.nome || ''}" data-surname="${p.cognome || ''}" data-dob="${p.data_nascita || ''}">
+            <button type="button" class="btn btn-primary btn-sm btn-action-pipeline" data-id="${escapeHtml(p.patient_id || '')}" data-redcap-id="${safeRedcapId}" data-name="${escapeHtml(p.nome || '')}" data-surname="${escapeHtml(p.cognome || '')}" data-dob="${escapeHtml(p.data_nascita || '')}">
               ⚡ Pipeline
             </button>
-            <button type="button" class="btn btn-secondary btn-sm btn-action-verify" data-name="${p.nome || ''}" data-surname="${p.cognome || ''}" data-dob="${p.data_nascita || ''}">
+            <button type="button" class="btn btn-secondary btn-sm btn-action-verify" data-name="${escapeHtml(p.nome || '')}" data-surname="${escapeHtml(p.cognome || '')}" data-dob="${escapeHtml(p.data_nascita || '')}">
               🔍 Verifica
             </button>
           </div>
@@ -499,6 +561,7 @@ class PipelineRealtimeController {
     const name = document.getElementById("pipe-name").value.trim();
     const surname = document.getElementById("pipe-surname").value.trim();
     const dob = document.getElementById("pipe-dob").value.trim();
+    const aiBackend = document.getElementById("pipe-backend-select")?.value;
     const autoUpload = document.getElementById("pipe-auto-upload").checked;
     const dryRun = document.getElementById("pipe-dry-run").checked;
 
@@ -516,11 +579,12 @@ class PipelineRealtimeController {
         name: name || undefined,
         surname: surname || undefined,
         date_of_birth: dob || undefined,
+        ai_backend: aiBackend || undefined,
         auto_upload: autoUpload,
         dry_run: dryRun
       });
 
-      this.connectSSE(res.task_id);
+      await this.connectSSE(res.task_id);
     } catch (err) {
       this.appendLog(`Errore avvio task: ${err.message}`, "error");
       document.getElementById("pipeline-live-badge").className = "badge badge-danger";
@@ -531,6 +595,7 @@ class PipelineRealtimeController {
   static async startBatch() {
     document.getElementById("modal-batch").setAttribute("hidden", "true");
     const limit = parseInt(document.getElementById("batch-limit-input").value, 10) || 5;
+    const aiBackend = document.getElementById("pipe-backend-select")?.value;
     const autoUpload = document.getElementById("pipe-auto-upload").checked;
     const dryRun = document.getElementById("pipe-dry-run").checked;
 
@@ -539,12 +604,14 @@ class PipelineRealtimeController {
 
     try {
       const res = await APIClient.processBatchAsync({
+        cup_file_name: CupController.currentFile || undefined,
+        ai_backend: aiBackend || undefined,
         limit: limit,
         auto_upload: autoUpload,
         dry_run: dryRun
       });
 
-      this.connectSSE(res.task_id);
+      await this.connectSSE(res.task_id);
     } catch (err) {
       this.appendLog(`Errore avvio batch: ${err.message}`, "error");
       document.getElementById("pipeline-live-badge").className = "badge badge-danger";
@@ -561,6 +628,7 @@ class PipelineRealtimeController {
       clearInterval(this.timerInterval);
       this.timerInterval = null;
     }
+    this.seenLogKeys.clear();
 
     document.getElementById("pipeline-live-badge").className = "badge badge-info";
     document.getElementById("pipeline-live-badge").textContent = "In Esecuzione";
@@ -581,10 +649,21 @@ class PipelineRealtimeController {
     }, 1000);
   }
 
-  static connectSSE(taskId) {
+  static async connectSSE(taskId) {
     document.getElementById("live-task-id").textContent = taskId;
-    const url = `/api/tasks/${taskId}/events`;
-    this.appendLog(`Connessione streaming SSE stabilita con ${url}`, "info");
+    let url = `/api/tasks/${encodeURIComponent(taskId)}/events`;
+    if (APIClient.getApiKey()) {
+      try {
+        const tokRes = await APIClient.getSseToken();
+        if (tokRes && tokRes.sse_token) {
+          url = `${url}?sse_token=${encodeURIComponent(tokRes.sse_token)}`;
+        }
+      } catch (err) {
+        this.appendLog(`Impossibile ottenere token SSE: ${err.message}`, "error");
+        return;
+      }
+    }
+    this.appendLog(`Connessione streaming SSE stabilita per task ${taskId}`, "info");
 
     const eventSource = new EventSource(url);
     this.currentEventSource = eventSource;
@@ -652,8 +731,8 @@ class PipelineRealtimeController {
     const line = document.createElement("div");
     line.className = "event-terminal-line";
     line.innerHTML = `
-      <span class="event-time">[${timeStr}]</span>
-      <span class="event-msg ${type}">${msg}</span>
+      <span class="event-time">[${escapeHtml(timeStr)}]</span>
+      <span class="event-msg ${escapeHtml(type)}">${escapeHtml(msg)}</span>
     `;
     term.appendChild(line);
     term.scrollTop = term.scrollHeight;
@@ -670,8 +749,8 @@ class PipelineRealtimeController {
     line.className = "event-terminal-line";
     const type = msg.includes("Errore") || msg.includes("✗") ? "error" : (msg.includes("Completato") || msg.includes("✓") ? "success" : "info");
     line.innerHTML = `
-      <span class="event-time">[${timeStr}]</span>
-      <span class="event-msg ${type}">${msg}</span>
+      <span class="event-time">[${escapeHtml(timeStr)}]</span>
+      <span class="event-msg ${escapeHtml(type)}">${escapeHtml(msg)}</span>
     `;
     term.appendChild(line);
     term.scrollTop = term.scrollHeight;
@@ -692,14 +771,14 @@ class PipelineRealtimeController {
       const statusClass = doc.status === "success" ? "badge-success" : (doc.status === "skipped" ? "badge-neutral" : "badge-danger");
 
       card.innerHTML = `
-        <div class="doc-card-title">📄 ${doc.filename}</div>
+        <div class="doc-card-title">📄 ${escapeHtml(doc.filename)}</div>
         <div style="font-size: 0.8125rem; color: var(--primary-dark); margin-top: 0.25rem;">
-          <strong>Target REDCap:</strong> <code>${formName}</code>
+          <strong>Target REDCap:</strong> <code>${escapeHtml(formName)}</code>
         </div>
         <div class="doc-card-meta">
-          <span>Campi estratti: <strong>${fieldCount}</strong></span>
-          <span>Tempo: ${duration}</span>
-          <span class="badge ${statusClass}">${doc.status || 'success'}</span>
+          <span>Campi estratti: <strong>${escapeHtml(fieldCount)}</strong></span>
+          <span>Tempo: ${escapeHtml(duration)}</span>
+          <span class="badge ${statusClass}">${escapeHtml(doc.status || 'success')}</span>
         </div>
       `;
       container.appendChild(card);
@@ -732,36 +811,59 @@ class AuditController {
       const report = await APIClient.getAuditReport();
       this.renderReport(report);
     } catch (err) {
-      container.innerHTML = `<span style="color: var(--status-danger);">Impossibile generare report di audit: ${err.message}</span>`;
+      container.innerHTML = `<span style="color: var(--status-danger);">Impossibile generare report di audit: ${escapeHtml(err.message)}</span>`;
     }
   }
 
   static renderReport(report) {
-    document.getElementById("audit-total-patients").textContent = report.total_patients_audited || 0;
-    document.getElementById("audit-complete-records").textContent = report.fully_completed_records_count || 0;
-    document.getElementById("audit-false-complete").textContent = report.false_complete_flags_count || 0;
-    document.getElementById("audit-critical-anomalies").textContent = report.inconsistencies ? report.inconsistencies.length : 0;
+    const issues = report.issues || report.inconsistencies || [];
+    const totalPatients = report.total_records ?? report.total_patients_audited ?? 0;
+    const globalScoreText = report.global_completeness_score !== undefined
+      ? `${report.global_completeness_score}%`
+      : (report.fully_completed_records_count || 0);
+    const falseCompleteCount = report.false_complete_flags_count ?? issues.filter(i => i.category === "false_complete").length;
+    const criticalCount = report.critical_issues_count ?? issues.filter(i => i.severity === "critical").length;
+
+    document.getElementById("audit-total-patients").textContent = totalPatients;
+    document.getElementById("audit-complete-records").textContent = globalScoreText;
+    document.getElementById("audit-false-complete").textContent = falseCompleteCount;
+    document.getElementById("audit-critical-anomalies").textContent = criticalCount;
 
     let html = "";
-    if (report.inconsistencies && report.inconsistencies.length > 0) {
+    if (issues.length > 0) {
       html += '<h4 style="margin-bottom: 0.5rem; color: var(--status-danger);">⚠️ Anomalie e Incongruenze Rilevate:</h4><ul style="padding-left: 1.25rem; margin-bottom: 1.25rem;">';
-      report.inconsistencies.forEach(inc => {
-        html += `<li style="margin-bottom: 0.375rem;"><strong>[Paziente ${inc.patient_id}]</strong> ${inc.description || JSON.stringify(inc)}</li>`;
+      issues.forEach(inc => {
+        const desc = inc.description || JSON.stringify(inc);
+        html += `<li style="margin-bottom: 0.375rem;"><strong>[Paziente ${escapeHtml(inc.patient_id)}]</strong> ${escapeHtml(desc)}</li>`;
       });
       html += '</ul>';
     } else {
       html += '<div style="color: var(--status-success); margin-bottom: 1.25rem;">✓ Nessuna incongruenza critica riscontrata nei record analizzati.</div>';
     }
 
-    if (report.form_completion_matrix) {
+    if (Array.isArray(report.forms_stats) && report.forms_stats.length > 0) {
+      html += '<h4 style="margin-bottom: 0.5rem;">Avanzamento Form per Strumento REDCap:</h4>';
+      html += '<div class="table-wrapper"><table><thead><tr><th>Form REDCap</th><th>Completati</th><th>Non Verificati</th><th>Incompleti / Vuoti</th><th>Completezza</th></tr></thead><tbody>';
+      report.forms_stats.forEach(stat => {
+        const incompleteTotal = (stat.incomplete_count || 0) + (stat.empty_count || 0);
+        html += `<tr>
+          <td><strong>${escapeHtml(stat.form_name || stat.form_label)}</strong></td>
+          <td><span class="badge badge-success">${escapeHtml(stat.completed_count ?? 0)}</span></td>
+          <td><span class="badge badge-info">${escapeHtml(stat.unverified_count ?? 0)}</span></td>
+          <td><span class="badge badge-warning">${escapeHtml(incompleteTotal)}</span></td>
+          <td><strong>${escapeHtml(stat.completeness_pct ?? 0)}%</strong></td>
+        </tr>`;
+      });
+      html += '</tbody></table></div>';
+    } else if (report.form_completion_matrix) {
       html += '<h4 style="margin-bottom: 0.5rem;">Avanzamento Form per Strumento REDCap:</h4>';
       html += '<div class="table-wrapper"><table><thead><tr><th>Form REDCap</th><th>Completati</th><th>Incompleti</th><th>Non Iniziati</th></tr></thead><tbody>';
       for (const [form, counts] of Object.entries(report.form_completion_matrix)) {
         html += `<tr>
-          <td><strong>${form}</strong></td>
-          <td><span class="badge badge-success">${counts.complete || 0}</span></td>
-          <td><span class="badge badge-warning">${counts.unverified || counts.incomplete || 0}</span></td>
-          <td><span class="badge badge-neutral">${counts.not_started || 0}</span></td>
+          <td><strong>${escapeHtml(form)}</strong></td>
+          <td><span class="badge badge-success">${escapeHtml(counts.complete || 0)}</span></td>
+          <td><span class="badge badge-warning">${escapeHtml(counts.unverified || counts.incomplete || 0)}</span></td>
+          <td><span class="badge badge-neutral">${escapeHtml(counts.not_started || 0)}</span></td>
         </tr>`;
       }
       html += '</tbody></table></div>';
@@ -781,7 +883,7 @@ class SyncController {
 
     try {
       const res = await APIClient.getIncompletePatients();
-      const patients = res.patients || [];
+      const patients = Array.isArray(res) ? res : (res.patients || []);
 
       if (patients.length === 0) {
         tbody.innerHTML = '<tr><td colspan="5" style="text-align: center; color: var(--status-success); padding: 1.5rem;">✓ Tutti i pazienti hanno i form completati al 100%!</td></tr>';
@@ -791,14 +893,22 @@ class SyncController {
       tbody.innerHTML = "";
       patients.forEach(p => {
         const tr = document.createElement("tr");
-        const formsBadge = (p.incomplete_forms || []).map(f => `<span class="badge badge-warning" style="margin-right: 0.25rem;">${f}</span>`).join("");
+        const incompleteForms = Array.isArray(p.incomplete_forms)
+          ? p.incomplete_forms
+          : Object.entries(p)
+              .filter(([k, v]) => k.endsWith("_complete") && String(v || "").trim() !== "2")
+              .map(([k]) => k.replace(/_complete$/, ""));
+        const formsBadge = incompleteForms
+          .map(f => `<span class="badge badge-warning" style="margin-right: 0.25rem;">${escapeHtml(f)}</span>`)
+          .join("");
+        const safeId = escapeHtml(p.record_id);
         tr.innerHTML = `
-          <td><code>${p.record_id}</code></td>
-          <td style="font-weight: 600;">${p.name || ''} ${p.surname || ''}</td>
-          <td>${p.date_of_birth || '-'}</td>
+          <td><code>${safeId}</code></td>
+          <td style="font-weight: 600;">${escapeHtml(p.name || '')} ${escapeHtml(p.surname || '')}</td>
+          <td>${escapeHtml(p.date_of_birth || '-')}</td>
           <td>${formsBadge}</td>
           <td>
-            <button type="button" class="btn btn-primary btn-sm btn-sync-single" data-id="${p.record_id}">
+            <button type="button" class="btn btn-primary btn-sm btn-sync-single" data-id="${safeId}">
               🔄 Sincronizza
             </button>
           </td>
@@ -807,14 +917,22 @@ class SyncController {
       });
 
       tbody.querySelectorAll(".btn-sync-single").forEach(b => {
-        b.addEventListener("click", () => {
+        b.addEventListener("click", async () => {
           const id = b.getAttribute("data-id");
-          document.getElementById("pipe-patient-id").value = id;
-          TabManager.switchToTab("tab-btn-pipeline", "panel-pipeline");
+          if (!id) return;
+          try {
+            const syncRes = await APIClient.triggerSync({ patient_id: id, auto_upload: true });
+            TabManager.switchToTab("tab-btn-pipeline", "panel-pipeline");
+            PipelineRealtimeController.resetLiveUI();
+            PipelineRealtimeController.appendLog(`Sync REDCap avviato per paziente ${id}...`, "info");
+            await PipelineRealtimeController.connectSSE(syncRes.task_id);
+          } catch (err) {
+            alert(`Errore avvio sync per ${id}: ${err.message}`);
+          }
         });
       });
     } catch (err) {
-      tbody.innerHTML = `<tr><td colspan="5" style="text-align: center; color: var(--status-danger); padding: 1.5rem;">Errore: ${err.message}</td></tr>`;
+      tbody.innerHTML = `<tr><td colspan="5" style="text-align: center; color: var(--status-danger); padding: 1.5rem;">Errore: ${escapeHtml(err.message)}</td></tr>`;
     }
   }
 }
@@ -837,21 +955,25 @@ class RedCapController {
       tbody.innerHTML = "";
       records.forEach(r => {
         const tr = document.createElement("tr");
-        const fullName = `${r.surname || ''} ${r.name || ''}`.trim() || 'Paziente Anonimo';
-        const dob = r.date_of_birth || '-';
-        const completedCount = r.completed_forms_count || r.forms_completed || 0;
+        const fullName = escapeHtml(`${r.surname || ''} ${r.name || ''}`.trim() || 'Paziente Anonimo');
+        const dob = escapeHtml(r.date_of_birth || '-');
+        const derivedComplete = Object.entries(r)
+          .filter(([k, v]) => k.endsWith("_complete") && String(v || "").trim() === "2")
+          .length;
+        const completedCount = r.completed_forms_count ?? r.forms_completed_count ?? r.forms_completed ?? derivedComplete;
+        const safeId = escapeHtml(r.record_id);
 
         tr.innerHTML = `
-          <td><code>${r.record_id}</code></td>
+          <td><code>${safeId}</code></td>
           <td style="font-weight: 600;">${fullName}</td>
           <td>${dob}</td>
           <td>
             <span class="badge ${completedCount >= 8 ? 'badge-success' : 'badge-warning'}">
-              ${completedCount}/8 form
+              ${escapeHtml(completedCount)}/8 form
             </span>
           </td>
           <td>
-            <button type="button" class="btn btn-danger btn-sm btn-delete-record" data-id="${r.record_id}">
+            <button type="button" class="btn btn-danger btn-sm btn-delete-record" data-id="${safeId}">
               🗑️ Elimina
             </button>
           </td>
@@ -875,7 +997,7 @@ class RedCapController {
         });
       });
     } catch (err) {
-      tbody.innerHTML = `<tr><td colspan="5" style="text-align: center; color: var(--status-danger); padding: 1.5rem;">Errore caricamento: ${err.message}</td></tr>`;
+      tbody.innerHTML = `<tr><td colspan="5" style="text-align: center; color: var(--status-danger); padding: 1.5rem;">Errore caricamento: ${escapeHtml(err.message)}</td></tr>`;
     }
   }
 }
@@ -975,21 +1097,25 @@ document.addEventListener("DOMContentLoaded", () => {
       btn.innerHTML = origText;
     }
   });
-  document.getElementById("btn-cup-export-csv").addEventListener("click", () => {
+  document.getElementById("btn-cup-export-csv").addEventListener("click", async () => {
     const file = CupController.currentFile || "";
-    const apiKey = APIClient.getApiKey();
     const query = new URLSearchParams({ format: "csv" });
     if (file) query.append("file_name", file);
-    if (apiKey) query.append("api_key", apiKey);
-    window.open(`/api/cup/export?${query.toString()}`, "_blank");
+    try {
+      await APIClient.downloadFile(`/api/cup/export?${query.toString()}`, "anagrafica_cup.csv");
+    } catch (err) {
+      alert(`Errore esportazione CSV: ${err.message}`);
+    }
   });
-  document.getElementById("btn-cup-export-json").addEventListener("click", () => {
+  document.getElementById("btn-cup-export-json").addEventListener("click", async () => {
     const file = CupController.currentFile || "";
-    const apiKey = APIClient.getApiKey();
     const query = new URLSearchParams({ format: "json" });
     if (file) query.append("file_name", file);
-    if (apiKey) query.append("api_key", apiKey);
-    window.open(`/api/cup/export?${query.toString()}`, "_blank");
+    try {
+      await APIClient.downloadFile(`/api/cup/export?${query.toString()}`, "anagrafica_cup.json");
+    } catch (err) {
+      alert(`Errore esportazione JSON: ${err.message}`);
+    }
   });
 
   // Audit triggers
@@ -999,7 +1125,10 @@ document.addEventListener("DOMContentLoaded", () => {
   document.getElementById("btn-trigger-sync").addEventListener("click", async () => {
     try {
       const res = await APIClient.triggerSync({ auto_upload: true });
-      alert(`Sincronizzazione avviata in background (Task: ${res.task_id})`);
+      TabManager.switchToTab("tab-btn-pipeline", "panel-pipeline");
+      PipelineRealtimeController.resetLiveUI();
+      PipelineRealtimeController.appendLog(`Sincronizzazione REDCap avviata in background (Task: ${res.task_id})`, "info");
+      await PipelineRealtimeController.connectSSE(res.task_id);
     } catch (err) {
       alert(`Errore sincronizzazione: ${err.message}`);
     }

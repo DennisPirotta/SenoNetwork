@@ -9,21 +9,21 @@ dei fogli di lavoro ambulatoriali (worksheets) in formato Excel (.xlsx) per:
 """
 
 import calendar
-from datetime import date, datetime, timedelta
+import contextlib
+from datetime import date, timedelta
 import logging
 import os
 from pathlib import Path
 import re
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, List, Optional, Tuple, Union
 from urllib.parse import urlparse
+import warnings
 import urllib3
 from bs4 import BeautifulSoup
-import requests
 from requests import Session, RequestException
 
 from src.config import Settings, get_settings
-
-urllib3.disable_warnings()
+from src.utils import mask_phi
 
 logger = logging.getLogger("PriamoCupClient")
 
@@ -84,7 +84,7 @@ class PriamoCupClient:
         password: Optional[str] = None,
         cup_url: Optional[str] = None,
         home_url: Optional[str] = None,
-        verify_ssl: bool = False,
+        verify_ssl: Optional[bool] = None,
     ):
         self.settings = settings or get_settings()
         self.username = username or self.settings.priamo_username
@@ -112,7 +112,7 @@ class PriamoCupClient:
         else:
             self.cup_url = (cup_url or cfg_cup or fallback_cup).rstrip("/")
 
-        self.verify_ssl = verify_ssl
+        self.verify_ssl = getattr(self.settings, "priamo_verify_ssl", True) if verify_ssl is None else verify_ssl
 
         # Supporto Cloudflare Access Client Headers
         self.cf_client_id = (
@@ -148,10 +148,17 @@ class PriamoCupClient:
             raise PriamoCupAuthError("Credenziali Priamo mancanti (PRIAMO_USERNAME / PRIAMO_PASSWORD).")
 
         login_url = f"{self.home_url}/Account/Login"
-        logger.info(f"Autenticazione su PriamoHOME ({login_url}) come utente '{self.username}'...")
+        logger.info(f"Autenticazione su PriamoHOME ({login_url}) come utente '{mask_phi(self.username)}'...")
+
+        def _do_request(fn, *a, **kw):
+            if self.verify_ssl:
+                return fn(*a, **kw)
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", urllib3.exceptions.InsecureRequestWarning)
+                return fn(*a, **kw)
 
         try:
-            resp_get = self.session.get(login_url, timeout=(5, 30), verify=self.verify_ssl)
+            resp_get = _do_request(self.session.get, login_url, timeout=(5, 30), verify=self.verify_ssl)
             resp_get.raise_for_status()
         except RequestException as e:
             raise PriamoCupAuthError(f"Impossibile raggiungere l'endpoint di login PriamoHOME ({login_url}): {e}") from e
@@ -168,7 +175,8 @@ class PriamoCupClient:
         }
 
         try:
-            resp_post = self.session.post(
+            resp_post = _do_request(
+                self.session.post,
                 login_url,
                 data=payload,
                 allow_redirects=True,
@@ -180,7 +188,6 @@ class PriamoCupClient:
             raise PriamoCupAuthError(f"Errore durante l'invio delle credenziali di login: {e}") from e
 
         # Estrazione manuale del cookie .PRIAMOAUTH da Set-Cookie per gestire mismatch di dominio
-        # attraverso tunnel Cloudflare o reverse proxy (es. backend invia dominio .valduce.it)
         all_responses = list(resp_post.history) + [resp_post]
         for resp in all_responses:
             raw_headers = getattr(resp.raw, "headers", None)
@@ -196,9 +203,10 @@ class PriamoCupClient:
                 match = re.search(r"(?i)\.PRIAMOAUTH=([^;]+)", sc)
                 if match:
                     priamo_auth_val = match.group(1).strip()
-                    target_host = urlparse(self.home_url).hostname
-                    if target_host:
-                        self.session.cookies.set(".PRIAMOAUTH", priamo_auth_val, domain=target_host, path="/")
+                    home_host = urlparse(self.home_url).hostname
+                    cup_host = urlparse(self.cup_url).hostname
+                    for h in {x for x in (home_host, cup_host) if x}:
+                        self.session.cookies.set(".PRIAMOAUTH", priamo_auth_val, domain=h, path="/")
                     break
 
         # Verifica cookie .PRIAMOAUTH
@@ -218,7 +226,13 @@ class PriamoCupClient:
         token_page_url = f"{self.cup_url}/Riepilogo/FoglioLavoro"
 
         try:
-            resp = self.session.get(token_page_url, timeout=(5, 30), verify=self.verify_ssl)
+            with warnings.catch_warnings():
+                if not self.verify_ssl:
+                    warnings.simplefilter("ignore", urllib3.exceptions.InsecureRequestWarning)
+                resp = self.session.get(token_page_url, timeout=(5, 30), verify=self.verify_ssl)
+                if resp.status_code in (401, 403):
+                    self.authenticate(force=True)
+                    resp = self.session.get(token_page_url, timeout=(5, 30), verify=self.verify_ssl)
             resp.raise_for_status()
         except RequestException as e:
             raise PriamoCupAuthError(f"Impossibile accedere alla pagina Riepilogo FoglioLavoro ({token_page_url}): {e}") from e
@@ -355,7 +369,10 @@ class PriamoCupClient:
 
         esporta_url = f"{self.cup_url}/api/RiepilogoFoglioLavoro/Esporta"
         try:
-            resp_export = self.session.post(esporta_url, headers=headers, data=payload, timeout=(10, 60))
+            with warnings.catch_warnings():
+                if not self.verify_ssl:
+                    warnings.simplefilter("ignore", urllib3.exceptions.InsecureRequestWarning)
+                resp_export = self.session.post(esporta_url, headers=headers, data=payload, timeout=(10, 60), verify=self.verify_ssl)
             resp_export.raise_for_status()
         except RequestException as e:
             raise RuntimeError(f"Errore durante la richiesta di generazione report PriamoCUP: {e}") from e
@@ -371,18 +388,34 @@ class PriamoCupClient:
         out_dir.mkdir(parents=True, exist_ok=True)
 
         if custom_filename:
-            local_name = custom_filename if custom_filename.endswith(".xlsx") else f"{custom_filename}.xlsx"
+            local_name = Path(custom_filename).name
+            if not local_name.endswith(".xlsx"):
+                local_name = f"{local_name}.xlsx"
         else:
             local_name = f"fogli_lavoro_unita_{codice_unita}_{start_dt.strftime('%Y%m%d')}_{end_dt.strftime('%Y%m%d')}.xlsx"
 
         dest_path = out_dir / local_name
 
         try:
-            with self.session.get(preleva_url, params={"fileName": remote_filename}, stream=True, timeout=(10, 60)) as resp_down:
-                resp_down.raise_for_status()
-                with open(dest_path, "wb") as f:
-                    for chunk in resp_down.iter_content(chunk_size=8192):
-                        f.write(chunk)
+            with warnings.catch_warnings():
+                if not self.verify_ssl:
+                    warnings.simplefilter("ignore", urllib3.exceptions.InsecureRequestWarning)
+                with contextlib.closing(
+                    self.session.get(
+                        preleva_url,
+                        params={"fileName": remote_filename},
+                        stream=True,
+                        timeout=(10, 60),
+                        verify=self.verify_ssl,
+                    )
+                ) as resp_down:
+                    resp_down.raise_for_status()
+                    chunks = list(resp_down.iter_content(chunk_size=8192))
+            raw_bytes = b"".join(chunks)
+            if not raw_bytes.startswith(b"PK"):
+                raise RuntimeError("Il file scaricato da PriamoCUP non è un archivio Excel (.xlsx) valido.")
+            with open(dest_path, "wb") as f:
+                f.write(raw_bytes)
         except RequestException as e:
             raise RuntimeError(f"Errore durante il prelievo del file esportato da PriamoCUP ({remote_filename}): {e}") from e
 
@@ -622,11 +655,12 @@ class PriamoCupClient:
                 output_dir=output_dir,
             )
 
-        if start_date is not None and end_date is not None:
-            logger.info(f"Download fogli lavoro PriamoCUP dal {start_date} al {end_date}...")
+        if start_date is not None:
+            eff_end = end_date if end_date is not None else start_date
+            logger.info(f"Download fogli lavoro PriamoCUP dal {start_date} al {eff_end}...")
             return self.export_worksheets(
                 start_date=start_date,
-                end_date=end_date,
+                end_date=eff_end,
                 codice_unita=codice_unita,
                 agende=agendas,
                 output_dir=output_dir,

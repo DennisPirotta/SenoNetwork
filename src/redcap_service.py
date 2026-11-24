@@ -1,15 +1,20 @@
 import csv
-from datetime import date, datetime
-import io
+from datetime import date
+import hashlib
 import json
 import logging
 from pathlib import Path
+import threading
 from typing import Any, Dict, List, Optional, Union
 import requests
 
 from src.models import REDCapField
+from src.utils import normalize_person_name, parse_flexible_date, sanitize_identifier
 
 logger = logging.getLogger(__name__)
+
+_ALLOCATED_IDS_LOCK = threading.Lock()
+_ALLOCATED_IDS_BY_PROJECT: Dict[str, set[str]] = {}
 
 
 class REDCapService:
@@ -240,6 +245,49 @@ class REDCapService:
 
         return result
 
+    @staticmethod
+    def merge_with_existing_record(
+        existing: Optional[Dict[str, Any]],
+        updates: Dict[str, Any],
+        overwrite: bool = False,
+        primary_key: str = "record_id",
+    ) -> Dict[str, Any]:
+        """Safely merges new extracted updates against an existing REDCap record.
+
+        When `overwrite=False`, existing populated REDCap fields are preserved and
+        checked checkboxes ('1') are never cleared to '0'.
+        """
+        if not existing or overwrite:
+            return dict(updates)
+
+        filtered: Dict[str, Any] = {primary_key: str(updates.get(primary_key) or existing.get(primary_key) or "")}
+        for k, new_v in updates.items():
+            if k == primary_key or k.startswith("_"):
+                continue
+            if new_v is None or new_v == "":
+                continue
+
+            old_v = existing.get(k)
+            old_str = str(old_v).strip() if old_v is not None else ""
+            new_str = str(new_v).strip()
+
+            if k.endswith("_complete"):
+                if old_str == "2":
+                    continue
+                if old_str == "1" and new_str == "0":
+                    continue
+                filtered[k] = new_str
+            elif "___" in k:
+                # Never overwrite a checked box ('1') with '0' in safe fill_missing mode;
+                # only emit '1' for newly detected options.
+                if new_str == "1" and old_str != "1":
+                    filtered[k] = "1"
+            else:
+                if not old_str:
+                    filtered[k] = new_v
+
+        return filtered
+
     def import_records_to_api(self, records: List[Dict[str, Any]]) -> Dict[str, Any]:
         """Directly uploads extracted records to the REDCap project.
 
@@ -378,101 +426,119 @@ class REDCapService:
         name: Optional[str] = None,
         surname: Optional[str] = None,
         date_of_birth: Optional[Union[date, str]] = None,
-        numeric_only: bool = False
+        numeric_only: bool = False,
+        codice_fiscale: Optional[str] = None,
+        records_cache: Optional[List[Dict[str, Any]]] = None,
     ) -> Optional[str]:
-        """Searches REDCap for an existing patient by name, surname and date of birth.
+        """Searches REDCap for an existing patient by Codice Fiscale or (name, surname, DOB).
 
-        Returns the native REDCap 'record_id' if found, preserving the original project
-        primary key and avoiding accidental creation of duplicate patient records.
-        Strictly requires date_of_birth to match to prevent dangerous cross-contamination of homonyms.
-        If numeric_only is True, ignores legacy slug IDs and returns only numeric record_ids.
+        Strictly requires date_of_birth (or Codice Fiscale) to match and rejects ambiguous
+        multiple matches to prevent cross-contamination of homonyms.
         """
-        if not name or not surname or not date_of_birth:
-            return None
+        cf_norm = str(codice_fiscale or "").strip().upper()
+        clean_name = normalize_person_name(name)
+        clean_surname = normalize_person_name(surname)
+        dob_parsed = parse_flexible_date(date_of_birth)
+        dob_str = dob_parsed.strftime("%Y-%m-%d") if dob_parsed else ""
 
-        clean_name = name.strip().lower()
-        clean_surname = surname.strip().lower()
-        dob_str = ""
-        if isinstance(date_of_birth, date):
-            dob_str = date_of_birth.strftime("%Y-%m-%d")
-        else:
-            s = str(date_of_birth).strip()
-            for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%Y/%m/%d", "%d-%m-%Y"):
-                try:
-                    dob_str = datetime.strptime(s[:10], fmt).strftime("%Y-%m-%d")
-                    break
-                except ValueError:
-                    continue
-            if not dob_str:
-                dob_str = s
-
-        if not dob_str:
+        if not cf_norm and (not clean_name or not clean_surname or not dob_str):
             return None
 
         try:
-            records = self.export_records_from_api(
-                fields=["record_id", "name", "surname", "date_of_birth"]
-            )
-            for r in records:
-                r_name = str(r.get("name") or "").strip().lower()
-                r_surname = str(r.get("surname") or "").strip().lower()
-                r_dob = str(r.get("date_of_birth") or "").strip()
-                rid = str(r.get("record_id") or "").strip()
+            records = records_cache
+            if records is None:
+                records = self.export_records_from_api(
+                    fields=["record_id", "name", "surname", "date_of_birth"]
+                )
 
-                if r_name == clean_name and r_surname == clean_surname and r_dob and r_dob == dob_str:
-                    if numeric_only and not rid.isdigit():
-                        continue
-                    return rid
+            cf_matches: List[str] = []
+            demo_matches: List[str] = []
+
+            for r in records:
+                rid = str(r.get("record_id") or "").strip()
+                if not rid:
+                    continue
+                if numeric_only and not rid.isdigit():
+                    continue
+
+                if cf_norm:
+                    r_cf = str(r.get("codice_fiscale") or "").strip().upper()
+                    if r_cf and r_cf == cf_norm:
+                        cf_matches.append(rid)
+
+                if clean_name and clean_surname and dob_str:
+                    r_name = normalize_person_name(r.get("name"))
+                    r_surname = normalize_person_name(r.get("surname"))
+                    r_dob_parsed = parse_flexible_date(r.get("date_of_birth"))
+                    r_dob = r_dob_parsed.strftime("%Y-%m-%d") if r_dob_parsed else str(r.get("date_of_birth") or "").strip()
+
+                    if r_name == clean_name and r_surname == clean_surname and r_dob and r_dob == dob_str:
+                        demo_matches.append(rid)
+
+            if len(cf_matches) == 1:
+                return cf_matches[0]
+            if len(cf_matches) > 1:
+                logger.error(f"Rilevati più record REDCap duplicati con stesso CF ({len(cf_matches)} match).")
+                return None
+
+            if len(demo_matches) == 1:
+                return demo_matches[0]
+            if len(demo_matches) > 1:
+                logger.error(f"Rilevati più record REDCap omonimi con stessa anagrafica/DOB ({len(demo_matches)} match).")
+                return None
         except Exception as e:
             logger.warning(f"Errore ricerca record_id su REDCap tramite anagrafica: {e}")
 
         return None
 
+    def _project_alloc_key(self) -> str:
+        token_hash = hashlib.sha256(self.api_token.encode("utf-8")).hexdigest()[:12] if self.api_token else "local"
+        return f"{self.api_url}::{token_hash}"
+
     def generate_next_record_name(self) -> str:
         """Generates the next available numeric record ID using REDCap's native API.
 
-        Uses REDCap's 'generateNextRecordName' API method with session tracking
-        to ensure distinct sequential IDs even in dry-run or batch scenarios.
+        Uses process-wide locking and allocation tracking per REDCap project to avoid
+        concurrent ID collisions before upload.
         """
-        candidate_num = None
-        if self.api_url and self.api_token:
-            try:
-                payload = {
-                    "token": self.api_token,
-                    "content": "generateNextRecordName",
-                    "format": "json"
-                }
-                resp = requests.post(self.api_url, data=payload, timeout=15)
-                if resp.status_code == 200:
-                    raw_val = resp.text.strip().strip('"').strip("'")
-                    if raw_val and raw_val.isdigit():
-                        candidate_num = int(raw_val)
-            except Exception as e:
-                logger.warning(f"Chiamata REDCap generateNextRecordName fallita: {e}")
+        proj_key = self._project_alloc_key()
+        with _ALLOCATED_IDS_LOCK:
+            proj_allocated = _ALLOCATED_IDS_BY_PROJECT.setdefault(proj_key, set())
+            candidate_num = None
+            if self.api_url and self.api_token:
+                try:
+                    payload = {
+                        "token": self.api_token,
+                        "content": "generateNextRecordName",
+                        "format": "json"
+                    }
+                    resp = requests.post(self.api_url, data=payload, timeout=15)
+                    if resp.status_code == 200:
+                        raw_val = resp.text.strip().strip('"').strip("'")
+                        if raw_val and raw_val.isdigit():
+                            candidate_num = int(raw_val)
+                except Exception as e:
+                    logger.warning(f"Chiamata REDCap generateNextRecordName fallita: {e}")
 
-        # Se non ottenuto da API, calcola il massimo degli ID numerici esistenti + 1
-        if candidate_num is None:
-            try:
-                existing_ids = self.get_all_patient_ids()
-                numeric_ids = []
-                for rid in existing_ids:
-                    if rid and str(rid).isdigit():
-                        numeric_ids.append(int(rid))
-                candidate_num = max(numeric_ids) + 1 if numeric_ids else 1
-            except Exception as e:
-                logger.error(f"Errore critico nel calcolo del prossimo record_id da REDCap: {e}")
-                raise RuntimeError(
-                    "Impossibile generare record_id REDCap: chiamata API generateNextRecordName "
-                    f"e recupero degli ID esistenti falliti ({e})."
-                ) from e
+            if candidate_num is None:
+                try:
+                    existing_ids = self.get_all_patient_ids()
+                    numeric_ids = [int(rid) for rid in existing_ids if rid and str(rid).isdigit()]
+                    candidate_num = max(numeric_ids) + 1 if numeric_ids else 1
+                except Exception as e:
+                    logger.error(f"Errore critico nel calcolo del prossimo record_id da REDCap: {e}")
+                    raise RuntimeError(
+                        "Impossibile generare record_id REDCap: chiamata API generateNextRecordName "
+                        f"e recupero degli ID esistenti falliti ({e})."
+                    ) from e
 
-        # Assicura che l'ID non collida con ID già allocati in questa sessione
-        while str(candidate_num) in self._allocated_record_ids:
-            candidate_num += 1
+            while str(candidate_num) in self._allocated_record_ids or str(candidate_num) in proj_allocated:
+                candidate_num += 1
 
-        result_str = str(candidate_num)
-        self._allocated_record_ids.add(result_str)
-        return result_str
+            result_str = str(candidate_num)
+            self._allocated_record_ids.add(result_str)
+            proj_allocated.add(result_str)
+            return result_str
 
     def list_all_records(
         self,
@@ -690,7 +756,10 @@ class REDCapService:
             from src.config import get_settings
             state_dir = get_settings().state_dir
             for pid in all_ids:
-                sf = state_dir / f"{pid}_state.json"
+                safe_pid = sanitize_identifier(pid, default="")
+                if not safe_pid:
+                    continue
+                sf = state_dir / f"{safe_pid}_state.json"
                 if sf.exists():
                     try:
                         sf.unlink(missing_ok=True)
@@ -759,20 +828,23 @@ def delete_redcap_records(
     """
     from src.config import get_settings
     cfg = get_settings()
+    effective_token = api_token or cfg.redcap_delete_token or cfg.redcap_api_token
     service = REDCapService(
         api_url=api_url or cfg.redcap_api_url,
-        api_token=api_token or cfg.redcap_api_token
+        api_token=effective_token
     )
 
     if record_id and not all_records:
         success = service.delete_record(record_id=record_id, arm=arm)
         if success and clean_local_state:
-            state_file = cfg.state_dir / f"{record_id}_state.json"
-            if state_file.exists():
-                try:
-                    state_file.unlink(missing_ok=True)
-                except Exception as e:
-                    logger.debug(f"Impossibile rimuovere file di stato locale {state_file}: {e}")
+            safe_id = sanitize_identifier(record_id, default="")
+            if safe_id:
+                state_file = cfg.state_dir / f"{safe_id}_state.json"
+                if state_file.exists():
+                    try:
+                        state_file.unlink(missing_ok=True)
+                    except Exception as e:
+                        logger.debug(f"Impossibile rimuovere file di stato locale {state_file}: {e}")
         return 1 if success else 0
 
     if all_records:

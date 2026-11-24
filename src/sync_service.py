@@ -1,9 +1,10 @@
 from datetime import date, datetime
+import inspect
 import json
 import logging
 from pathlib import Path
 import time
-from typing import Any, Dict, List, Optional, Set, Tuple, Union
+from typing import Any, Dict, List, Optional, Set, Union
 
 from pydantic import BaseModel, Field
 
@@ -15,6 +16,7 @@ from src.models import REDCapField
 from src.pdf_extractor import PDFExtractor
 from src.patient_pipeline import PatientPipeline, compute_file_hash
 from src.redcap_service import REDCapService
+from src.utils import atomic_write_text, mask_phi, sanitize_identifier
 
 logger = logging.getLogger(__name__)
 
@@ -81,16 +83,29 @@ class RedCapSyncService:
             api_token=self.settings.redcap_api_token
         )
         self.dotnet_client = dotnet_client or DotNetApiClient(settings=self.settings)
-        self.ai_extractor = ai_extractor or get_ai_extractor(self.settings)
+        self._ai_extractor = ai_extractor
         self.pipeline = patient_pipeline or PatientPipeline(
             settings=self.settings,
             redcap_service=self.redcap_service,
             dotnet_client=self.dotnet_client,
-            ai_extractor=self.ai_extractor
+            ai_extractor=ai_extractor
         )
 
         # Pre-load metadata via pipeline
         self._all_metadata: List[REDCapField] = []
+
+    @property
+    def ai_extractor(self):
+        """Lazily accesses or initializes the AI extractor without eager startup network probes."""
+        if self._ai_extractor is None:
+            self._ai_extractor = self.pipeline.ai_extractor if self.pipeline else get_ai_extractor(self.settings)
+        return self._ai_extractor
+
+    @ai_extractor.setter
+    def ai_extractor(self, value: Optional[AIExtractor]) -> None:
+        self._ai_extractor = value
+        if self.pipeline is not None:
+            self.pipeline.ai_extractor = value
 
     def load_metadata(self) -> List[REDCapField]:
         """Loads REDCap data dictionary fields."""
@@ -120,11 +135,14 @@ class RedCapSyncService:
             return []
 
         if not filter_incomplete_forms:
+            for r in records:
+                r["incomplete_forms"] = self.detect_incomplete_forms(r)
             return records
 
         target_forms = [f.lower().strip() for f in filter_incomplete_forms]
         incomplete_records = []
         for r in records:
+            r["incomplete_forms"] = self.detect_incomplete_forms(r)
             needs_update = False
             for frm in target_forms:
                 status_val = str(r.get(f"{frm}_complete") or "").strip()
@@ -153,24 +171,25 @@ class RedCapSyncService:
 
     def load_patient_state(self, patient_id: str) -> Dict[str, Any]:
         """Loads state tracking json for patient if present."""
-        state_file = self.settings.state_dir / f"{patient_id}_state.json"
+        safe_pid = sanitize_identifier(patient_id)
+        state_file = self.settings.state_dir / f"{safe_pid}_state.json"
         if state_file.exists():
             try:
                 with open(state_file, "r", encoding="utf-8") as f:
                     return json.load(f)
             except Exception as e:
-                logger.warning(f"Errore lettura state file per {patient_id}: {e}")
-        return {"patient_id": patient_id, "files": [], "forms_populated": []}
+                logger.warning(f"Errore lettura state file per {safe_pid}: {e}")
+        return {"patient_id": safe_pid, "files": [], "forms_populated": []}
 
     def save_patient_state(self, patient_id: str, state_data: Dict[str, Any]):
         """Persists state tracking json for patient."""
+        safe_pid = sanitize_identifier(patient_id)
         try:
             self.settings.state_dir.mkdir(parents=True, exist_ok=True)
-            state_file = self.settings.state_dir / f"{patient_id}_state.json"
-            with open(state_file, "w", encoding="utf-8") as f:
-                json.dump(state_data, f, indent=2, ensure_ascii=False)
+            state_file = self.settings.state_dir / f"{safe_pid}_state.json"
+            atomic_write_text(state_file, json.dumps(state_data, indent=2, ensure_ascii=False))
         except Exception as e:
-            logger.warning(f"Impossibile salvare lo state file per {patient_id}: {e}")
+            logger.warning(f"Impossibile salvare lo state file per {safe_pid}: {e}")
 
     def check_and_update_patient(
         self,
@@ -198,8 +217,11 @@ class RedCapSyncService:
             overwrite_mode: 'fill_missing' (default: only update empty/0 fields) or 'overwrite' (replace existing).
         """
         start_time = time.time()
-        mode = overwrite_mode or self.settings.sync_overwrite_mode
-        logger.info(f"--- [SYNC] Controllo paziente REDCap: {patient_id} (mode={mode}, dry_run={dry_run}) ---")
+        mode = (overwrite_mode or self.settings.sync_overwrite_mode).strip().lower()
+        logger.info(
+            f"--- [SYNC] Controllo paziente REDCap: {patient_id} ({mask_phi(surname)} {mask_phi(name)}, "
+            f"mode={mode}, dry_run={dry_run}) ---"
+        )
 
         # Step 1: Query existing REDCap record
         existing_record: Optional[Dict[str, Any]] = None
@@ -272,7 +294,7 @@ class RedCapSyncService:
         logger.info(f"-> Form da verificare per {patient_id}: {forms_to_audit}")
 
         # Step 3: Fetch available reports (Priamo / .NET or local directories)
-        download_dir = self.settings.downloads_dir / patient_id
+        download_dir = self.settings.downloads_dir / sanitize_identifier(patient_id)
         download_dir.mkdir(parents=True, exist_ok=True)
         available_pdfs = self.dotnet_client.download_all_patient_pdfs(
             patient_id=patient_id,
@@ -334,128 +356,150 @@ class RedCapSyncService:
                 if not report_text.strip():
                     continue
 
-                # 4.2 Classify form
-                classified_form = FormClassifier.classify_report(
+                # 4.2 Classify target REDCap forms (primary + secondary)
+                target_forms_for_doc = FormClassifier.classify_report_targets(
                     text=report_text,
                     hint=pdf_path.name,
                     settings=self.settings
                 )
-
-                # Check if this form is relevant to audit
-                if forms_to_audit and classified_form not in forms_to_audit:
-                    # Also check if this form in REDCap is currently incomplete
-                    if existing_record.get(f"{classified_form}_complete") == "2" and not force_reprocess:
-                        continue
-
-                logger.info(f"-> Analisi referto '{pdf_path.name}' classificato come '{classified_form}'...")
-
-                # 4.3 AI Extraction
-                target_fields = self.pipeline.get_fields_for_form(classified_form)
-                extraction_res = self.ai_extractor.extract_from_text(
-                    report_text=report_text,
-                    fields=target_fields,
-                    pdf_path=str(pdf_path),
-                    record_id=patient_id,
-                    form_name=classified_form
-                )
-
-                if extraction_res.status != "success":
-                    logger.warning(f"Estrazione fallita per {pdf_path.name}: {extraction_res.error_message}")
+                valid_doc_forms = [
+                    f for f in target_forms_for_doc if f not in ("skip", "irrelevant", "unknown")
+                ]
+                if not valid_doc_forms:
                     continue
 
-                extracted_data = extraction_res.redcap_record
+                extract_sig_params: Set[str] = set()
+                try:
+                    extract_sig_params = set(
+                        inspect.signature(self.ai_extractor.extract_from_text).parameters.keys()
+                    )
+                except (TypeError, ValueError):
+                    extract_sig_params = set()
 
-                # 4.4 Compute diff with existing REDCap record
-                form_has_updates = False
-                for k, new_v in extracted_data.items():
-                    if k in ("record_id",):
-                        continue
+                doc_forms_processed: List[str] = []
+                for form_idx, classified_form in enumerate(valid_doc_forms):
+                    # Check if this form is relevant to audit
+                    if forms_to_audit and classified_form not in forms_to_audit:
+                        if existing_record.get(f"{classified_form}_complete") == "2" and not force_reprocess:
+                            continue
 
-                    # Skip empty/None values in extracted data unless checkbox code '0'
-                    if new_v in (None, ""):
-                        continue
+                    is_primary = (form_idx == 0)
+                    logger.info(
+                        f"-> Analisi referto '{pdf_path.name}' classificato come '{classified_form}' "
+                        f"({'primario' if is_primary else 'secondario'})..."
+                    )
 
-                    old_v = existing_record.get(k)
-                    old_str = str(old_v).strip() if old_v is not None else ""
-                    new_str = str(new_v).strip()
+                    # 4.3 AI Extraction
+                    target_fields = self.pipeline.get_fields_for_form(classified_form)
+                    extract_kwargs: Dict[str, Any] = {
+                        "report_text": report_text,
+                        "fields": target_fields,
+                        "pdf_path": str(pdf_path),
+                        "record_id": patient_id,
+                        "form_name": classified_form,
+                        "mark_form_complete": is_primary,
+                        "form_completion_status": "1" if is_primary else "0",
+                    }
+                    if "include_unchecked_checkboxes" in extract_sig_params:
+                        extract_kwargs["include_unchecked_checkboxes"] = (mode == "overwrite")
 
-                    # Completion field logic
-                    if k == f"{classified_form}_complete":
-                        if old_str != "2" and new_str == "2":
-                            field_updates.append(
-                                FieldUpdateDetail(
-                                    field_name=k,
-                                    form_name=classified_form,
-                                    old_value=old_v,
-                                    new_value=new_v,
-                                    update_type="status_change"
-                                )
-                            )
-                            updates_payload[k] = new_v
-                            form_has_updates = True
-                        continue
+                    extraction_res = self.ai_extractor.extract_from_text(**extract_kwargs)
 
-                    # Checkbox fields: format {field}___{code}
-                    if "___" in k:
-                        if old_str != new_str:
-                            if mode == "overwrite" or (mode == "fill_missing" and old_str in ("", "0") and new_str == "1"):
-                                field_updates.append(
-                                    FieldUpdateDetail(
-                                        field_name=k,
-                                        form_name=classified_form,
-                                        old_value=old_v,
-                                        new_value=new_v,
-                                        update_type="new_field" if old_str in ("", "0") else "overwrite"
-                                    )
-                                )
-                                updates_payload[k] = new_v
-                                form_has_updates = True
-                        continue
-
-                    # Standard fields (radio, dropdown, text, number, date)
-                    if old_str == "" or old_str is None:
-                        # New field enrichment
-                        field_updates.append(
-                            FieldUpdateDetail(
-                                field_name=k,
-                                form_name=classified_form,
-                                old_value=old_v,
-                                new_value=new_v,
-                                update_type="new_field"
-                            )
+                    if extraction_res.status != "success":
+                        logger.warning(
+                            f"Estrazione fallita per {pdf_path.name} ({classified_form}): {extraction_res.error_message}"
                         )
-                        updates_payload[k] = new_v
-                        form_has_updates = True
-                    elif old_str != new_str:
-                        # Value already exists, but new valid value comes from a medical report.
-                        # Per clinical merging logic: if a value is valid and comes from a more recent report,
-                        # it is an update of an older value.
-                        if mode == "overwrite" or mode == "fill_missing":
+                        continue
+
+                    doc_forms_processed.append(classified_form)
+                    extracted_data = extraction_res.redcap_record
+
+                    # 4.4 Compute diff with existing REDCap record
+                    form_has_updates = False
+                    for k, new_v in extracted_data.items():
+                        if k in ("record_id",):
+                            continue
+
+                        if new_v in (None, ""):
+                            continue
+
+                        old_v = existing_record.get(k)
+                        old_str = str(old_v).strip() if old_v is not None else ""
+                        new_str = str(new_v).strip()
+
+                        # Completion field logic: never auto-promote to '2' or downgrade '2'
+                        if k == f"{classified_form}_complete":
+                            continue
+
+                        # Checkbox fields: format {field}___{code}
+                        if "___" in k:
+                            if old_str != new_str:
+                                if mode == "overwrite" or (
+                                    mode != "overwrite" and old_str in ("", "0") and new_str == "1"
+                                ):
+                                    field_updates.append(
+                                        FieldUpdateDetail(
+                                            field_name=k,
+                                            form_name=classified_form,
+                                            old_value=old_v,
+                                            new_value=new_v,
+                                            update_type="new_field" if old_str in ("", "0") else "overwrite"
+                                        )
+                                    )
+                                    updates_payload[k] = new_v
+                                    form_has_updates = True
+                            continue
+
+                        # Standard fields (radio, dropdown, text, number, date)
+                        if not old_str:
                             field_updates.append(
                                 FieldUpdateDetail(
                                     field_name=k,
                                     form_name=classified_form,
                                     old_value=old_v,
                                     new_value=new_v,
-                                    update_type="update_recent" if mode != "overwrite" else "overwrite"
+                                    update_type="new_field"
+                                )
+                            )
+                            updates_payload[k] = new_v
+                            form_has_updates = True
+                        elif old_str != new_str and mode == "overwrite":
+                            # Only overwrite populated REDCap fields when overwrite mode is explicitly requested
+                            field_updates.append(
+                                FieldUpdateDetail(
+                                    field_name=k,
+                                    form_name=classified_form,
+                                    old_value=old_v,
+                                    new_value=new_v,
+                                    update_type="overwrite"
                                 )
                             )
                             updates_payload[k] = new_v
                             form_has_updates = True
 
-                if form_has_updates:
-                    forms_updated.add(classified_form)
-                    # Ensure form completion is marked
-                    updates_payload[f"{classified_form}_complete"] = "2"
+                    if form_has_updates:
+                        forms_updated.add(classified_form)
+                        if str(existing_record.get(f"{classified_form}_complete") or "").strip() != "2":
+                            updates_payload[f"{classified_form}_complete"] = "1"
 
-                # Update in-memory state file entry
-                patient_state.setdefault("files", []).append({
-                    "filename": pdf_path.name,
-                    "sha256": file_hash,
-                    "form": classified_form,
-                    "status": "success",
-                    "processed_at": datetime.now().isoformat()
-                })
+                # Upsert in-memory state file entry deduplicated by sha256
+                if doc_forms_processed:
+                    files_list = patient_state.setdefault("files", [])
+                    new_entry = {
+                        "filename": pdf_path.name,
+                        "sha256": file_hash,
+                        "form": ", ".join(doc_forms_processed),
+                        "status": "success",
+                        "processed_at": datetime.now().isoformat()
+                    }
+                    replaced = False
+                    for i, existing_entry in enumerate(files_list):
+                        if existing_entry.get("sha256") == file_hash:
+                            files_list[i] = new_entry
+                            replaced = True
+                            break
+                    if not replaced:
+                        files_list.append(new_entry)
 
             except Exception as e:
                 logger.error(f"Errore elaborazione referto {pdf_path.name}: {e}")
@@ -522,7 +566,8 @@ class RedCapSyncService:
         dry_run: bool = False,
         force_reprocess: bool = False,
         limit: Optional[int] = None,
-        only_incomplete: bool = True
+        only_incomplete: bool = True,
+        overwrite_mode: Optional[str] = None,
     ) -> SyncSummaryReport:
         """Executes a complete audit and synchronization cycle across REDCap patients.
 
@@ -565,7 +610,8 @@ class RedCapSyncService:
                 target_forms=target_forms,
                 auto_upload=auto_upload,
                 dry_run=dry_run,
-                force_reprocess=force_reprocess
+                force_reprocess=force_reprocess,
+                overwrite_mode=overwrite_mode,
             )
             results.append(res)
 
@@ -586,12 +632,11 @@ class RedCapSyncService:
             dry_run=dry_run
         )
 
-        # Save audit report locally
+        # Save audit report atomically
         audit_dir = self.settings.sync_audit_dir
         audit_dir.mkdir(parents=True, exist_ok=True)
         report_filename = f"sync_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
-        with open(audit_dir / report_filename, "w", encoding="utf-8") as f:
-            f.write(report.model_dump_json(indent=2))
+        atomic_write_text(audit_dir / report_filename, report.model_dump_json(indent=2))
 
         logger.info(
             f"=== AUDIT & SYNC COMPLETATO IN {duration}s: "

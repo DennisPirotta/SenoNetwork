@@ -1,7 +1,7 @@
 # SenoNetwork - Pipeline Referti Medici: .NET API ➡️ IA Locale (llama.cpp RPC) ➡️ REDCap
 
 Soluzione software completa per la gestione automatizzata dei referti medici senologici:
-1. **Estrazione PDF da API .NET** (cartelle cliniche, mammografie, ecografie, biopsie, istologici tramite [Priamo](file:///home/dennis/PycharmProjects/PriamoScraper/)).
+1. **Estrazione PDF da API .NET** (cartelle cliniche, mammografie, ecografie, biopsie, istologici tramite Priamo HIS Valduce).
 2. **Elaborazione con IA Locale su llama.cpp (Distribuita su 2 schede con protocollo RPC)**:
    - Inferenza ad alte prestazioni ripartita su 2 GPU/schede tramite `rpc-server`.
    - Vincolo grammaticale GBNF / JSON Schema conforme alle specifiche del Data Dictionary REDCap.
@@ -53,15 +53,12 @@ llama.cpp supporta nativamente l'inferenza distribuita tramite il backend RPC (`
     -c 8192 --n-gpu-layers 999
   ```
 
-### 2. Script di avvio rapido incluso
-È disponibile lo script pronto per l'avvio del cluster distribuito:
-```bash
-./scripts/start_llama_rpc_cluster.sh /percorso/al/modello.gguf
-```
+### 2. Verifica configurazione e server
+Assicurati di aver configurato il tuo file `.env` locale a partire dal template [`.env.example`](.env.example).
 
 ---
 
-## ⚙️ Configurazione nel file [`.env`](file:///home/dennis/PycharmProjects/SenoNetwork/.env)
+## ⚙️ Configurazione nel file `.env`
 
 ```env
 # ==============================================================================
@@ -89,7 +86,7 @@ OLLAMA_MODEL=llama3.2:3b
 CLOUDFLARED_CLIENT_ID=TUO_CLOUDFLARE_CLIENT_ID.access
 CLOUDFLARED_CLIENT_SECRET=TUO_CLOUDFLARE_CLIENT_SECRET
 PRIAMO_API_URL=https://priamo-home.valduce.it:8062
-PRIAMO_USERNAME=90092
+PRIAMO_USERNAME=TUO_USERNAME
 PRIAMO_PASSWORD=TUA_PASSWORD
 ```
 
@@ -110,7 +107,7 @@ PRIAMO_PASSWORD=TUA_PASSWORD
 ### Modalità B: Batch su Coorte Excel (`interventi.xls`)
 ```bash
 .venv/bin/python main.py \
-  --excel /home/dennis/PycharmProjects/PriamoScraper/files/interventi.xls \
+  --excel /path/to/interventi.xls \
   --limit 5 \
   --backend llama_cpp \
   --import-to-redcap
@@ -127,4 +124,3 @@ PRIAMO_PASSWORD=TUA_PASSWORD
 ```bash
 uv run pytest tests/ -v
 ```
-*(14 test superati con successo in 0.82s).*

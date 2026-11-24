@@ -1,7 +1,6 @@
 """Test unitari per il client PriamoCUP e l'estrazione di anagrafiche dai fogli di lavoro."""
 
 from datetime import date
-from pathlib import Path
 from unittest.mock import MagicMock, patch
 import pandas as pd
 import pytest
@@ -15,7 +14,6 @@ from src.priamo_cup_client import (
     to_form_pairs,
 )
 from scripts.extract_patients_from_shared_file import (
-    Paziente,
     estrai_pazienti_da_fogli_cup,
     estrai_pazienti_univoci,
 )
@@ -390,7 +388,7 @@ def test_priamo_cup_cloudflare_and_url_sync():
         priamo_api_url="https://priamo.dennispirotta.com",
         priamo_cloudflared_client_id="test_cf_id",
         priamo_cloudflared_client_secret="test_cf_secret",
-        priamo_username="90092",
+        priamo_username="test_user",
         priamo_password="password123"
     )
 
@@ -406,7 +404,7 @@ def test_priamo_cup_authenticate_domain_mismatch_cookie_handling():
     from src.config import Settings
     settings = Settings(
         priamo_api_url="https://priamo.dennispirotta.com",
-        priamo_username="90092",
+        priamo_username="test_user",
         priamo_password="password123"
     )
     client = PriamoCupClient(settings=settings)

@@ -1,5 +1,4 @@
 from unittest.mock import MagicMock, patch
-import pytest
 
 from scripts.test_remote_llamacpp import LlamaRemoteTester
 

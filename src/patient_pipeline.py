@@ -1,10 +1,12 @@
 from datetime import date, datetime
 import hashlib
+import inspect
 import ipaddress
 import json
 import logging
 from pathlib import Path
 import re
+import socket
 import time
 from typing import Any, Callable, Dict, List, Optional, Union
 import urllib.parse
@@ -20,9 +22,10 @@ from src.ai_extractor import (
 from src.config import Settings, get_settings
 from src.dotnet_client import DotNetApiClient
 from src.form_classifier import FormClassifier
-from src.models import ExtractionResult, REDCapField
+from src.models import REDCapField
 from src.pdf_extractor import PDFExtractor
 from src.redcap_service import REDCapService
+from src.utils import atomic_write_text, mask_phi, normalize_person_name, sanitize_identifier
 
 logger = logging.getLogger(__name__)
 
@@ -42,24 +45,58 @@ def is_safe_webhook_url(
         if not hostname:
             return False
 
-        # If explicit whitelist is configured
+        lower_host = hostname.lower().rstrip(".")
+
+        # Explicit whitelist check
         if allowed_hosts:
-            return hostname.lower() in [h.lower() for h in allowed_hosts]
+            allowed = {h.lower().rstrip(".") for h in allowed_hosts}
+            if lower_host not in allowed:
+                return False
+            if allow_local:
+                return True
 
         if allow_local:
             return True
 
-        lower_host = hostname.lower()
-        if lower_host in {"localhost", "127.0.0.1", "0.0.0.0", "::1"}:
+        if lower_host in {"localhost", "127.0.0.1", "0.0.0.0", "::1"} or lower_host.endswith(
+            (".local", ".internal", ".localhost")
+        ):
             return False
 
-        # Check if hostname is an IP address
+        def _is_disallowed_ip(ip_obj: Union[ipaddress.IPv4Address, ipaddress.IPv6Address]) -> bool:
+            return (
+                ip_obj.is_private
+                or ip_obj.is_loopback
+                or ip_obj.is_link_local
+                or ip_obj.is_reserved
+                or ip_obj.is_multicast
+                or ip_obj.is_unspecified
+            )
+
+        # Literal IP address check
         try:
             ip = ipaddress.ip_address(lower_host)
-            if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved:
-                return False
+            return not _is_disallowed_ip(ip)
         except ValueError:
-            # Standard domain name
+            pass
+
+        # Reject bare internal service names (e.g. 'http://redis:6379')
+        if "." not in lower_host:
+            return False
+
+        # Resolve DNS where available to block loopback/private targets behind public-looking hostnames
+        try:
+            infos = socket.getaddrinfo(
+                hostname,
+                parsed.port or (443 if parsed.scheme == "https" else 80),
+                proto=socket.IPPROTO_TCP,
+            )
+            for info in infos:
+                ip_str = info[4][0].split("%")[0]
+                resolved_ip = ipaddress.ip_address(ip_str)
+                if _is_disallowed_ip(resolved_ip):
+                    return False
+        except socket.gaierror:
             pass
 
         return True
@@ -118,11 +155,55 @@ class PatientPipeline:
             api_token=self.settings.redcap_api_token
         )
         self.dotnet_client = dotnet_client or DotNetApiClient(settings=self.settings)
-        self.ai_extractor = ai_extractor or get_ai_extractor(self.settings)
+        self._ai_extractor = ai_extractor
 
         # Cache for REDCap metadata fields per form to avoid repeated API requests
         self._cached_fields_by_form: Dict[str, List[REDCapField]] = {}
         self._all_metadata_fields: List[REDCapField] = []
+
+    @property
+    def ai_extractor(self) -> Union[AIExtractor, LlamaCppExtractor, OllamaExtractor]:
+        """Lazily instantiates the configured AI extractor on first actual extraction use."""
+        if self._ai_extractor is None:
+            self._ai_extractor = get_ai_extractor(self.settings)
+        return self._ai_extractor
+
+    @ai_extractor.setter
+    def ai_extractor(self, value: Optional[Union[AIExtractor, LlamaCppExtractor, OllamaExtractor]]) -> None:
+        self._ai_extractor = value
+
+    @staticmethod
+    def _verify_pdf_patient_identity(
+        report_text: str,
+        name: Optional[str],
+        surname: Optional[str],
+    ) -> Optional[str]:
+        """Detects explicit header identity mismatches between a PDF report and the target patient."""
+        if not name or not surname:
+            return None
+        norm_surname = normalize_person_name(surname)
+        if len(norm_surname) < 3 or not report_text:
+            return None
+
+        norm_text = normalize_person_name(report_text)
+        if norm_surname in norm_text:
+            return None
+
+        # Only fail when an explicit patient header line identifies a different person
+        header_sample = report_text[:1000]
+        match = re.search(
+            r"(?:paziente|nominativo|assistit[oa]|cognome(?:\s+e\s+nome)?)\s*[:\-]\s*([A-Za-zÀ-ÿ'`\-\s]{3,60})",
+            header_sample,
+            re.IGNORECASE,
+        )
+        if match:
+            header_identity = normalize_person_name(match.group(1))
+            if header_identity and norm_surname not in header_identity:
+                return (
+                    f"Possibile mismatch anagrafico nel referto PDF: intestazione non corrispondente "
+                    f"al paziente {mask_phi(surname)} {mask_phi(name)}."
+                )
+        return None
 
     def load_all_metadata(self):
         """Pre-loads the full REDCap project data dictionary."""
@@ -157,60 +238,67 @@ class PatientPipeline:
         auto_upload: bool = True,
         output_dir: Optional[Path] = None,
         webhook_url: Optional[str] = None,
-        progress_callback: Optional[Callable[[str, int, Optional[Dict[str, Any]]], None]] = None
+        progress_callback: Optional[Callable[[str, int, Optional[Dict[str, Any]]], None]] = None,
+        overwrite: bool = False,
     ) -> PatientPipelineResult:
         """Executes the complete pipeline for a single patient."""
         start_time = time.time()
         if progress_callback:
-            progress_callback(f"Inizializzazione pipeline per paziente {name or ''} {surname or patient_id}...", 5, None)
+            progress_callback(f"Inizializzazione pipeline per paziente {patient_id}...", 5, None)
 
         # Sanitizzazione rigorosa di patient_id per prevenire Path Traversal
-        raw_id = str(patient_id or "").strip()
-        safe_patient_id = re.sub(r"[^a-zA-Z0-9_\-]", "_", Path(raw_id).name).strip("_")
-        if not safe_patient_id:
-            safe_patient_id = "patient_unknown"
-        patient_id = safe_patient_id
+        patient_id = sanitize_identifier(patient_id)
 
         # Mantenimento o generazione automatica del record_id numerico di REDCap:
         # Se il paziente esiste già su REDCap con un record_id, lo mantiene per evitare duplicati.
         # Se l'identificatore è lo slug nome-cognome-dob, genera automaticamente il prossimo record_id numerico da REDCap.
-        try:
-            if self.redcap_service.api_url and self.redcap_service.api_token:
-                matched_redcap_id = None
+        if self.redcap_service.api_url and self.redcap_service.api_token:
+            matched_redcap_id = None
+            try:
                 if name and surname:
                     matched_redcap_id = self.redcap_service.find_record_id_by_demographics(
                         name=name, surname=surname, date_of_birth=date_of_birth
                     )
-                if matched_redcap_id:
-                    if matched_redcap_id != str(patient_id):
-                        logger.info(
-                            f"-> Mantenuto record_id nativo di REDCap: '{matched_redcap_id}' "
-                            f"(invece dell'identificatore transitorio '{patient_id}')"
-                        )
-                        patient_id = matched_redcap_id
-                elif not patient_id:
-                    next_id = self.redcap_service.generate_next_record_name()
-                    if next_id:
-                        patient_id = next_id
-                else:
-                    # Controlla se patient_id è lo slug generato da nome-cognome-data_nascita
-                    slug_candidate = ""
-                    if name and surname:
-                        d_str = date_of_birth.strftime("%Y-%m-%d") if isinstance(date_of_birth, date) else str(date_of_birth or "")
-                        slug_candidate = re.sub(r"[^a-z0-9\-]", "", f"{name}-{surname}-{d_str}".lower().replace(" ", "-"))
+            except Exception as e:
+                logger.warning(f"Verifica anagrafica su REDCap non riuscita per {patient_id}: {e}")
 
-                    if slug_candidate and str(patient_id).lower() == slug_candidate:
-                        next_id = self.redcap_service.generate_next_record_name()
-                        if next_id:
+            slug_candidate = ""
+            if name and surname:
+                d_str = (
+                    date_of_birth.strftime("%Y-%m-%d")
+                    if isinstance(date_of_birth, date)
+                    else str(date_of_birth or "")
+                )
+                slug_candidate = re.sub(r"[^a-z0-9\-]", "", f"{name}-{surname}-{d_str}".lower().replace(" ", "-"))
+
+            if matched_redcap_id:
+                if matched_redcap_id != str(patient_id):
+                    logger.info(
+                        f"-> Mantenuto record_id nativo di REDCap: '{matched_redcap_id}' "
+                        f"(invece dell'identificatore transitorio '{patient_id}')"
+                    )
+                    patient_id = matched_redcap_id
+            elif not patient_id or (slug_candidate and str(patient_id).lower() == slug_candidate):
+                try:
+                    next_id = self.redcap_service.generate_next_record_name()
+                    if isinstance(next_id, str) and next_id.strip():
+                        if slug_candidate and str(patient_id).lower() == slug_candidate:
                             logger.info(
                                 f"-> Assegnato record_id numerico da REDCap: '{next_id}' "
                                 f"(sostituisce slug '{patient_id}')"
                             )
-                            patient_id = next_id
-        except Exception as e:
-            logger.debug(f"Verifica o generazione record_id REDCap non riuscita: {e}")
+                        patient_id = next_id.strip()
+                    elif auto_upload:
+                        raise RuntimeError("Impossibile ottenere il prossimo record_id numerico da REDCap.")
+                except Exception as e:
+                    if auto_upload:
+                        logger.error(f"Generazione record_id REDCap fallita ({patient_id}): {e}")
+                        raise
+                    logger.warning(f"Generazione record_id REDCap saltata in dry-run per {patient_id}: {e}")
 
-        logger.info(f"=== INIZIO PIPELINE PER PAZIENTE: {patient_id} ({name or ''} {surname or ''}) ===")
+        logger.info(
+            f"=== INIZIO PIPELINE PER PAZIENTE: {patient_id} ({mask_phi(name)} {mask_phi(surname)}) ==="
+        )
 
         # Step 1: Estrazione PDF da API .NET (Priamo o REST) se non forniti manualmente
         download_dir = self.settings.downloads_dir / patient_id
@@ -255,7 +343,7 @@ class PatientPipeline:
                 "name": name,
                 "surname": surname,
                 "date_of_birth": dob_str,
-                "dati_del_paziente_complete": "2"
+                "dati_del_paziente_complete": "1"
             }
             patient_records_to_upload.append(anagrafica_record)
             forms_populated.add("dati_del_paziente")
@@ -276,6 +364,23 @@ class PatientPipeline:
             try:
                 # 2.1 Estrazione testo
                 report_text = PDFExtractor.extract_text(pdf_path)
+
+                # 2.1b Verifica identità paziente se il referto espone un'intestazione esplicita
+                identity_error = self._verify_pdf_patient_identity(report_text, name, surname)
+                if identity_error:
+                    logger.error(f"-> Scartato referto '{pdf_path.name}': {identity_error}")
+                    doc_results.append(
+                        DocumentProcessingResult(
+                            filename=pdf_path.name,
+                            classified_form="unknown",
+                            fields_extracted_count=0,
+                            duration_sec=round(time.time() - t_doc_start, 2),
+                            status="error",
+                            error=identity_error,
+                            file_sha256=file_hash,
+                        )
+                    )
+                    continue
 
                 # 2.2 Rilevazione dei form REDCap di destinazione (primario ed eventuali secondari)
                 target_forms = FormClassifier.classify_report_targets(
@@ -309,6 +414,12 @@ class PatientPipeline:
                 doc_date = PDFExtractor.extract_document_date(pdf_path, report_text)
 
                 valid_target_forms = [f for f in target_forms if f not in ("skip", "irrelevant", "unknown")]
+                extract_sig_params = set()
+                try:
+                    extract_sig_params = set(inspect.signature(self.ai_extractor.extract_from_text).parameters.keys())
+                except (TypeError, ValueError):
+                    extract_sig_params = set()
+
                 for form_idx, target_form in enumerate(valid_target_forms):
                     is_primary = (form_idx == 0)
                     target_fields = self.get_fields_for_form(target_form)
@@ -317,15 +428,19 @@ class PatientPipeline:
                         f"per '{target_form}' ({'primario' if is_primary else 'secondario'})..."
                     )
 
-                    extraction_res = self.ai_extractor.extract_from_text(
-                        report_text=report_text,
-                        fields=target_fields,
-                        pdf_path=str(pdf_path),
-                        record_id=patient_id,
-                        form_name=target_form,
-                        mark_form_complete=is_primary,
-                        form_completion_status="1" if is_primary else "0"
-                    )
+                    extract_kwargs: Dict[str, Any] = {
+                        "report_text": report_text,
+                        "fields": target_fields,
+                        "pdf_path": str(pdf_path),
+                        "record_id": patient_id,
+                        "form_name": target_form,
+                        "mark_form_complete": is_primary,
+                        "form_completion_status": "1" if is_primary else "0",
+                    }
+                    if "include_unchecked_checkboxes" in extract_sig_params:
+                        extract_kwargs["include_unchecked_checkboxes"] = bool(overwrite)
+
+                    extraction_res = self.ai_extractor.extract_from_text(**extract_kwargs)
 
                     if extraction_res.status == "success":
                         record = extraction_res.redcap_record
@@ -333,8 +448,11 @@ class PatientPipeline:
                         record["_document_date"] = doc_date
 
                         clinical_fields = [
-                            k for k, v in extraction_res.extracted_data.items()
-                            if k != "record_id" and v not in ("", None, [], {}) and not (k.endswith("___0") and v == "0")
+                            k for k, v in record.items()
+                            if k != "record_id"
+                            and not k.startswith("_")
+                            and not k.endswith("_complete")
+                            and (v == "1" if "___" in k else v not in ("", None, [], {}))
                         ]
                         extracted_count = len(clinical_fields)
 
@@ -401,18 +519,43 @@ class PatientPipeline:
             if progress_callback:
                 progress_callback(f"Consolidamento e caricamento dati su REDCap per {patient_id}...", 90, None)
             merged_to_upload = REDCapService.merge_flat_records(patient_records_to_upload)
-            logger.info(
-                f"3. Caricamento dati estratti su REDCap ({len(patient_records_to_upload)} record estratti "
-                f"consolidati in {len(merged_to_upload)} record paziente)..."
-            )
-            try:
-                upload_response = self.redcap_service.import_records_to_api(merged_to_upload)
-                upload_status = "uploaded"
-                logger.info(f"-> Caricamento REDCap completato con successo: {upload_response}")
-            except Exception as e:
-                upload_status = "error"
-                upload_response = str(e)
-                logger.error(f"-> Errore durante il caricamento REDCap: {e}")
+
+            if not overwrite and self.redcap_service.api_url and self.redcap_service.api_token:
+                existing_record: Optional[Dict[str, Any]] = None
+                try:
+                    existing_record = self.redcap_service.get_record(str(patient_id))
+                except Exception as e:
+                    logger.debug(f"Recupero record esistente REDCap per safe-diff fallito ({patient_id}): {e}")
+
+                if isinstance(existing_record, dict) and existing_record:
+                    safe_records: List[Dict[str, Any]] = []
+                    for rec in merged_to_upload:
+                        safe_rec = REDCapService.merge_with_existing_record(
+                            existing=existing_record,
+                            updates=rec,
+                            overwrite=False,
+                        )
+                        if any(k != "record_id" for k in safe_rec.keys()):
+                            safe_records.append(safe_rec)
+                    merged_to_upload = safe_records
+
+            if not merged_to_upload:
+                upload_status = "skipped"
+                upload_response = {"count": 0, "reason": "no_new_fields"}
+                logger.info(f"3. Nessun nuovo campo da arricchire su REDCap per {patient_id} (dati esistenti preservati).")
+            else:
+                logger.info(
+                    f"3. Caricamento dati estratti su REDCap ({len(patient_records_to_upload)} record estratti "
+                    f"consolidati in {len(merged_to_upload)} record paziente)..."
+                )
+                try:
+                    upload_response = self.redcap_service.import_records_to_api(merged_to_upload)
+                    upload_status = "uploaded"
+                    logger.info(f"-> Caricamento REDCap completato con successo: {upload_response}")
+                except Exception as e:
+                    upload_status = "error"
+                    upload_response = str(e)
+                    logger.error(f"-> Errore durante il caricamento REDCap: {e}")
 
         # Save results locally
         target_out_dir = output_dir or (self.settings.output_dir / "patients")
@@ -437,8 +580,7 @@ class PatientPipeline:
                 {"patient_id": patient_id, "forms_populated": result.forms_populated, "upload_status": upload_status}
             )
 
-        with open(summary_file, "w", encoding="utf-8") as f:
-            f.write(result.model_dump_json(indent=2))
+        atomic_write_text(summary_file, result.model_dump_json(indent=2))
 
         # Idempotence: Save processing state
         try:
@@ -462,8 +604,7 @@ class PatientPipeline:
                     for d in doc_results
                 ]
             }
-            with open(state_file, "w", encoding="utf-8") as sf:
-                json.dump(state_payload, sf, indent=2)
+            atomic_write_text(state_file, json.dumps(state_payload, indent=2))
         except Exception as e:
             logger.warning(f"Impossibile salvare il file di stato per {patient_id}: {e}")
 
@@ -482,7 +623,7 @@ class PatientPipeline:
                 logger.info(f"4. Invio automatico dei risultati all'API di destinazione: {target_webhook}")
                 try:
                     cb_payload = json.loads(result.model_dump_json())
-                    cb_resp = requests.post(target_webhook, json=cb_payload, timeout=30)
+                    cb_resp = requests.post(target_webhook, json=cb_payload, timeout=30, allow_redirects=False)
                     logger.info(f"-> Risultati inviati all'API con esito: HTTP {cb_resp.status_code}")
                 except Exception as e:
                     logger.error(f"-> Errore durante l'invio dei risultati all'API esterna ({target_webhook}): {e}")

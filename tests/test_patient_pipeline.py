@@ -1,6 +1,5 @@
 from datetime import date
 from unittest.mock import patch
-import pytest
 from pathlib import Path
 from src.form_classifier import FormClassifier
 from src.dotnet_client import DotNetApiClient
@@ -172,22 +171,37 @@ def test_merge_flat_records_recent_document_updates():
 
 
 
-def test_dotnet_client_mock():
-    client = DotNetApiClient()
-    # In mock mode, if not configured, reads from local directory
+def test_dotnet_client_mock(tmp_path):
+    from src.config import Settings
+    patient_dir = tmp_path / "repo" / "SENO-2024-TEST"
+    patient_dir.mkdir(parents=True)
+    (patient_dir / "mammografia_screening.pdf").write_bytes(b"%PDF-1.4 sample")
+
+    client = DotNetApiClient(settings=Settings(priamo_files_dir=tmp_path / "repo"))
     docs = client.get_patient_documents("SENO-2024-TEST")
-    assert len(docs) >= 1
+    assert len(docs) == 1
     assert any("pdf" in d["filename"].lower() for d in docs)
 
 
-def test_load_patients_from_excel():
-    excel_path = Path("/home/dennis/PycharmProjects/PriamoScraper/files/interventi.xls")
-    if excel_path.exists():
-        patients = DotNetApiClient.load_patients_from_excel(excel_path)
-        assert len(patients) > 0
-        assert "name" in patients[0]
-        assert "surname" in patients[0]
-        assert "date_of_birth" in patients[0]
+def test_load_patients_from_excel(tmp_path):
+    import pandas as pd
+    excel_path = tmp_path / "interventi.xlsx"
+    df = pd.DataFrame([
+        {
+            "PAZ_COGNOME": "VERDI",
+            "PAZ_NOME": "ANNA",
+            "PAZ_DATA_NASCITA": "1968-03-11",
+            "PAZ_CODICE_FISCALE": "VRDNNA68C51C933K",
+            "EROG_CODICE": "3004",
+        }
+    ])
+    df.to_excel(excel_path, index=False, engine="openpyxl")
+
+    patients = DotNetApiClient.load_patients_from_excel(excel_path)
+    assert len(patients) == 1
+    assert patients[0]["name"] == "Anna"
+    assert patients[0]["surname"] == "Verdi"
+    assert str(patients[0]["date_of_birth"]) == "1968-03-11"
 
 
 def test_priamo_fetch_reports_no_nested_directory(tmp_path):

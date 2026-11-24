@@ -1,8 +1,5 @@
-from datetime import date
 import json
-from pathlib import Path
 from unittest.mock import MagicMock, patch
-import pytest
 from fastapi import BackgroundTasks
 
 from src.ai_extractor import (
@@ -10,7 +7,6 @@ from src.ai_extractor import (
     BaseAIExtractor,
     LlamaCppExtractor,
     OllamaExtractor,
-    parse_json_response
 )
 from src.api_server import (
     health_check,
@@ -24,7 +20,6 @@ from src.normalizer import REDCapNormalizer
 from src.patient_pipeline import (
     PatientPipeline,
     is_safe_webhook_url,
-    compute_file_hash
 )
 
 
@@ -85,7 +80,9 @@ def test_patient_pipeline_idempotence_and_state(tmp_path):
     settings = Settings(
         state_dir=tmp_path / "state",
         output_dir=tmp_path / "output",
-        downloads_dir=tmp_path / "downloads"
+        downloads_dir=tmp_path / "downloads",
+        redcap_api_url="",
+        redcap_api_token="",
     )
 
     dummy_pdf = tmp_path / "report_mammografia.pdf"
@@ -100,7 +97,12 @@ def test_patient_pipeline_idempotence_and_state(tmp_path):
         redcap_record={"record_id": "PZ-IDEMPOTENT-1", "result_of_mx_birads": "2"}
     )
 
+    from src.models import REDCapField
     pipeline = PatientPipeline(settings=settings, ai_extractor=mock_ai)
+    pipeline._cached_fields_by_form["radiologia"] = [
+        REDCapField(field_name="record_id", form_name="dati_del_paziente", field_type="text"),
+        REDCapField(field_name="result_of_mx_birads", form_name="radiologia", field_type="radio"),
+    ]
 
     with patch("src.pdf_extractor.PDFExtractor.extract_text", return_value="Mammografia birads 2"):
         res = pipeline.process_patient(

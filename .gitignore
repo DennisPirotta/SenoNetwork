@@ -27,6 +27,8 @@ data/cup/
 data/state/
 data/patient_repository/
 data/redcap_cache/
+data/redcap_metadata_live.json
+repomix-output.*.xml
 temp/*
 
 # ==============================================================================

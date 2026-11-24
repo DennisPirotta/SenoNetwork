@@ -1,16 +1,15 @@
 from datetime import date, datetime
 from enum import Enum
-import json
 import logging
 from pathlib import Path
-import re
-from typing import Any, Dict, List, Optional, Set, Tuple, Union
+from typing import Any, Dict, List, Optional, Set, Union
 
 from pydantic import BaseModel, Field
 
 from src.config import Settings, get_settings
 from src.form_classifier import AVAILABLE_FORMS
 from src.redcap_service import REDCapService
+from src.utils import atomic_write_text, parse_flexible_date
 
 logger = logging.getLogger(__name__)
 
@@ -83,17 +82,7 @@ class RedCapAuditReport(BaseModel):
 
 def _parse_iso_date(val: Any) -> Optional[date]:
     """Helper to parse a date string safely into date object."""
-    if not val:
-        return None
-    s = str(val).strip()
-    if not s or s.lower() in ("none", "nan", "null"):
-        return None
-    for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%Y/%m/%d", "%d-%m-%Y"):
-        try:
-            return datetime.strptime(s[:10], fmt).date()
-        except ValueError:
-            continue
-    return None
+    return parse_flexible_date(val)
 
 
 class RedCapDataAuditor:
@@ -115,6 +104,67 @@ class RedCapDataAuditor:
             api_url=self.settings.redcap_api_url,
             api_token=self.settings.redcap_api_token
         )
+        self._form_fields_map: Optional[Dict[str, Set[str]]] = None
+
+    def _get_form_fields_map(self) -> Dict[str, Set[str]]:
+        """Loads mapping of REDCap form_name -> set of extractable field names."""
+        if self._form_fields_map is not None:
+            return self._form_fields_map
+        mapping: Dict[str, Set[str]] = {}
+        try:
+            cache_file = self.settings.redcap_cache_file
+            fields = []
+            if cache_file and Path(cache_file).exists():
+                fields = self.redcap_service.load_metadata_from_file(cache_file)
+            elif self.redcap_service.api_url and self.redcap_service.api_token:
+                fields = self.redcap_service.fetch_metadata_from_api()
+            for f in fields:
+                if f.is_extractable and f.form_name:
+                    mapping.setdefault(f.form_name, set()).add(f.field_name)
+        except Exception as e:
+            logger.debug(f"Mapping campi per form non disponibile in audit: {e}")
+        self._form_fields_map = mapping
+        return mapping
+
+    def build_completion_matrix(self, records: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
+        """Builds per-form completion statistics and per-patient status matrix from REDCap records."""
+        if records is None:
+            records = self.redcap_service.export_records_from_api()
+
+        form_stats: Dict[str, Dict[str, int]] = {
+            form_name: {"complete": 0, "unverified": 0, "incomplete": 0, "not_started": 0}
+            for form_name in AVAILABLE_FORMS.keys()
+        }
+        patient_matrix: List[Dict[str, Any]] = []
+
+        for r in records:
+            pid = str(r.get("record_id", "")).strip()
+            if not pid:
+                continue
+            statuses: Dict[str, str] = {}
+            for form_name in AVAILABLE_FORMS.keys():
+                st = str(r.get(f"{form_name}_complete") or "").strip()
+                statuses[form_name] = st
+                if st == "2":
+                    form_stats[form_name]["complete"] += 1
+                elif st == "1":
+                    form_stats[form_name]["unverified"] += 1
+                elif st == "0":
+                    form_stats[form_name]["incomplete"] += 1
+                else:
+                    form_stats[form_name]["not_started"] += 1
+            patient_matrix.append({
+                "record_id": pid,
+                "name": r.get("name", ""),
+                "surname": r.get("surname", ""),
+                "form_statuses": statuses,
+            })
+
+        return {
+            "total_patients": len(patient_matrix),
+            "form_statistics": form_stats,
+            "patient_matrix": patient_matrix,
+        }
 
     def run_audit(
         self,
@@ -334,22 +384,39 @@ class RedCapDataAuditor:
             )
 
     def _check_form_status_sanity(self, r: Dict[str, Any], pid: str, issues: List[PatientAuditIssue]):
-        """Verifies if form complete statuses reflect actual data (False complete vs Unmarked complete)."""
+        """Verifies if form complete statuses reflect actual data belonging to that specific form."""
+        form_fields_map = self._get_form_fields_map()
+        demographic_keys = {"name", "surname", "date_of_birth"}
+
         for form_name in AVAILABLE_FORMS.keys():
             flag = str(r.get(f"{form_name}_complete") or "").strip()
+            if flag != "2":
+                continue
 
-            # Count fields with actual values in this form (ignoring record_id and completion flag)
-            # We estimate by counting non-empty keys that don't end in _complete
-            form_keys_with_data = [
-                k for k, v in r.items()
-                if not k.endswith("_complete")
-                and k != "record_id"
-                and v not in (None, "", "0", "None", "nan")
-                and not k.startswith("text_")  # descriptive
-            ]
+            specific_fields = form_fields_map.get(form_name)
+            if specific_fields:
+                # Filter record keys to only those belonging to this form (including checkbox ___code keys)
+                form_keys_with_data = [
+                    k for k, v in r.items()
+                    if (k in specific_fields or k.split("___", 1)[0] in specific_fields)
+                    and k != "record_id"
+                    and not k.endswith("_complete")
+                    and (v == "1" if "___" in k else v not in (None, "", "None", "nan"))
+                ]
+                is_empty_form = len(form_keys_with_data) == 0
+            else:
+                # Fallback when metadata does not define this form (e.g. minimal test fixtures)
+                form_keys_with_data = [
+                    k for k, v in r.items()
+                    if not k.endswith("_complete")
+                    and k != "record_id"
+                    and (form_name == "dati_del_paziente" or k not in demographic_keys)
+                    and v not in (None, "", "0", "None", "nan")
+                    and not k.startswith("text_")
+                ]
+                is_empty_form = len(form_keys_with_data) == 0
 
-            # False complete: marked complete '2' but record has no actual content
-            if flag == "2" and len(form_keys_with_data) <= 1:
+            if is_empty_form:
                 issues.append(
                     PatientAuditIssue(
                         patient_id=pid,
@@ -507,7 +574,7 @@ class RedCapDataAuditor:
         postop_complete = str(r.get("anatomia_patologica_complete") or "").strip()
         histol_diag = str(r.get("histopathological_diagnosis_of_operative_specimen") or "").strip()
 
-        if postop_complete == "2" or histol_diag in ("2", "3"):  # in situ or invasivo
+        if postop_complete == "2" or histol_diag in ("2", "3", "4"):  # 2=in situ, 3=microinvasivo, 4=invasivo
             # Check pT
             pt = str(r.get("pt") or "").strip()
             if not pt or pt.lower() == "none":
@@ -553,8 +620,8 @@ class RedCapDataAuditor:
                     )
                 )
 
-            # If invasive, check invasive_histological_type
-            if histol_diag == "3":
+            # If microinvasive ('3') or invasive ('4'), check invasive_histological_type
+            if histol_diag in ("3", "4"):
                 istotype = str(r.get("invasive_histological_type") or "").strip()
                 if not istotype or istotype.lower() == "none":
                     issues.append(
@@ -570,11 +637,27 @@ class RedCapDataAuditor:
                     )
 
     def _check_laterality(self, r: Dict[str, Any], pid: str, issues: List[PatientAuditIssue]):
-        """Checks consistency of laterality (side_of_lesion)."""
+        """Checks consistency and presence of laterality (side_of_lesion) when clinical events exist."""
         side = str(r.get("side_of_lesion") or "").strip().upper()
-        if side and side in ("L", "R"):
-            # Check if there is explicit side contradiction in other textual fields
-            pass
+        has_clinical_lesion = bool(
+            str(r.get("bi1") or "").strip() == "1"
+            or r.get("date_of_bi1")
+            or r.get("pt")
+            or r.get("result_of_mx_birads")
+        )
+        if has_clinical_lesion and (not side or side == "N"):
+            issues.append(
+                PatientAuditIssue(
+                    patient_id=pid,
+                    severity=IssueSeverity.INFO,
+                    category=IssueCategory.MISSING_MANDATORY_FIELD,
+                    form_name="dati_del_paziente",
+                    field_name="side_of_lesion",
+                    description="Lateralità della lesione (side_of_lesion) mancante o ignota nonostante siano presenti indagini/interventi.",
+                    current_value=side or None,
+                    suggested_action="Specificare il lato della lesione ('L' Sinistro o 'R' Destro)."
+                )
+            )
 
     def generate_markdown_report(self, report: RedCapAuditReport) -> str:
         """Generates a clean, comprehensive Markdown report ready for presentation and archiving."""
@@ -663,14 +746,12 @@ class RedCapDataAuditor:
         md_path = target_dir / f"redcap_quality_report_{timestamp_str}.md"
         json_path = target_dir / f"redcap_quality_report_{timestamp_str}.json"
 
-        # Write markdown
+        # Write markdown atomically
         md_content = self.generate_markdown_report(report)
-        with open(md_path, "w", encoding="utf-8") as f:
-            f.write(md_content)
+        atomic_write_text(md_path, md_content)
 
-        # Write json
-        with open(json_path, "w", encoding="utf-8") as f:
-            f.write(report.model_dump_json(indent=2))
+        # Write json atomically
+        atomic_write_text(json_path, report.model_dump_json(indent=2))
 
         logger.info(f"Report di qualità esportati con successo:\n  - Markdown: {md_path}\n  - JSON: {json_path}")
         return {"markdown": md_path, "json": json_path}

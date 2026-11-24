@@ -28,14 +28,14 @@ import json
 import logging
 from pathlib import Path
 import sys
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 from dotenv import load_dotenv
 import pandas as pd
 
 # Add project root to sys.path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from src.config import Settings, get_settings
+from src.config import get_settings
 from src.priamo_client import PriamoClient, PriamoPatient
 from scripts.extract_patients_from_shared_file import estrai_pazienti_univoci, Paziente
 
@@ -46,8 +46,6 @@ try:
     from rich.console import Console
     from rich.panel import Panel
     from rich.table import Table
-    from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn
-    from rich import print as rprint
     HAS_RICH = True
 except ImportError:
     HAS_RICH = False

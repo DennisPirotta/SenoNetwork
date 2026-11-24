@@ -11,13 +11,14 @@ try:
     from bs4 import BeautifulSoup
 except ImportError:
     BeautifulSoup = None
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 from requests import Response, Session
 from requests.adapters import HTTPAdapter
 from requests.exceptions import RequestException
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 
 from src.config import Settings, get_settings
+from src.utils import mask_phi, normalize_person_name, parse_flexible_date
 
 logger = logging.getLogger(__name__)
 
@@ -158,7 +159,9 @@ class PriamoClient:
         self.session.mount("http://", adapter)
 
         self._authenticated = False
+        self._auth_generation = 0
         self._ces_token: Optional[str] = None
+        self.verify_ssl = getattr(cfg, "priamo_verify_ssl", True)
 
     @property
     def is_configured(self) -> bool:
@@ -167,23 +170,27 @@ class PriamoClient:
     @RETRYABLE
     def _request(self, method: str, url: str, **kwargs) -> Response:
         kwargs.setdefault("timeout", 15)
+        kwargs.setdefault("verify", self.verify_ssl)
+        gen_before = self._auth_generation
         response = self.session.request(method, url, **kwargs)
 
         # Handle session expiry and re-authenticate (avoid recursive calls if failing on login page)
         if response.status_code in (401, 403) and url != self.login_page_url:
             logger.warning("Sessione Priamo scaduta o non autorizzata, ri-autenticazione in corso...")
-            self.authenticate(force=True)
+            self.authenticate(force=True, expected_generation=gen_before)
             response = self.session.request(method, url, **kwargs)
 
         response.raise_for_status()
         return response
 
-    def authenticate(self, force: bool = False) -> None:
+    def authenticate(self, force: bool = False, expected_generation: Optional[int] = None) -> None:
         """Authenticates with the Priamo ASP.NET MVC login endpoint (thread-safe)."""
         if self._authenticated and not force:
             return
 
         with self._auth_lock:
+            if expected_generation is not None and self._auth_generation != expected_generation:
+                return
             if self._authenticated and not force:
                 return
 
@@ -261,23 +268,65 @@ class PriamoClient:
                 raise ValueError(f"Autenticazione Priamo fallita: {error_detail}")
 
             self._authenticated = True
+            self._auth_generation += 1
             logger.info("Autenticazione su Priamo avvenuta con successo (.PRIAMOAUTH acquisito).")
+
+    @staticmethod
+    def _select_unambiguous_match(
+        candidates: List[Dict[str, Any]],
+        expected_name: str,
+        expected_surname: str,
+        codice_fiscale: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Disambiguates multiple GetAnagrafica results via CF or exact normalized name/surname."""
+        if not candidates:
+            return None
+        if len(candidates) == 1:
+            return candidates[0]
+
+        cf_clean = str(codice_fiscale or "").strip().upper()
+        if cf_clean:
+            cf_hits = [
+                c for c in candidates
+                if str((c.get("datiMef") or {}).get("codiceFiscale") or "").strip().upper() == cf_clean
+            ]
+            if len(cf_hits) == 1:
+                return cf_hits[0]
+            if len(cf_hits) > 1:
+                logger.warning(f"Trovati {len(cf_hits)} profili ambigui con medesimo CF su Priamo.")
+                return None
+
+        exp_full = normalize_person_name(f"{expected_surname} {expected_name}")
+        exact_hits = []
+        for c in candidates:
+            mef = c.get("datiMef") or {}
+            cand_full = normalize_person_name(f"{mef.get('cognome', '')} {mef.get('nome', '')}")
+            if cand_full and cand_full == exp_full:
+                exact_hits.append(c)
+
+        if len(exact_hits) == 1:
+            return exact_hits[0]
+
+        logger.warning(f"Ricerca Priamo ambigua ({len(candidates)} candidati restituiti): selezione annullata.")
+        return None
 
     def search_patient(
         self,
         name: str,
         surname: str,
         date_of_birth: Union[date, str],
-        exact_only: bool = False
+        exact_only: bool = False,
+        codice_fiscale: Optional[str] = None,
     ) -> Optional[PriamoPatient]:
         """Searches for a patient in Priamo by Name, Surname, and Date of Birth.
 
         Extracts progressivoPaz1 as patient_id, Codice Fiscale, and demographics.
-        Supports automatic fallback for composite first names and diacritics.
+        Rejects ambiguous multiple matches unless disambiguated by Codice Fiscale.
         """
         self.authenticate()
 
-        dob_str = date_of_birth.strftime("%Y-%m-%d") if isinstance(date_of_birth, date) else str(date_of_birth)
+        parsed_input_dob = parse_flexible_date(date_of_birth)
+        dob_str = parsed_input_dob.strftime("%Y-%m-%d") if parsed_input_dob else str(date_of_birth)
         clean_name = name.strip()
         clean_surname = surname.strip()
 
@@ -317,7 +366,7 @@ class PriamoClient:
                 response = self._request("GET", self.get_anagrafica_url, params=params_fallback)
                 data = response.json()
 
-            # 4. Fallback con solo Cognome e DataNascita (confrontando poi il nome con i candidati restituiti)
+            # 4. Fallback con solo Cognome e DataNascita (confronto a token esatti sul nome)
             if not data or not isinstance(data, list):
                 params_dob = {
                     "Cognome": priamo_surname,
@@ -326,45 +375,34 @@ class PriamoClient:
                 response = self._request("GET", self.get_anagrafica_url, params=params_dob)
                 candidate_data = response.json()
                 if candidate_data and isinstance(candidate_data, list):
-                    target_name_clean = priamo_name.lower()
+                    target_tokens = normalize_priamo_accents(clean_name).lower().split()
+                    matched_cands = []
                     for cand in candidate_data:
-                        cand_name = normalize_priamo_accents((cand.get("datiMef") or {}).get("nome", "")).lower()
-                        if target_name_clean in cand_name or cand_name in target_name_clean or (first_name and first_name.lower() in cand_name):
-                            data = [cand]
-                            break
+                        cand_tokens = normalize_priamo_accents((cand.get("datiMef") or {}).get("nome", "")).lower().split()
+                        if cand_tokens and target_tokens and (
+                            cand_tokens == target_tokens
+                            or (len(target_tokens) >= 1 and cand_tokens[:len(target_tokens)] == target_tokens)
+                            or (len(cand_tokens) >= 1 and target_tokens[:len(cand_tokens)] == cand_tokens)
+                        ):
+                            matched_cands.append(cand)
+                    data = matched_cands
 
             # 5. Fallback con permutazioni di partizione per doppi cognomi / nominativi composti esteri
             if not data or not isinstance(data, list):
                 all_tokens = f"{priamo_surname} {priamo_name}".split()
                 if len(all_tokens) >= 3:
                     candidates_to_try = []
-                    # Prova doppio cognome (2 token cognome, restante nome)
-                    c_sur2 = " ".join(all_tokens[:2])
-                    c_nam2 = " ".join(all_tokens[2:])
-                    if c_sur2 != priamo_surname:
-                        candidates_to_try.append((c_sur2, c_nam2))
+                    for split_idx in (2, 3, 4, 1):
+                        if len(all_tokens) > split_idx:
+                            c_sur = " ".join(all_tokens[:split_idx])
+                            c_nam = " ".join(all_tokens[split_idx:])
+                            if c_sur != priamo_surname:
+                                candidates_to_try.append((c_sur, c_nam))
 
-                    # Prova triplo cognome (3 token cognome, restante nome)
-                    if len(all_tokens) >= 4:
-                        c_sur3 = " ".join(all_tokens[:3])
-                        c_nam3 = " ".join(all_tokens[3:])
-                        if c_sur3 != priamo_surname:
-                            candidates_to_try.append((c_sur3, c_nam3))
-
-                    # Prova quadruplo cognome per composti con particelle (4 token cognome, restante nome)
-                    if len(all_tokens) >= 5:
-                        c_sur4 = " ".join(all_tokens[:4])
-                        c_nam4 = " ".join(all_tokens[4:])
-                        if c_sur4 != priamo_surname:
-                            candidates_to_try.append((c_sur4, c_nam4))
-
-                    # Prova singolo cognome (1 token cognome, restante nome)
-                    c_sur1 = all_tokens[0]
-                    c_nam1 = " ".join(all_tokens[1:])
-                    if c_sur1 != priamo_surname:
-                        candidates_to_try.append((c_sur1, c_nam1))
-
+                    expected_all_norm = normalize_person_name(f"{clean_surname} {clean_name}")
                     for cand_sur, cand_nam in candidates_to_try:
+                        cand_sur_norm = normalize_person_name(cand_sur)
+                        cand_nam_norm = normalize_person_name(cand_nam)
                         p_cand = {
                             "Nome": cand_nam,
                             "Cognome": cand_sur,
@@ -373,9 +411,19 @@ class PriamoClient:
                         resp_cand = self._request("GET", self.get_anagrafica_url, params=p_cand)
                         d_cand = resp_cand.json()
                         if d_cand and isinstance(d_cand, list):
-                            data = d_cand
-                            break
-                        # Prova con primo nome del candidato se composto
+                            verified = []
+                            for c in d_cand:
+                                mef_c = c.get("datiMef") or {}
+                                c_sur = normalize_person_name(mef_c.get("cognome", ""))
+                                c_nam = normalize_person_name(mef_c.get("nome", ""))
+                                if (
+                                    f"{c_sur}{c_nam}" == expected_all_norm
+                                    or (c_sur == cand_sur_norm and cand_nam_norm and c_nam.startswith(cand_nam_norm))
+                                ):
+                                    verified.append(c)
+                            if verified:
+                                data = verified
+                                break
                         cand_first = cand_nam.split()[0] if cand_nam else ""
                         if cand_first and cand_first.lower() != cand_nam.lower():
                             p_cand_first = {
@@ -386,15 +434,23 @@ class PriamoClient:
                             resp_cand_first = self._request("GET", self.get_anagrafica_url, params=p_cand_first)
                             d_cand_first = resp_cand_first.json()
                             if d_cand_first and isinstance(d_cand_first, list):
-                                data = d_cand_first
-                                break
-
+                                verified_f = [
+                                    c for c in d_cand_first
+                                    if normalize_person_name((c.get("datiMef") or {}).get("cognome", "")) == normalize_person_name(cand_sur)
+                                ]
+                                if verified_f:
+                                    data = verified_f
+                                    break
 
         if not data or not isinstance(data, list):
-            logger.warning(f"Paziente non trovato su Priamo: {clean_name} {clean_surname} ({dob_str})")
+            logger.warning(f"Paziente non trovato su Priamo ({mask_phi(clean_surname)} {mask_phi(clean_name)})")
             return None
 
-        first_match = data[0]
+        first_match = self._select_unambiguous_match(
+            data, expected_name=clean_name, expected_surname=clean_surname, codice_fiscale=codice_fiscale
+        )
+        if not first_match:
+            return None
 
         # Estrazione ID paziente (progressivoPaz1 in datiAa, id in datiAa, idAnagPaz1 in consensi)
         patient_id = None
@@ -415,19 +471,19 @@ class PriamoClient:
                 patient_id = str(cf).strip()
 
         if not patient_id:
-            logger.warning(f"Paziente trovato su Priamo ma senza identificativo estraibile: {clean_name} {clean_surname}")
+            logger.warning(f"Paziente trovato su Priamo ma senza identificativo estraibile ({mask_phi(clean_surname)}).")
             return None
 
         dati_mef = first_match.get("datiMef") or {}
         dati_asl = first_match.get("datiAsl") or {}
 
-        codice_fiscale = dati_mef.get("codiceFiscale")
+        cf_val = dati_mef.get("codiceFiscale")
         comune_nascita = (dati_mef.get("comuneNascita") or {}).get("nome")
         sesso = dati_mef.get("sesso")
         tessera = dati_asl.get("tesseraSanitaria")
         telefono = dati_aa.get("cellulare") or dati_aa.get("telefono")
 
-        parsed_dob = date.fromisoformat(dob_str[:10]) if isinstance(date_of_birth, str) else date_of_birth
+        parsed_dob = parsed_input_dob if isinstance(date_of_birth, str) else date_of_birth
 
         # Nome e cognome ufficiali da anagrafica fiscale/sanitaria Priamo se presenti
         mef_name = dati_mef.get("nome", "").strip().title() or clean_name
@@ -438,7 +494,7 @@ class PriamoClient:
             name=mef_name,
             surname=mef_surname,
             date_of_birth=parsed_dob,
-            codice_fiscale=codice_fiscale,
+            codice_fiscale=cf_val,
             comune_nascita=comune_nascita,
             sesso=sesso,
             tessera_sanitaria=tessera,
@@ -606,7 +662,7 @@ class PriamoClient:
         connection pooling to maximize download speed and minimize latency.
         """
         events = self.get_patient_events(patient.patient_id)
-        logger.info(f"Trovati {len(events)} eventi per il paziente {patient.name} {patient.surname} (ID: {patient.patient_id})")
+        logger.info(f"Trovati {len(events)} eventi per il paziente ID: {patient.patient_id}")
 
         # Se destination_dir è la cartella generica genitore dei download (es. 'downloads' o 'data'),
         # usa l'ID del paziente (patient.patient_id) e non lo slug nome-cognome-dob.
@@ -628,7 +684,7 @@ class PriamoClient:
         ]
 
         if not active_events:
-            logger.info(f"Nessun referto/pdf disponibile tra gli eventi di {patient.name} {patient.surname}.")
+            logger.info(f"Nessun referto/pdf disponibile tra gli eventi per ID {patient.patient_id}.")
             return []
 
         workers = max_workers or self.max_workers or 8
@@ -714,8 +770,8 @@ class PriamoClient:
             return []
 
         logger.info(
-            f"Avvio download concorrente di {len(download_tasks)} referti PDF per il paziente "
-            f"{patient.name} {patient.surname} con pool di {workers} thread..."
+            f"Avvio download concorrente di {len(download_tasks)} referti PDF per paziente ID {patient.patient_id} "
+            f"con pool di {workers} thread..."
         )
 
         documents: List[PriamoDocument] = []
@@ -752,7 +808,7 @@ class PriamoClient:
                 if doc_res:
                     documents.append(doc_res)
 
-        logger.info(f"Download concorrente completato: {len(documents)}/{len(download_tasks)} referti acquisiti con successo per {patient.name} {patient.surname}.")
+        logger.info(f"Download concorrente completato: {len(documents)}/{len(download_tasks)} referti acquisiti per ID {patient.patient_id}.")
         return documents
 
     def verify_patient_cohort(
@@ -819,11 +875,14 @@ class PriamoClient:
                 return res
 
             try:
-                found_patient = self.search_patient(
-                    name=name,
-                    surname=surname,
-                    date_of_birth=dob
-                )
+                search_kwargs: Dict[str, Any] = {
+                    "name": name,
+                    "surname": surname,
+                    "date_of_birth": dob,
+                }
+                if d.get("codice_fiscale"):
+                    search_kwargs["codice_fiscale"] = d.get("codice_fiscale")
+                found_patient = self.search_patient(**search_kwargs)
                 if found_patient:
                     res["exists_in_priamo"] = True
                     res["status"] = "found"

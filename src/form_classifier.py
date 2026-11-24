@@ -265,7 +265,13 @@ class FormClassifier:
 
         # 2. Check explicit hint (e.g. from .NET API metadata, exam name or filename)
         if hint:
-            # 2.1 Chirurgia Senologica -> collega SEMPRE a 'struttura_della_lesione'
+            # 2.0 Explicit pathology / biopsy hints must be checked before generic surgery department hints
+            if any(b in lower_hint for b in ["biops", "core", "fna", "agobiopt", "agoaspirat"]):
+                return "anatomia_patologica_preoperatoria"
+            if any(i in lower_hint for i in ["istolog", "definitiv", "recettore", "estrogen", "progesteron", "sentinella", "osna", "bls", "e_i_c", "pezzo_operatorio", "pezzo operatorio"]):
+                return "anatomia_patologica"
+
+            # 2.1 Chirurgia Senologica -> collega a 'struttura_della_lesione'
             chirurgia_senologica_hints = [
                 "chirurgia senologica",
                 "chirurgia_senologica",
@@ -280,11 +286,11 @@ class FormClassifier:
                 "verbale operatorio",
                 "verbale_operatorio",
                 "intervent",
-                "operatori",
+                "mastec",
                 "dimissione",
             ]
             if any(term in lower_hint for term in chirurgia_senologica_hints):
-                if not any(h in lower_hint for h in ["istolog", "e_i_c", "esame istologico", "anatomia patologica", "core biopsy", "agobiops"]):
+                if not any(h in lower_hint for h in ["istolog", "e_i_c", "esame istologico", "anatomia patologica", "core biopsy", "agobiops", "oncolog", "radioterap"]):
                     return "struttura_della_lesione"
 
             # 2.2 Multidisciplinare
@@ -299,21 +305,61 @@ class FormClassifier:
                 if alias_term in lower_hint:
                     return target_form
 
-            if any(b in lower_hint for b in ["biops", "core", "fna", "agobiopt", "agoaspirat"]):
-                return "anatomia_patologica_preoperatoria"
-            if any(i in lower_hint for i in ["istolog", "definitiv", "recettore", "estrogen", "progesteron", "sentinella", "osna", "bls", "mastec", "e_i_c"]):
-                return "anatomia_patologica"
-            if any(r in lower_hint for r in ["mammo", "eco", "rmn", "mri", "marcatura"]):
+            if (
+                any(r in lower_hint for r in ["mammo", "rmn", "mri", "marcatura", "ecografia", "eco_mamm", "eco mamm"])
+                or (
+                    re.search(r"(?:^|[_\-\s])eco(?:grafia)?(?:[_\-\s]|$)", lower_hint)
+                    and not any(ex in lower_hint for ex in ["ecocardio", "ecodoppler", "ginecolog"])
+                )
+            ):
                 return "radiologia"
-            if any(o in lower_hint for o in ["oncolog", "chemioter"]):
+            if any(o in lower_hint for o in ["oncolog", "chemioter"]) and "psiconcolog" not in lower_hint:
                 return "chemioterapia"
+            if "radioterap" in lower_hint:
+                return "radioterapia"
             if "visita" in lower_hint:
                 if "diagnostica per immagini" in lower_text or "mammografia" in lower_text or "eco mammaria" in lower_text:
                     return "radiologia"
                 return "dati_del_paziente"
 
         # 3. Heuristic rules based on clinical text keywords
-        # 3.1 Chirurgia Senologica / Verbale operatorio / Lettera di dimissione
+        has_postop_surgery = any(t in lower_text for t in ("pezzo operatorio", "quadrantectomia", "mastectomia", "istologico definitivo", "resezione chirurgica"))
+        has_tnm_margins = bool(
+            re.search(
+                r"\b(pt\s*[0-4is]|pn\s*[0-3]|margini\s+(?:di\s+resezione|chirurgic[ih]|indenni|positivi|negativi|a\s+ridosso))\b",
+                lower_text,
+            )
+        )
+        is_explicit_postop_pathology = (
+            (has_postop_surgery and has_tnm_margins)
+            or "recettori degli estrogeni" in lower_text
+            or "metodica osna" in lower_text
+            or "stadiazione istopatologica" in lower_text
+            or "esame istologico definitivo" in lower_text
+            or "referto istologico definitivo" in lower_text
+        )
+
+        # 3.1 Biopsia / Citologia pre-operatoria (Core Biopsy, agobioptici, frustoli, FNA)
+        # Valutata prima dell'istologico definitivo post-operatorio per evitare falsi positivi
+        has_biopsy_context = any(k in lower_text for k in (
+            "biops", "frustol", "agobiopt", "agoaspirat", "citolog", "microistolog",
+            "tru-cut", "trucut", "vabb", "mammotome", "categoria b", "classe b"
+        ))
+        has_b_c_code = bool(re.search(r"\b(b[1-5][abc]?|c[1-5])\b", lower_text))
+        if (
+            ("frustoli" in lower_text or "agobioptici" in lower_text or "core biopsy" in lower_text or "agobiopsia" in lower_text)
+            or ("agoaspirato" in lower_text and ("fna" in lower_text or "citologico" in lower_text or bool(re.search(r"\bc[1-5]\b", lower_text))))
+            or "esame citologico da agoaspirat" in lower_text
+            or (has_b_c_code and has_biopsy_context and not is_explicit_postop_pathology)
+        ):
+            return "anatomia_patologica_preoperatoria"
+
+        # 3.2 Istologico definitivo post-operatorio e biologia molecolare / OSNA
+        # Valutato PRIMA del generico "chirurgia senologica" (spesso presente come reparto richiedente sui referti istologici)
+        if is_explicit_postop_pathology:
+            return "anatomia_patologica"
+
+        # 3.3 Chirurgia Senologica / Verbale operatorio / Lettera di dimissione
         if (
             "lettera di dimissione" in lower_text
             or "verbale operatorio" in lower_text
@@ -327,28 +373,6 @@ class FormClassifier:
             or "intervento chirurgico senologico" in lower_text
         ) and ("diagnosi istopatologica" not in lower_text and "frustoli" not in lower_text):
             return "struttura_della_lesione"
-
-        # 3.2 Biopsia / Citologia pre-operatoria (Core Biopsy, agobioptici, frustoli, FNA)
-        # Valutata prima dell'istologico definitivo post-operatorio per evitare che termini come
-        # "frustoli agobioptici" attivino erroneamente "pt" o "diagnosi istopatologica"
-        if (
-            ("frustoli" in lower_text or "agobioptici" in lower_text or "core biopsy" in lower_text or "agobiopsia" in lower_text)
-            or ("agoaspirato" in lower_text and ("fna" in lower_text or "citologico" in lower_text or any(f"c{i}" in lower_text for i in range(1, 6))))
-            or "esame citologico da agoaspirat" in lower_text
-            or bool(re.search(r"\b(b[1-5]|c[1-5])\b", lower_text))
-        ):
-            return "anatomia_patologica_preoperatoria"
-
-        # 3.3 Istologico definitivo post-operatorio e biologia molecolare / OSNA
-        has_postop_surgery = any(t in lower_text for t in ("pezzo operatorio", "quadrantectomia", "mastectomia", "istologico definitivo", "resezione chirurgica"))
-        has_tnm_margins = bool(re.search(r"\b(pt[0-4is]|pn[0-3]|linfonodo sentinella|margini di resezione|margini)\b", lower_text))
-        if (
-            (has_postop_surgery and has_tnm_margins)
-            or "recettori degli estrogeni" in lower_text
-            or "metodica osna" in lower_text
-            or "stadiazione istopatologica" in lower_text
-        ):
-            return "anatomia_patologica"
 
         # 3.4 Radiologia
         if (
@@ -391,6 +415,8 @@ class FormClassifier:
             return "recidiva"
 
         # 5. Fallback to quick local LLM classification (supports llama.cpp or Ollama configured in Settings)
+        llm_timeout = getattr(cfg, "llm_fallback_timeout_seconds", 30)
+        text_excerpt = text if len(text) <= 2500 else f"{text[:1500]}\n...\n{text[-1000:]}"
         try:
             prompt = (
                 "Classifica il seguente referto medico senologico in uno e uno solo di questi strumenti REDCap:\n"
@@ -400,9 +426,10 @@ class FormClassifier:
                 "- struttura_della_lesione (Chirurgia Senologica, verbale operatorio, lettera di dimissione, tipo intervento chirurgico)\n"
                 "- chemioterapia (oncologia medica)\n"
                 "- radioterapia (trattamento radiante)\n"
-                "- dati_del_paziente (anamnesi, prima visita, riunioni multidisciplinari)\n\n"
-                f"Referto:\n{text[:1000]}\n\n"
-                "Rispondi ESCLUSIVAMENTE con il nome dello strumento (es. 'radiologia'):"
+                "- dati_del_paziente (anamnesi, prima visita, riunioni multidisciplinari)\n"
+                "- skip (referto non senologico / irrilevante)\n\n"
+                f"Referto:\n{text_excerpt}\n\n"
+                "Rispondi ESCLUSIVAMENTE con il nome dello strumento (es. 'radiologia' o 'skip'):"
             )
 
             # 5.1 Try llama.cpp server first if configured
@@ -413,19 +440,39 @@ class FormClassifier:
                         headers["CF-Access-Client-Id"] = cfg.ai_cloudflared_client_id
                         headers["CF-Access-Client-Secret"] = cfg.ai_cloudflared_client_secret
 
-                    r_llama = requests.post(
-                        f"{target_llama_url}/completion",
-                        headers=headers,
-                        json={"prompt": prompt, "temperature": 0.0, "n_predict": 20, "stream": False},
-                        timeout=3
-                    )
-                    if r_llama.status_code == 200:
-                        predicted = r_llama.json().get("content", "").strip().lower()
-                        for form_key in AVAILABLE_FORMS.keys():
-                            if form_key in predicted:
-                                return form_key
-                except Exception:
-                    pass
+                    if getattr(cfg, "llama_cpp_api_mode", "chat").lower() == "chat":
+                        r_llama = requests.post(
+                            f"{target_llama_url}/v1/chat/completions",
+                            headers=headers,
+                            json={
+                                "model": cfg.llama_cpp_model or "llama-cpp-rpc",
+                                "messages": [{"role": "user", "content": prompt}],
+                                "temperature": 0.0,
+                                "max_tokens": 20,
+                                "stream": False,
+                            },
+                            timeout=llm_timeout,
+                        )
+                        predicted = (
+                            r_llama.json().get("choices", [{}])[0].get("message", {}).get("content", "").strip().lower()
+                            if r_llama.status_code == 200 else ""
+                        )
+                    else:
+                        r_llama = requests.post(
+                            f"{target_llama_url}/completion",
+                            headers=headers,
+                            json={"prompt": prompt, "temperature": 0.0, "n_predict": 20, "stream": False},
+                            timeout=llm_timeout,
+                        )
+                        predicted = r_llama.json().get("content", "").strip().lower() if r_llama.status_code == 200 else ""
+
+                    if "skip" in predicted:
+                        return "skip"
+                    for form_key in AVAILABLE_FORMS.keys():
+                        if form_key in predicted:
+                            return form_key
+                except Exception as e:
+                    logger.debug(f"Classificazione LLM llama.cpp fallback fallita: {e}")
 
             # 5.2 Try Ollama fallback
             if target_ollama_url:
@@ -437,22 +484,102 @@ class FormClassifier:
                         "stream": False,
                         "options": {"temperature": 0.0, "num_predict": 20}
                     },
-                    timeout=5
+                    timeout=llm_timeout,
                 )
                 if r.status_code == 200:
                     predicted = r.json().get("response", "").strip().lower()
+                    if "skip" in predicted:
+                        return "skip"
                     for form_key in AVAILABLE_FORMS.keys():
                         if form_key in predicted:
                             return form_key
         except Exception as e:
             logger.warning(f"Classificazione LLM non riuscita: {e}")
 
-        # Default fallback: check if document contains senological terms; if not, skip
+        # Fail-safe fallback: return 'unknown' if senological terms present (for human review), otherwise 'skip'
         seno_terms = ["mamm", "senolog", "cavo ascellare", "capezzolo", "areolare", "nodulo", "bi-rads", "birads"]
         if any(st in lower_text for st in seno_terms):
-            return "radiologia"
+            return "unknown"
 
         return "skip"
+
+    @staticmethod
+    def _extract_section_body(lower_text: str, start_markers: List[str], stop_markers: List[str]) -> str:
+        """Extracts text following the first matching start marker up to the earliest stop marker."""
+        start_idx = -1
+        used_len = 0
+        for marker in start_markers:
+            pos = lower_text.find(marker)
+            if pos != -1 and (start_idx == -1 or pos < start_idx):
+                start_idx = pos
+                used_len = len(marker)
+        if start_idx == -1:
+            return ""
+        rest = lower_text[start_idx + used_len:]
+        end_idx = len(rest)
+        for stop in stop_markers:
+            pos = rest.find(stop)
+            if pos != -1 and pos < end_idx:
+                end_idx = pos
+        return rest[:end_idx].strip()
+
+    @staticmethod
+    def _is_surgery_section_populated(lower_text: str) -> bool:
+        """Detects whether surgical intervention data is genuinely populated (not a blank template)."""
+        proc_terms = (
+            "quadrantectomia", "mastectomia", "tumorectomia", "resezione ampia",
+            "duttectomia", "linfonodo sentinella", "dissezione ascellare", "svuotamento ascellare",
+        )
+        if any(t in lower_text for t in proc_terms):
+            return True
+
+        sec = FormClassifier._extract_section_body(
+            lower_text,
+            start_markers=["intervento eseguito", "tipo di intervento"],
+            stop_markers=["esame istologico definitivo", "istologico definitivo", "meeting multidisciplinare", "indicazione terapeutica"],
+        )
+        if not sec:
+            return False
+        # Strip standard template boilerplate ("In data ……… è stato eseguito intervento di")
+        cleaned = re.sub(r"in\s+data|è\s+stato\s+eseguito\s+intervento\s+di|[\.\…_\s:/\-]+", " ", sec).strip()
+        has_date = bool(re.search(r"\b\d{1,2}[./\-]\d{1,2}[./\-]\d{2,4}\b", sec))
+        return has_date or len(cleaned) >= 4
+
+    @staticmethod
+    def _is_postop_histology_populated(lower_text: str) -> bool:
+        """Detects whether definitive post-operative histology is genuinely populated (not a blank template)."""
+        sec = FormClassifier._extract_section_body(
+            lower_text,
+            start_markers=[
+                "esame istologico definitivo",
+                "istologico definitivo",
+                "istologia definitiva",
+                "esame istopatologico definitivo",
+            ],
+            stop_markers=["meeting multidisciplinare", "indicazione terapeutica", "terapia adiuvante", "presenti"],
+        )
+        if sec:
+            has_clinical_value = bool(
+                re.search(
+                    r"\b(?:"
+                    r"pt\s*[:=]?\s*(?:[0-4](?:mic|[a-d])?|is|x)"
+                    r"|pn\s*[:=]?\s*(?:[0-3](?:mi|[a-c])?|x)"
+                    r"|g\s*[:=]?\s*[1-3]"
+                    r"|(?:er|pr|pgr|ki\s*-?67)\s*[:=]?\s*\d{1,3}\s*%"
+                    r"|her\s*2\s*[:=]?\s*(?:score\s*)?(?:0|1\+|2\+|3\+|negativ|positiv)"
+                    r"|margini\s*(?:chirurgici\s*)?(?:indenni|negativi|positivi|interessati|a\s+ridosso|[<>]?\s*\d+)"
+                    r"|osna|ck19|carcinoma"
+                    r")\b",
+                    sec,
+                )
+            )
+            if has_clinical_value:
+                return True
+
+        return (
+            any(k in lower_text for k in ("pezzo operatorio", "quadrantectomia", "mastectomia"))
+            and bool(re.search(r"\b(pt\s*[0-4is]|pn\s*[0-3]|margini\s+(?:indenni|positivi|negativi|a\s+ridosso))\b", lower_text))
+        )
 
     @staticmethod
     def classify_report_targets(
@@ -522,26 +649,23 @@ class FormClassifier:
             and any(k in lower_text for k in ["gray", "gy", "imrt", "irradiazione", "tot 48gy", "sib"])
         )
 
-        has_biopsy_summary = any(k in lower_text for k in [
-            "tru-cut", "core biopsy", "agobiopsia", "agoaspirato", "citologico c", "vab", "b5"
-        ])
-
-        has_surgery_section = any(k in lower_text for k in [
-            "intervento eseguito", "stato eseguito intervento di", "tipo di intervento",
-            "quadrantectomia", "mastectomia", "linfonodo sentinella", "dissezione ascellare"
-        ])
-
-        has_postop_histology = (
+        has_biopsy_summary = (
             any(k in lower_text for k in [
-                "esame istologico definitivo",
-                "istologico definitivo",
-                "istologia definitiva",
-                "esame istopatologico definitivo",
+                "tru-cut", "core biopsy", "agobiopsia", "agoaspirato", "citologico c"
             ])
-            or (
-                any(k in lower_text for k in ["pezzo operatorio", "quadrantectomia", "mastectomia"])
-                and any(k in lower_text for k in ["pt1", "pt2", "pt3", "pt4", "ptis", "pn0", "pn1", "pn2", "pn3", "margini"])
+            or bool(re.search(r"\bvabb?\b", lower_text))
+            or bool(re.search(r"\bb[1-5][abc]?\b", lower_text))
+        )
+
+        has_surgery_section = FormClassifier._is_surgery_section_populated(lower_text)
+        has_postop_histology = FormClassifier._is_postop_histology_populated(lower_text)
+
+        has_radiology_findings = bool(
+            re.search(
+                r"\b(?:bi-?rads\s*[0-6]|u[1-5]|mr[0-6]|r[1-5]|opacit|nodul|microcalcificazion|densit|lesion[ei]\s+(?:nodular|sospett))",
+                lower_text,
             )
+            and any(k in lower_text for k in ["mammografia", "ecografia", "risonanza", "tomosintesi", "birads", "bi-rads"])
         )
 
         # Rule 1: Oncology visit / report
@@ -564,14 +688,14 @@ class FormClassifier:
                 targets.insert(0, "dati_del_paziente")
             if has_chemo_or_endocrine and "chemioterapia" not in targets:
                 targets.append("chemioterapia")
-            if any(k in lower_text for k in ["mammografia", "ecografia", "birads", "bi-rads"]) and "radiologia" not in targets:
+            if has_radiology_findings and "radiologia" not in targets:
                 targets.append("radiologia")
             if has_biopsy_summary and "anatomia_patologica_preoperatoria" not in targets:
                 targets.append("anatomia_patologica_preoperatoria")
-            # Sezione intervento chirurgico eseguito
+            # Sezione intervento chirurgico eseguito (solo se realmente popolata)
             if has_surgery_section and "struttura_della_lesione" not in targets:
                 targets.append("struttura_della_lesione")
-            # Sezione istologico definitivo popolata: il paziente è stato operato ed è presente il referto post-operatorio
+            # Sezione istologico definitivo popolata (solo se realmente popolata)
             if has_postop_histology and "anatomia_patologica" not in targets:
                 targets.append("anatomia_patologica")
             if has_radiotherapy and "radioterapia" not in targets:

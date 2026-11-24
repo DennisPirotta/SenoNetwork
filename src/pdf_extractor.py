@@ -77,52 +77,85 @@ class PDFExtractor:
         raise FileNotFoundError(f"Target path does not exist: {target_path}")
 
     @staticmethod
+    def _validate_iso_date(year: str, month: str, day: str) -> Optional[str]:
+        """Validates a calendar date and formats it as YYYY-MM-DD."""
+        try:
+            y, m, d = int(year), int(month), int(day)
+            if not (1900 <= y <= 2099):
+                return None
+            from datetime import date as _date
+            return _date(y, m, d).strftime("%Y-%m-%d")
+        except ValueError:
+            return None
+
+    @staticmethod
     def extract_document_date(pdf_path: Union[str, Path], text: Optional[str] = None) -> str:
         """Extracts the clinical document date (YYYY-MM-DD) from text or filename.
 
         Prioritizes explicit clinical report date markers (e.g. 'Data Ref.', 'Data Acc.', 'Data visita'),
-        then general date formats in the text, and falls back to the year/sequence encoded in the filename.
+        supports both DD/MM/YYYY and YYYY-MM-DD formats, validates calendar dates, and ignores DOB lines.
         """
         path = Path(pdf_path)
         doc_text = text if text is not None else (PDFExtractor.extract_text(path) if path.is_file() else "")
 
         # 1. Search for explicit date labels in Italian medical reports (highest priority)
-        explicit_patterns = [
-            r'(?:data\s*ref(?:erto)?|data\s*acc(?:ettazione)?|data\s*esame|data\s*prelievo|eseguito\s*il|data\s*visita|data\s*:)\s*[:\s]*(\d{1,2}[./\-]\d{1,2}[./\-]((?:19|20)\d{2}))',
-            r'firmato\s*digitalmente[^\n]*?il\s*(\d{1,2}[./\-]\d{1,2}[./\-]((?:19|20)\d{2}))',
-            r'(\d{1,2}[./\-]\d{1,2}[./\-]((?:19|20)\d{2}))\s*alle\s*ore',
+        explicit_dmy_patterns = [
+            r'(?:data\s*ref(?:erto)?|data\s*acc(?:ettazione)?|data\s*esame|data\s*prelievo|eseguito\s*il|data\s*visita|data\s*:)\s*[:\s]*(\d{1,2})[./\-](\d{1,2})[./\-]((?:19|20)\d{2})\b',
+            r'firmato\s*digitalmente[^\n]*?il\s*(\d{1,2})[./\-](\d{1,2})[./\-]((?:19|20)\d{2})\b',
+            r'\b(\d{1,2})[./\-](\d{1,2})[./\-]((?:19|20)\d{2})\s*alle\s*ore',
         ]
-        for pat in explicit_patterns:
+        explicit_ymd_patterns = [
+            r'(?:data\s*ref(?:erto)?|data\s*acc(?:ettazione)?|data\s*esame|data\s*prelievo|eseguito\s*il|data\s*visita|data\s*:)\s*[:\s]*((?:19|20)\d{2})[-/](\d{1,2})[-/](\d{1,2})\b',
+            r'firmato\s*digitalmente[^\n]*?il\s*((?:19|20)\d{2})[-/](\d{1,2})[-/](\d{1,2})\b',
+        ]
+        for pat in explicit_dmy_patterns:
             m = re.search(pat, doc_text, re.IGNORECASE)
             if m:
-                raw = m.group(1).replace('/', '-').replace('.', '-')
-                parts = raw.split('-')
-                if len(parts) == 3:
-                    d, mth, y = parts
-                    if len(y) == 4 and 1 <= int(mth) <= 12 and 1 <= int(d) <= 31:
-                        return f"{y}-{int(mth):02d}-{int(d):02d}"
-
-        # 2. Secondary contextual date markers (e.g. "referto del", "del", "li")
-        secondary_patterns = [
-            r'(?:referto\s*del|in\s*data|del|l[iì])\s*[:\s]*(\d{1,2}[./\-]\d{1,2}[./\-]((?:19|20)\d{2}))',
-        ]
-        for pat in secondary_patterns:
+                iso = PDFExtractor._validate_iso_date(m.group(3), m.group(2), m.group(1))
+                if iso:
+                    return iso
+        for pat in explicit_ymd_patterns:
             m = re.search(pat, doc_text, re.IGNORECASE)
             if m:
-                raw = m.group(1).replace('/', '-').replace('.', '-')
-                parts = raw.split('-')
-                if len(parts) == 3:
-                    d, mth, y = parts
-                    if len(y) == 4 and 1 <= int(mth) <= 12 and 1 <= int(d) <= 31:
-                        return f"{y}-{int(mth):02d}-{int(d):02d}"
+                iso = PDFExtractor._validate_iso_date(m.group(1), m.group(2), m.group(3))
+                if iso:
+                    return iso
 
-        # 3. Any standard date in text (1900-2099)
-        for m in re.finditer(r'\b(\d{1,2})[./\-](\d{1,2})[./\-]((?:19|20)\d{2})\b', doc_text):
-            d, mth, y = m.group(1), m.group(2), m.group(3)
-            if 1 <= int(mth) <= 12 and 1 <= int(d) <= 31:
-                return f"{y}-{int(mth):02d}-{int(d):02d}"
+        # 2. Secondary contextual date markers (e.g. "referto del", "in data", "del", "li")
+        secondary_dmy = [
+            r'(?:referto\s*del|in\s*data|del|l[iì])\s*[:\s]*(\d{1,2})[./\-](\d{1,2})[./\-]((?:19|20)\d{2})\b',
+        ]
+        secondary_ymd = [
+            r'(?:referto\s*del|in\s*data|del|l[iì])\s*[:\s]*((?:19|20)\d{2})[-/](\d{1,2})[-/](\d{1,2})\b',
+        ]
+        for pat in secondary_dmy:
+            m = re.search(pat, doc_text, re.IGNORECASE)
+            if m:
+                iso = PDFExtractor._validate_iso_date(m.group(3), m.group(2), m.group(1))
+                if iso:
+                    return iso
+        for pat in secondary_ymd:
+            m = re.search(pat, doc_text, re.IGNORECASE)
+            if m:
+                iso = PDFExtractor._validate_iso_date(m.group(1), m.group(2), m.group(3))
+                if iso:
+                    return iso
 
-        # 3. Filename numeric prefix: e.g. 20260000... or 20250000...
+        # 3. Any standard date in text (1900-2099), ignoring explicit DOB lines
+        for line in doc_text.splitlines():
+            lower_line = line.lower()
+            if any(marker in lower_line for marker in ("data di nascita", "nato il", "nata il", "dob")):
+                continue
+            for m in re.finditer(r'\b(\d{1,2})[./\-](\d{1,2})[./\-]((?:19|20)\d{2})\b', line):
+                iso = PDFExtractor._validate_iso_date(m.group(3), m.group(2), m.group(1))
+                if iso:
+                    return iso
+            for m in re.finditer(r'\b((?:19|20)\d{2})[-/](\d{1,2})[-/](\d{1,2})\b', line):
+                iso = PDFExtractor._validate_iso_date(m.group(1), m.group(2), m.group(3))
+                if iso:
+                    return iso
+
+        # 4. Filename numeric prefix: e.g. 20260000... or 20250000...
         m_fn = re.match(r'^(?:evento_)?(20\d{2})', path.stem)
         if m_fn:
             return f"{m_fn.group(1)}-01-01"

@@ -8,7 +8,6 @@ from dotenv import load_dotenv
 
 from src.ai_extractor import (
     LlamaCppExtractor,
-    OllamaExtractor,
     get_ai_extractor
 )
 from src.config import Settings
@@ -16,7 +15,7 @@ from src.models import ExtractionResult
 from src.pdf_extractor import PDFExtractor
 from src.pipeline import ExtractionPipeline
 from src.redcap_service import REDCapService
-from src.sync_service import PatientSyncResult, RedCapSyncService, SyncSummaryReport
+from src.sync_service import RedCapSyncService, SyncSummaryReport
 
 load_dotenv()
 
@@ -25,7 +24,6 @@ try:
     from rich.console import Console
     from rich.table import Table
     from rich.panel import Panel
-    from rich import print as rprint
 
     HAS_RICH = True
 except ImportError:
@@ -752,7 +750,7 @@ def main():
         count = delete_redcap_records(
             record_id=args.delete_record,
             api_url=settings.redcap_api_url,
-            api_token=settings.redcap_api_token,
+            api_token=settings.redcap_delete_token or settings.redcap_api_token,
             clean_local_state=args.clean_local_state
         )
         if count > 0:
@@ -778,7 +776,7 @@ def main():
             all_records=True,
             confirm=True,
             api_url=settings.redcap_api_url,
-            api_token=settings.redcap_api_token,
+            api_token=settings.redcap_delete_token or settings.redcap_api_token,
             clean_local_state=args.clean_local_state
         )
         print(f"[OK] Eliminazione completata: eliminati con successo {count} record da REDCap.")
@@ -805,7 +803,7 @@ def main():
         target_excel = args.excel or settings.patients_excel_path
         if target_excel and str(target_excel).strip().lower() != "cup" and Path(target_excel).exists():
             print(f"-> Caricamento pazienti da {target_excel} per verifica su Priamo...")
-            cohort = DotNetApiClient.load_patients_from_excel(target_excel)
+            cohort = DotNetApiClient.load_patients_from_excel(target_excel, settings=settings)
         else:
             # Download del foglio di lavoro aggiornato direttamente da PriamoCUP
             from src.priamo_cup_client import AGENDE_SENOLOGIA, UNITA_SENOLOGIA, PriamoCupClient
@@ -823,10 +821,10 @@ def main():
                 weeks=args.weeks,
                 codice_unita=unit,
                 agende=agendas_list,
-                output_dir="data/cup",
+                output_dir=str(settings.cup_dir),
             )
             print(f"[OK] Foglio aggiornato scaricato: {downloaded_file.name}")
-            cohort = DotNetApiClient.load_patients_from_excel(downloaded_file)
+            cohort = DotNetApiClient.load_patients_from_excel(downloaded_file, settings=settings)
         if args.limit:
             cohort = cohort[:args.limit]
 
@@ -1103,12 +1101,27 @@ def main():
     pipeline = PatientPipeline(settings=settings)
     print(f"\n-> Avvio pipeline clinica IA su {len(pazienti)} pazienti...")
 
+    # Pre-carica anagrafica REDCap una volta sola prima del loop batch per evitare query O(N^2)
+    redcap_records_cache = None
+    if settings.redcap_api_url and settings.redcap_api_token:
+        try:
+            redcap_records_cache = pipeline.redcap_service.export_records_from_api(
+                fields=["record_id", "name", "surname", "date_of_birth"]
+            )
+        except Exception:
+            redcap_records_cache = None
+
     results = []
     for idx, p in enumerate(pazienti, 1):
         target_id = p.patient_id
         if settings.redcap_api_url and settings.redcap_api_token:
             matched_id = pipeline.redcap_service.find_record_id_by_demographics(
-                p.nome or "", p.cognome, p.data_nascita, numeric_only=True
+                p.nome or "",
+                p.cognome,
+                p.data_nascita,
+                numeric_only=True,
+                codice_fiscale=p.codice_fiscale,
+                records_cache=redcap_records_cache,
             )
             if matched_id:
                 target_id = matched_id
@@ -1117,6 +1130,13 @@ def main():
                 next_id = pipeline.redcap_service.generate_next_record_name()
                 if next_id:
                     target_id = next_id
+                    if redcap_records_cache is not None:
+                        redcap_records_cache.append({
+                            "record_id": str(next_id),
+                            "name": p.nome or "",
+                            "surname": p.cognome,
+                            "date_of_birth": p.data_nascita.isoformat() if p.data_nascita else "",
+                        })
                     print(f"-> Generato automaticamente record_id numerico da REDCap: '{next_id}' per {p.nome} {p.cognome}")
 
         print(

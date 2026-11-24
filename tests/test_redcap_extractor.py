@@ -2,11 +2,10 @@ import json
 from unittest.mock import MagicMock, patch
 import pytest
 from pathlib import Path
-from src.models import REDCapField, ExtractionResult
+from src.models import REDCapField
 from src.redcap_service import REDCapService
 from src.schema_builder import SchemaBuilder
 from src.normalizer import REDCapNormalizer
-from src.pdf_extractor import PDFExtractor
 
 
 @pytest.fixture
@@ -321,6 +320,8 @@ def test_api_server_delete_endpoints():
     mock_cfg = MagicMock()
     mock_cfg.redcap_api_url = "https://mock.redcap/api/"
     mock_cfg.redcap_api_token = "TOKEN"
+    mock_cfg.redcap_delete_token = None
+    mock_cfg.allow_mass_delete = True
 
     # 1. Single delete success
     with patch("src.redcap_service.delete_redcap_records", return_value=1) as mock_del:
@@ -328,6 +329,7 @@ def test_api_server_delete_endpoints():
         assert res["status"] == "deleted"
         assert res["record_id"] == "PZ-01"
         assert res["deleted_count"] == 1
+        assert mock_del.called
 
     # 2. Single delete not found (returns 0) -> HTTPException 404
     with patch("src.redcap_service.delete_redcap_records", return_value=0):
@@ -335,12 +337,19 @@ def test_api_server_delete_endpoints():
             delete_single_redcap_record(record_id="PZ-NONEXIST", clean_local_state=False, settings=mock_cfg)
         assert exc_info.value.status_code == 404
 
-    # 3. Mass delete without confirm -> HTTPException 400
+    # 3. Mass delete disabled when allow_mass_delete=False -> HTTPException 403
+    mock_cfg.allow_mass_delete = False
+    with pytest.raises(HTTPException) as exc_info:
+        delete_all_redcap_records(confirm=True, settings=mock_cfg)
+    assert exc_info.value.status_code == 403
+
+    # 4. Mass delete without confirm when allow_mass_delete=True -> HTTPException 400
+    mock_cfg.allow_mass_delete = True
     with pytest.raises(HTTPException) as exc_info:
         delete_all_redcap_records(confirm=False, settings=mock_cfg)
     assert exc_info.value.status_code == 400
 
-    # 4. Mass delete with confirm=True -> success
+    # 5. Mass delete with confirm=True -> success
     with patch("src.redcap_service.delete_redcap_records", return_value=12) as mock_mass:
         res = delete_all_redcap_records(confirm=True, clean_local_state=True, settings=mock_cfg)
         assert res["status"] == "deleted"

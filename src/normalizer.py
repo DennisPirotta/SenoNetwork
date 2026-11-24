@@ -1,10 +1,85 @@
+import ast
+from datetime import datetime
 import difflib
 import logging
+import operator
 import re
 from typing import Any, Dict, List, Optional
 from src.models import REDCapField
 
 logger = logging.getLogger(__name__)
+
+_ITALIAN_MONTHS = {
+    "gennaio": 1, "gen": 1,
+    "febbraio": 2, "feb": 2,
+    "marzo": 3, "mar": 3,
+    "aprile": 4, "apr": 4,
+    "maggio": 5, "mag": 5,
+    "giugno": 6, "giu": 6,
+    "luglio": 7, "lug": 7,
+    "agosto": 8, "ago": 8,
+    "settembre": 9, "set": 9, "sett": 9,
+    "ottobre": 10, "ott": 10,
+    "novembre": 11, "nov": 11,
+    "dicembre": 12, "dic": 12,
+}
+
+
+def _safe_eval_ast(node: ast.AST) -> Any:
+    """Safely evaluates a restricted boolean/comparison AST without calling eval()."""
+    if isinstance(node, ast.Expression):
+        return _safe_eval_ast(node.body)
+    if isinstance(node, ast.Constant):
+        if isinstance(node.value, (str, int, float, bool)) or node.value is None:
+            return node.value
+        raise ValueError(f"Unsupported constant type: {type(node.value)}")
+    if isinstance(node, ast.UnaryOp):
+        val = _safe_eval_ast(node.operand)
+        if isinstance(node.op, ast.Not):
+            return not bool(val)
+        if isinstance(node.op, ast.USub):
+            return -val
+        if isinstance(node.op, ast.UAdd):
+            return +val
+        raise ValueError(f"Unsupported unary op: {node.op}")
+    if isinstance(node, ast.BoolOp):
+        if isinstance(node.op, ast.And):
+            for v in node.values:
+                if not bool(_safe_eval_ast(v)):
+                    return False
+            return True
+        if isinstance(node.op, ast.Or):
+            for v in node.values:
+                if bool(_safe_eval_ast(v)):
+                    return True
+            return False
+        raise ValueError(f"Unsupported bool op: {node.op}")
+    if isinstance(node, ast.Compare):
+        ops_map = {
+            ast.Eq: operator.eq,
+            ast.NotEq: operator.ne,
+            ast.Lt: operator.lt,
+            ast.LtE: operator.le,
+            ast.Gt: operator.gt,
+            ast.GtE: operator.ge,
+        }
+        left = _safe_eval_ast(node.left)
+        for op, comp_node in zip(node.ops, node.comparators):
+            fn = ops_map.get(type(op))
+            if fn is None:
+                raise ValueError(f"Unsupported comparison op: {op}")
+            right = _safe_eval_ast(comp_node)
+            if not fn(left, right):
+                return False
+            left = right
+        return True
+    raise ValueError(f"Unsupported AST node in branching logic: {type(node).__name__}")
+
+
+def _extract_code_tokens(text: str) -> List[str]:
+    """Extracts alphanumeric tokens containing digits (e.g. '3', '4a', 'b5', 'g2')."""
+    tokens = re.findall(r"[a-z0-9]+", text.lower())
+    return [t for t in tokens if any(ch.isdigit() for ch in t)]
 
 
 class REDCapNormalizer:
@@ -18,7 +93,8 @@ class REDCapNormalizer:
         default_record_id_field: str = "record_id",
         form_name: Optional[str] = None,
         mark_form_complete: bool = True,
-        form_completion_status: str = "2"
+        form_completion_status: str = "2",
+        include_unchecked_checkboxes: bool = True,
     ) -> Dict[str, Any]:
         """Converts extracted key-value dictionary into a valid REDCap record dictionary.
 
@@ -30,6 +106,8 @@ class REDCapNormalizer:
             form_name: Optional instrument name to set <form_name>_complete status.
             mark_form_complete: If True, sets <form_name>_complete to form_completion_status.
             form_completion_status: Form completion code: '0' (Incomplete), '1' (Unverified), '2' (Complete).
+            include_unchecked_checkboxes: If False, omits '0' entries for unmentioned checkbox fields
+                so incremental REDCap uploads do not clear previously ticked checkboxes.
 
         Returns:
             Flat dictionary ready for REDCap API or CSV import.
@@ -42,8 +120,6 @@ class REDCapNormalizer:
         elif default_record_id_field in extracted_data and extracted_data[default_record_id_field]:
             record[default_record_id_field] = str(extracted_data[default_record_id_field])
 
-        field_map = {f.field_name: f for f in fields}
-
         for f in fields:
             if not f.is_extractable:
                 continue
@@ -54,10 +130,10 @@ class REDCapNormalizer:
             # Skip or set empty for None/null
             if val is None or val == "":
                 if f.field_type == "checkbox":
-                    # Checkbox fields must have 0 for each option if absent
-                    choices = f.parse_choices()
-                    for code in choices.keys():
-                        record[f"{field_name}___{code}"] = "0"
+                    if include_unchecked_checkboxes:
+                        choices = f.parse_choices()
+                        for code in choices.keys():
+                            record[f"{field_name}___{code}"] = "0"
                 else:
                     record[field_name] = ""
                 continue
@@ -73,24 +149,29 @@ class REDCapNormalizer:
                 choices = f.parse_choices()
                 selected_codes = REDCapNormalizer._normalize_checkbox_selection(val, choices)
                 for code in choices.keys():
-                    record[f"{field_name}___{code}"] = "1" if code in selected_codes else "0"
+                    if code in selected_codes:
+                        record[f"{field_name}___{code}"] = "1"
+                    elif include_unchecked_checkboxes or selected_codes:
+                        if include_unchecked_checkboxes:
+                            record[f"{field_name}___{code}"] = "0"
 
             elif f.field_type == "text" and f.text_validation_type_or_show_slider_number:
                 val_type = f.text_validation_type_or_show_slider_number
                 if "date" in val_type:
                     record[field_name] = REDCapNormalizer._normalize_date(str(val))
                 elif val_type in {"integer", "number", "number_1dp", "number_2dp"}:
-                    record[field_name] = REDCapNormalizer._normalize_number(val)
+                    record[field_name] = REDCapNormalizer._normalize_number(
+                        val,
+                        min_val=f.text_validation_min,
+                        max_val=f.text_validation_max,
+                        integer_only=(val_type == "integer"),
+                    )
                 else:
                     record[field_name] = str(val).strip()
             else:
                 record[field_name] = str(val).strip()
 
         # Enforce REDCap branching logic (field visibility and dependency rules):
-        # If a field has branching_logic and that condition evaluates to False,
-        # the field is hidden in REDCap. Any value must be cleared back to blank ("")
-        # to prevent REDCap from showing:
-        # "ERASE THE VALUE OF THE FIELD ... requires that field ... be hidden from view"
         # Multi-pass sweep (up to 3 passes) resolves cascading dependencies
         for _ in range(3):
             changed = False
@@ -105,8 +186,8 @@ class REDCapNormalizer:
                         choices = f.parse_choices()
                         for code in choices.keys():
                             chk_key = f"{field_name}___{code}"
-                            if record.get(chk_key) not in (None, "", "0"):
-                                record[chk_key] = "0"
+                            if chk_key in record and record.get(chk_key) not in (None, "", "0"):
+                                record[chk_key] = "0" if include_unchecked_checkboxes else ""
                                 changed = True
                     else:
                         if record.get(field_name) not in (None, ""):
@@ -115,12 +196,13 @@ class REDCapNormalizer:
             if not changed:
                 break
 
-        # Mark form as complete in REDCap: 0=Incomplete, 1=Unverified, 2=Complete
-        # Only mark complete if explicitly requested AND at least one non-empty clinical field was extracted
+        # Mark form status only if explicitly requested AND at least one meaningful clinical field was extracted.
+        # Non-checkbox fields with legitimate clinical value "0" (e.g. pN=0, margins=0, BI-RADS=0) count as data;
+        # checkbox fields count only when checked ("1").
         has_clinical_values = any(
-            v not in (None, "", [], {}, "0") or (k.endswith("___1"))
+            (v == "1" if "___" in k else v not in (None, "", [], {}))
             for k, v in record.items()
-            if k not in (default_record_id_field, f"{form_name}_complete") and not (k.endswith("___0") and v == "0")
+            if k not in (default_record_id_field, f"{form_name}_complete")
         )
         if form_name and mark_form_complete and has_clinical_values:
             record[f"{form_name}_complete"] = str(form_completion_status)
@@ -129,14 +211,12 @@ class REDCapNormalizer:
 
     @staticmethod
     def evaluate_branching_logic(branching_logic: Optional[str], record_data: Dict[str, Any]) -> bool:
-        """Evaluates a REDCap branching logic rule against current record values.
-
-        Returns:
-            True if the field should be visible (condition met or no branching logic),
-            False if the field should be hidden from view.
-        """
+        """Evaluates a REDCap branching logic rule safely using AST evaluation (no eval())."""
         if not branching_logic or not branching_logic.strip():
             return True
+
+        if "[" not in branching_logic:
+            return False
 
         expr = branching_logic.strip().replace("\r\n", " ").replace("\n", " ")
 
@@ -157,7 +237,7 @@ class REDCapNormalizer:
 
         expr = re.sub(r"\[([a-zA-Z0-9_]+)\]", replace_field, expr)
 
-        # 3. Translate REDCap SQL-like operators to Python
+        # 3. Translate REDCap SQL-like operators to Python syntax
         expr = re.sub(r"<>", r"!=", expr)
         expr = re.sub(r"(?<![!<>=])=(?!=)", r"==", expr)
 
@@ -165,11 +245,10 @@ class REDCapNormalizer:
         expr = re.sub(r"\bOR\b", "or", expr, flags=re.IGNORECASE)
         expr = re.sub(r"\bNOT\b", "not", expr, flags=re.IGNORECASE)
 
-        # Convert unquoted integer comparisons (e.g. == 1 -> == '1')
+        # Convert unquoted integer comparisons (e.g. == 1 -> == "1")
         expr = re.sub(r"([=!<>]=?\s*)(\d+)(?!\w|\'|\")", r'\1"\2"', expr)
 
         # Convert inequality comparisons with numeric operands to float comparison
-        # (e.g. '100' > '50' -> (100.0 > 50.0) instead of lexical string comparison where '100' < '50')
         def replace_inequality(m):
             left = m.group(1).strip("'\"")
             op = m.group(2)
@@ -179,7 +258,6 @@ class REDCapNormalizer:
                 right_f = float(right)
                 return f"({left_f} {op} {right_f})"
             except (ValueError, TypeError):
-                # If either operand cannot be cast to float in an inequality, condition is not satisfied
                 return "False"
 
         expr = re.sub(
@@ -189,15 +267,18 @@ class REDCapNormalizer:
         )
 
         try:
-            res = eval(expr, {"__builtins__": {}}, {})
-            return bool(res)
-        except Exception:
+            tree = ast.parse(expr, mode="eval")
+            return bool(_safe_eval_ast(tree))
+        except Exception as e:
+            logger.debug(f"Branching logic non valutabile in modo sicuro ({branching_logic}): {e}")
             return True
 
     @staticmethod
     def _normalize_choice(val: Any, choices: Dict[str, str]) -> str:
         """Matches a raw value or label to a valid REDCap choice code with high clinical precision."""
         str_val = str(val).strip()
+        if not str_val:
+            return ""
 
         # 1. Exact code match
         if str_val in choices:
@@ -221,11 +302,17 @@ class REDCapNormalizer:
             if label_tokens and label_tokens.issubset(val_tokens):
                 return code
 
-        # 5. Fuzzy match with high similarity threshold to prevent dangerous accidental substrings
+        # 5. Fuzzy match guarded against differing numeric/alphanumeric clinical codes
+        # Prevents dangerous collisions like "Grado 3" -> "Grado 1" or "BI-RADS 4A" -> "BI-RADS 4B"
+        val_code_tokens = _extract_code_tokens(lower_val)
         best_code: Optional[str] = None
         best_ratio = 0.0
         for code, label in choices.items():
-            ratio = difflib.SequenceMatcher(None, lower_val, label.strip().lower()).ratio()
+            clean_label = label.strip().lower()
+            label_code_tokens = _extract_code_tokens(clean_label)
+            if (val_code_tokens or label_code_tokens) and sorted(val_code_tokens) != sorted(label_code_tokens):
+                continue
+            ratio = difflib.SequenceMatcher(None, lower_val, clean_label).ratio()
             if ratio > best_ratio:
                 best_ratio = ratio
                 best_code = code
@@ -276,25 +363,65 @@ class REDCapNormalizer:
 
     @staticmethod
     def _normalize_date(date_str: str) -> str:
-        """Attempts to normalize Italian/ISO dates to YYYY-MM-DD."""
-        clean = date_str.strip()
-        # YYYY-MM-DD
-        if re.match(r"^\d{4}-\d{2}-\d{2}$", clean):
-            return clean
+        """Normalizes and validates Italian/ISO dates to YYYY-MM-DD; returns '' if invalid."""
+        clean = str(date_str or "").strip()
+        if not clean:
+            return ""
 
-        # DD/MM/YYYY or DD-MM-YYYY
-        m = re.match(r"^(\d{1,2})[/\.-](\d{1,2})[/\.-](\d{4})$", clean)
-        if m:
-            day, month, year = m.groups()
-            return f"{year}-{int(month):02d}-{int(day):02d}"
+        # YYYY-MM-DD or YYYY/MM/DD
+        m_iso = re.match(r"^(\d{4})[-/](\d{1,2})[-/](\d{1,2})$", clean)
+        if m_iso:
+            y, mth, d = m_iso.groups()
+            try:
+                return datetime(int(y), int(mth), int(d)).strftime("%Y-%m-%d")
+            except ValueError:
+                return ""
 
-        return clean
+        # DD/MM/YYYY or DD-MM-YYYY or DD.MM.YYYY
+        m_it = re.match(r"^(\d{1,2})[/\.-](\d{1,2})[/\.-](\d{4})$", clean)
+        if m_it:
+            day, month, year = m_it.groups()
+            try:
+                return datetime(int(year), int(month), int(day)).strftime("%Y-%m-%d")
+            except ValueError:
+                return ""
+
+        # Italian textual month: "12 aprile 2024"
+        m_txt = re.match(r"^(\d{1,2})\s+([a-zA-Z]+)\s+(\d{4})$", clean)
+        if m_txt:
+            day, month_name, year = m_txt.groups()
+            mth_num = _ITALIAN_MONTHS.get(month_name.lower())
+            if mth_num:
+                try:
+                    return datetime(int(year), mth_num, int(day)).strftime("%Y-%m-%d")
+                except ValueError:
+                    return ""
+
+        return ""
 
     @staticmethod
-    def _normalize_number(val: Any) -> str:
-        """Cleans and standardizes numeric values."""
+    def _normalize_number(
+        val: Any,
+        min_val: Optional[str] = None,
+        max_val: Optional[str] = None,
+        integer_only: bool = False,
+    ) -> str:
+        """Cleans, standardizes, and validates numeric values against optional min/max bounds."""
         str_val = str(val).strip().replace(",", ".")
         match = re.search(r"[-+]?\d*\.?\d+", str_val)
-        if match:
-            return match.group(0)
-        return str_val
+        if not match:
+            return ""
+        raw_num = match.group(0)
+        try:
+            num = float(raw_num)
+            if min_val is not None and str(min_val).strip() != "":
+                if num < float(min_val):
+                    return ""
+            if max_val is not None and str(max_val).strip() != "":
+                if num > float(max_val):
+                    return ""
+            if integer_only and num.is_integer():
+                return str(int(num))
+            return raw_num
+        except ValueError:
+            return ""

@@ -6,7 +6,6 @@ from src.ai_extractor import (
     LlamaCppExtractor,
     OllamaExtractor,
     get_ai_extractor,
-    parse_json_response
 )
 from src.config import Settings
 from src.models import REDCapField

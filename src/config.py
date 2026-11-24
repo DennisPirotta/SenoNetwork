@@ -160,6 +160,37 @@ class Settings(BaseSettings):
         validation_alias=AliasChoices("senonetwork_api_key", "api_key"),
         description="API Key opzionale per autenticare le richieste dalla dashboard web via header X-API-Key"
     )
+    allow_insecure_local_dev: bool = Field(
+        default=False,
+        validation_alias=AliasChoices("allow_insecure_local_dev", "allow_unauthenticated_dev"),
+        description="Consente esplicitamente l'avvio senza API Key anche su host non-loopback (solo sviluppo)"
+    )
+    allow_mass_delete: bool = Field(
+        default=False,
+        validation_alias=AliasChoices("allow_mass_delete", "enable_mass_delete_api"),
+        description="Abilita l'endpoint HTTP distruttivo DELETE /api/redcap/records (disabilitato per sicurezza di default)"
+    )
+    redcap_delete_token: Optional[str] = Field(
+        default=None,
+        validation_alias=AliasChoices("redcap_delete_token", "redcap_admin_api_token"),
+        description="Token REDCap separato opzionale per operazioni di eliminazione record"
+    )
+    priamo_verify_ssl: bool = Field(
+        default=True,
+        description="Verifica i certificati SSL/TLS per connessioni a Priamo / PriamoCUP"
+    )
+    ai_max_concurrent_requests: int = Field(
+        default=1,
+        ge=1,
+        le=8,
+        description="Numero massimo di inferenze LLM concorrenti eseguite contemporaneamente"
+    )
+    llm_fallback_timeout_seconds: int = Field(
+        default=30,
+        ge=3,
+        le=180,
+        description="Timeout in secondi per la classificazione fallback tramite LLM"
+    )
     cors_origins: List[str] = Field(
         default=[
             "http://localhost:3000",
@@ -172,8 +203,8 @@ class Settings(BaseSettings):
         description="Elenco delle origini consentite dal middleware CORS per chiamate da browser"
     )
     api_host: str = Field(
-        default="0.0.0.0",
-        description="Host predefinito per il server HTTP FastAPI"
+        default="127.0.0.1",
+        description="Host predefinito per il server HTTP FastAPI (default sicuro loopback 127.0.0.1)"
     )
     api_port: int = Field(
         default=8000,
@@ -210,6 +241,10 @@ class Settings(BaseSettings):
     output_dir: Path = Field(
         default=Path("./data/output"),
         description="Cartella predefinita per salvare i risultati strutturati JSON/CSV"
+    )
+    cup_dir: Path = Field(
+        default=Path("./data/cup"),
+        description="Cartella predefinita in cui salvare i fogli Excel scaricati da PriamoCUP"
     )
     downloads_dir: Path = Field(
         default=Path("./data/downloads"),

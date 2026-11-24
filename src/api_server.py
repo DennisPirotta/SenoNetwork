@@ -11,46 +11,67 @@ Exposes REST endpoints and SSE streams for:
 """
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 from functools import lru_cache
 import logging
 from pathlib import Path
 import sys
-from typing import Any, Dict, List, Optional
+from typing import List, Optional
 import uvicorn
-from fastapi import BackgroundTasks, Depends, FastAPI
+from fastapi import Depends, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
 from src.ai_extractor import LlamaCppExtractor, OllamaExtractor
-from src.audit_service import RedCapAuditReport, RedCapDataAuditor
+from src.audit_service import RedCapAuditReport, RedCapDataAuditor  # noqa: F401
 from src.config import Settings, get_settings
 from src.dotnet_client import DotNetApiClient
 
-# Import modular routers
-from src.routers.security import router as security_router, generate_api_key
+# Import modular routers & re-exports used by CLI/tests
+from src.routers.security import LOOPBACK_HOSTS, router as security_router, generate_api_key
 from src.routers.dashboard import router as dashboard_router
 from src.routers.cup import router as cup_router
 from src.routers.priamo import router as priamo_router
 from src.routers.pipeline import (
     router as pipeline_router,
-    _tasks_store,
-    process_patient_async,
-    get_task_status,
+    _tasks_store,  # noqa: F401
+    process_patient_async,  # noqa: F401
+    get_task_status,  # noqa: F401
 )
-from src.routers.audit import router as audit_router, get_audit_report as get_audit_data_quality_report
+from src.routers.audit import router as audit_router, get_audit_report as get_audit_data_quality_report  # noqa: F401
 from src.routers.sync import (
     router as sync_router,
-    SyncTriggerRequest,
-    get_incomplete_patients,
-    sync_check_updates_async,
-    sync_check_updates_sync,
+    SyncTriggerRequest,  # noqa: F401
+    get_incomplete_patients,  # noqa: F401
+    sync_check_updates_async,  # noqa: F401
+    sync_check_updates_sync,  # noqa: F401
 )
 from src.routers.redcap import (
     router as redcap_router,
-    delete_single_record as delete_single_redcap_record,
-    delete_all_records as delete_all_redcap_records,
+    delete_single_record as delete_single_redcap_record,  # noqa: F401
+    delete_all_records as delete_all_redcap_records,  # noqa: F401
 )
+
+__all__ = [
+    "app",
+    "main",
+    "run_server",
+    "health_check",
+    "get_shared_settings",
+    "RedCapAuditReport",
+    "RedCapDataAuditor",
+    "_tasks_store",
+    "process_patient_async",
+    "get_task_status",
+    "get_audit_data_quality_report",
+    "SyncTriggerRequest",
+    "get_incomplete_patients",
+    "sync_check_updates_async",
+    "sync_check_updates_sync",
+    "delete_single_redcap_record",
+    "delete_all_redcap_records",
+]
 
 logger = logging.getLogger(__name__)
 
@@ -105,7 +126,7 @@ def get_shared_settings() -> Settings:
 
 
 @app.get("/health", tags=["System"])
-def health_check(settings: Settings = Depends(get_shared_settings)):
+def health_check(settings: Settings = Depends(get_settings)):
     """Verifica lo stato dei server IA (llama.cpp RPC e Ollama), REDCap e Priamo .NET."""
     ollama = OllamaExtractor(base_url=settings.ollama_base_url)
     llamacpp = LlamaCppExtractor(
@@ -115,13 +136,18 @@ def health_check(settings: Settings = Depends(get_shared_settings)):
     )
     dotnet = DotNetApiClient(settings=settings)
 
-    # Esponi URL interni solo se esplicitamente non protetti da chiave o in localhost
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        fut_llama = pool.submit(llamacpp.is_available)
+        fut_ollama = pool.submit(ollama.is_available)
+        llama_ok = fut_llama.result()
+        ollama_ok = fut_ollama.result()
+
     return {
         "status": "online",
         "version": "2.0.0",
         "ai_backend_configured": settings.ai_backend,
-        "llama_cpp_rpc_available": llamacpp.is_available(),
-        "ollama_available": ollama.is_available(),
+        "llama_cpp_rpc_available": llama_ok,
+        "ollama_available": ollama_ok,
         "ollama_model": settings.ollama_model,
         "redcap_configured": bool(settings.redcap_api_url and settings.redcap_api_token),
         "priamo_dotnet_configured": dotnet.is_priamo_configured,
@@ -167,6 +193,15 @@ def run_server(host: Optional[str] = None, port: Optional[int] = None):
     cfg = get_settings()
     target_host = host or cfg.api_host
     target_port = port or cfg.api_port
+    if (
+        target_host.strip().lower() not in LOOPBACK_HOSTS
+        and not (cfg.api_key and cfg.api_key.strip())
+        and not cfg.allow_insecure_local_dev
+    ):
+        raise RuntimeError(
+            f"Rifiutato avvio su host non-loopback '{target_host}' senza SENONETWORK_API_KEY configurata. "
+            "Imposta SENONETWORK_API_KEY in .env (o usa --host 127.0.0.1 / ALLOW_INSECURE_LOCAL_DEV=true)."
+        )
     print(f"\n-> Avvio SenoNetwork API Server su http://{target_host}:{target_port}...")
     print(f"-> Documentazione Swagger interattiva disponibile su: http://{target_host}:{target_port}/docs\n")
     uvicorn.run("src.api_server:app", host=target_host, port=target_port, reload=False)
@@ -188,7 +223,7 @@ def main(argv: Optional[List[str]] = None) -> None:
         sys.exit(0)
 
     parser = argparse.ArgumentParser(description="Avvia il server API di SenoNetwork")
-    parser.add_argument("--host", default=None, help="Host di ascolto (default da .env o 0.0.0.0)")
+    parser.add_argument("--host", default=None, help="Host di ascolto (default da .env o 127.0.0.1)")
     parser.add_argument("--port", type=int, default=None, help="Porta di ascolto (default da .env o 8000)")
     parser.add_argument("--generate-key", action="store_true", help="Genera una nuova API key crittograficamente sicura ed esci")
     args = parser.parse_args(args_list)

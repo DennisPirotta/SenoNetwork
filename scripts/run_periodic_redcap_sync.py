@@ -11,7 +11,6 @@ Funzionalità:
 """
 
 import argparse
-from datetime import datetime
 import logging
 from pathlib import Path
 import signal
@@ -23,7 +22,7 @@ from dotenv import load_dotenv
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src.config import Settings
-from src.sync_service import RedCapSyncService, SyncSummaryReport
+from src.sync_service import RedCapSyncService
 
 load_dotenv()
 
