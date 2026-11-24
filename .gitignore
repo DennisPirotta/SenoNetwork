@@ -27,6 +27,7 @@ data/cup/
 data/state/
 data/patient_repository/
 data/redcap_cache/
+temp/*
 
 # ==============================================================================
 # Python: Bytecode, cache ed ambienti virtuali
